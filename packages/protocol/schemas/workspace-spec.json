@@ -1,0 +1,72 @@
+{
+  "$defs": {
+    "workspace-spec": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "existing",
+              "type": "string"
+            },
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "managed",
+              "type": "string"
+            },
+            "name": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "type": "string"
+            },
+            "source": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "git",
+                  "type": "string"
+                },
+                "ref": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "remote": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "remote"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/workspace-spec.json",
+  "$ref": "#/$defs/workspace-spec",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "workspace-spec",
+  "x-wire-version": "0.4"
+}

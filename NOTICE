@@ -1,0 +1,12 @@
+Relvo Agent Runtime
+Copyright 2026 Relvo Labs
+
+This product includes independently authored repository-local guidance informed by official Node.js, npm, pnpm, TypeScript, Zod, Vitest, Changesets, publint, and Are The Types Wrong documentation.
+
+Portions of the repository-local skill guidance adapt MIT-licensed ideas from:
+
+- antfu/skills at a74f281a27dadc02397bc1a174b0f2c97531b6ae
+- module-federation/core at 5727cf3298ca9b3d04306a4a6065265a131965b7
+- rolldown/tsdown at f7f0cc3adb70d2589216d479a59f226869ac4b08
+
+Sources with absent or ambiguous licensing were reviewed for vocabulary only and were not copied. See each skill's Provenance section for details.

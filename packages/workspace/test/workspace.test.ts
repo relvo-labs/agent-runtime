@@ -1,0 +1,77 @@
+import { mkdir, mkdtemp, stat, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
+import { checkRemovable, createLocalWorkspaceProvider } from '../src/index.ts';
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  const { rm } = await import('node:fs/promises');
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-test-'));
+  roots.push(root);
+  const baseDirectory = join(root, 'managed');
+  const borrowed = join(root, 'borrowed');
+  await mkdir(borrowed);
+  const removed: string[] = [];
+  const provider = createLocalWorkspaceProvider({
+    baseDirectory,
+    clock: createFixedClock(),
+    idFactory: createCounterIdFactory(),
+    removeDirectory: async (path) => {
+      removed.push(path);
+      const { rm } = await import('node:fs/promises');
+      await rm(path, { recursive: true, force: true });
+    },
+  });
+  return { root, baseDirectory, borrowed, removed, provider };
+}
+
+describe('workspace ownership', () => {
+  it('never deletes a borrowed workspace and reports no destructive operations', async () => {
+    const { borrowed, removed, provider } = await fixture();
+    const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+    const report = await lease.release();
+    expect(report.ownership).toBe('borrowed');
+    expect(report.destructiveOperations).toEqual([]);
+    expect(removed).toEqual([]);
+    expect((await stat(borrowed)).isDirectory()).toBe(true);
+  });
+
+  it('removes only a newly created managed root and is idempotent', async () => {
+    const { removed, provider } = await fixture();
+    const lease = await provider.acquire({ kind: 'managed', name: 'owned' });
+    const first = await lease.release();
+    const second = await lease.release();
+    expect(first.destructiveOperations).toHaveLength(1);
+    expect(second.alreadyReleased).toBe(true);
+    expect(removed).toEqual([lease.root]);
+  });
+
+  it('does not claim a pre-existing named directory as managed', async () => {
+    const { baseDirectory, provider } = await fixture();
+    await mkdir(join(baseDirectory, 'already-there'), { recursive: true });
+    await expect(provider.acquire({ kind: 'managed', name: 'already-there' })).rejects.toThrow();
+  });
+
+  it('refuses a symlink escape and a shallow target', async () => {
+    const { root, baseDirectory } = await fixture();
+    await mkdir(baseDirectory, { recursive: true });
+    const outside = join(root, 'outside');
+    await mkdir(outside);
+    const escape = join(baseDirectory, 'escape');
+    await symlink(outside, escape, 'dir');
+    expect(
+      await checkRemovable({ target: escape, baseDirectory, ownership: 'managed', alreadyReleased: false }),
+    ).toMatchObject({ reason: 'the target resolves outside the managed base directory' });
+    expect(
+      await checkRemovable({ target: '/tmp', baseDirectory: '/', ownership: 'managed', alreadyReleased: false }),
+    ).toMatchObject({ reason: 'the target path is too shallow to remove safely' });
+  });
+});

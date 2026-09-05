@@ -1,0 +1,348 @@
+{
+  "$defs": {
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "approval-request": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedModes": {
+          "items": {
+            "$ref": "#/$defs/approval-mode"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "riskHint": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "$ref": "#/$defs/approval-subject"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "allowedModes",
+        "riskHint"
+      ],
+      "type": "object"
+    },
+    "approval-subject": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "command",
+            "file_write",
+            "file_delete",
+            "network",
+            "tool",
+            "other"
+          ],
+          "type": "string"
+        },
+        "detail": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "interaction-request": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-request"
+        },
+        {
+          "$ref": "#/$defs/approval-request"
+        }
+      ]
+    },
+    "json-value": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/json-value"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "question-choice": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 400,
+          "minLength": 1,
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "type": "object"
+    },
+    "question-request": {
+      "additionalProperties": false,
+      "properties": {
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/question-choice"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "placeholder": {
+          "maxLength": 400,
+          "type": "string"
+        },
+        "prompt": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt",
+        "multiSelect"
+      ],
+      "type": "object"
+    },
+    "usage": {
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outputTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totalTokens": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/provider-event-input.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "payload": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "maxLength": 100000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "run.message_delta",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "additionalProperties": {
+                "$ref": "#/$defs/json-value"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "phase": {
+              "enum": [
+                "invoked",
+                "succeeded",
+                "failed"
+              ],
+              "type": "string"
+            },
+            "toolName": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "run.tool_activity",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "toolName",
+            "phase"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "run.usage",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/usage"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "providerRef": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/interaction-request"
+            },
+            "type": {
+              "const": "interaction.requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request",
+            "providerRef"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "additionalProperties": {
+                "$ref": "#/$defs/json-value"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "level": {
+              "enum": [
+                "debug",
+                "info",
+                "warning"
+              ],
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "diagnostic",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "level",
+            "message"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "required": [
+    "payload"
+  ],
+  "title": "provider-event-input",
+  "type": "object",
+  "x-wire-version": "0.4"
+}

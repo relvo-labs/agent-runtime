@@ -1,0 +1,307 @@
+{
+  "$defs": {
+    "approval-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking": {
+          "default": true,
+          "type": "boolean"
+        },
+        "modes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/approval-mode"
+          },
+          "type": "array"
+        },
+        "supported": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "modes",
+        "blocking"
+      ],
+      "type": "object"
+    },
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "interaction-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/approval-capability"
+        },
+        "question": {
+          "$ref": "#/$defs/question-capability"
+        },
+        "settlementTimeoutMs": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "approval",
+        "question",
+        "settlementTimeoutMs"
+      ],
+      "type": "object"
+    },
+    "interrupt-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "deliversPartialOutput": {
+          "default": true,
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "immediate",
+            "cooperative",
+            "unsupported"
+          ],
+          "type": "string"
+        },
+        "sessionRemainsUsable": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode",
+        "deliversPartialOutput",
+        "sessionRemainsUsable"
+      ],
+      "type": "object"
+    },
+    "json-value": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/json-value"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "question-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "choices": {
+          "default": false,
+          "type": "boolean"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "supported": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "choices",
+        "multiSelect"
+      ],
+      "type": "object"
+    },
+    "recovery-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "exportsRecoveryRecord": {
+          "default": false,
+          "type": "boolean"
+        },
+        "resumesFromRecoveryRecord": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exportsRecoveryRecord",
+        "resumesFromRecoveryRecord"
+      ],
+      "type": "object"
+    },
+    "run-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "interrupt": {
+          "$ref": "#/$defs/interrupt-capability"
+        },
+        "maxConcurrentRunsPerSession": {
+          "default": 1,
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "type": "integer"
+        },
+        "streaming": {
+          "$ref": "#/$defs/streaming-capability"
+        }
+      },
+      "required": [
+        "interrupt",
+        "streaming",
+        "maxConcurrentRunsPerSession"
+      ],
+      "type": "object"
+    },
+    "streaming-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "incrementalUsage": {
+          "default": false,
+          "type": "boolean"
+        },
+        "messageDeltas": {
+          "default": false,
+          "type": "boolean"
+        },
+        "toolActivity": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "messageDeltas",
+        "toolActivity",
+        "incrementalUsage"
+      ],
+      "type": "object"
+    },
+    "workspace-capability": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptsOwnership": {
+          "default": [
+            "borrowed",
+            "managed"
+          ],
+          "items": {
+            "enum": [
+              "borrowed",
+              "managed"
+            ],
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "requires": {
+          "enum": [
+            "directory",
+            "none"
+          ],
+          "type": "string"
+        },
+        "writes": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requires",
+        "acceptsOwnership",
+        "writes"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/provider-descriptor.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "displayName": {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "extensions": {
+      "additionalProperties": {
+        "$ref": "#/$defs/json-value"
+      },
+      "default": {},
+      "propertyNames": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "interaction": {
+      "$ref": "#/$defs/interaction-capability"
+    },
+    "providerId": {
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "type": "string"
+    },
+    "providerVersion": {
+      "maxLength": 64,
+      "minLength": 1,
+      "type": "string"
+    },
+    "recovery": {
+      "$ref": "#/$defs/recovery-capability"
+    },
+    "run": {
+      "$ref": "#/$defs/run-capability"
+    },
+    "wireVersion": {
+      "maxLength": 16,
+      "minLength": 1,
+      "type": "string"
+    },
+    "workspace": {
+      "$ref": "#/$defs/workspace-capability"
+    }
+  },
+  "required": [
+    "providerId",
+    "providerVersion",
+    "wireVersion",
+    "displayName",
+    "run",
+    "interaction",
+    "workspace",
+    "recovery",
+    "extensions"
+  ],
+  "title": "provider-descriptor",
+  "type": "object",
+  "x-wire-version": "0.4"
+}

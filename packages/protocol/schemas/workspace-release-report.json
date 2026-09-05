@@ -1,0 +1,58 @@
+{
+  "$defs": {
+    "timestamp": {
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+      "type": "string"
+    },
+    "workspace-lease-id": {
+      "pattern": "^wsl_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "workspace-ownership": {
+      "enum": [
+        "borrowed",
+        "managed"
+      ],
+      "type": "string"
+    },
+    "workspace-release-report": {
+      "additionalProperties": false,
+      "properties": {
+        "alreadyReleased": {
+          "default": false,
+          "type": "boolean"
+        },
+        "destructiveOperations": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "leaseId": {
+          "$ref": "#/$defs/workspace-lease-id"
+        },
+        "ownership": {
+          "$ref": "#/$defs/workspace-ownership"
+        },
+        "releasedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "required": [
+        "leaseId",
+        "ownership",
+        "alreadyReleased",
+        "destructiveOperations",
+        "releasedAt"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/workspace-release-report.json",
+  "$ref": "#/$defs/workspace-release-report",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "workspace-release-report",
+  "x-wire-version": "0.4"
+}

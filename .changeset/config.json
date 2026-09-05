@@ -1,0 +1,26 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@4.0.0/schema.json",
+  "changelog": false,
+  "commit": false,
+  "fixed": [],
+  "linked": [
+    [
+      "@relvo-labs/agent-protocol",
+      "@relvo-labs/agent-executor",
+      "@relvo-labs/agent-provider",
+      "@relvo-labs/agent-provider-codex",
+      "@relvo-labs/agent-provider-claude",
+      "@relvo-labs/agent-runtime",
+      "@relvo-labs/agent-workspace",
+      "@relvo-labs/agent-workspace-git"
+    ]
+  ],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [],
+  "___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
+    "onlyUpdatePeerDependentsWhenOutOfRange": true,
+    "updateInternalDependents": "always"
+  }
+}
