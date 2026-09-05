@@ -39,3 +39,11 @@ acquisition runtime-validates specs, binds borrowed roots to the requested realp
 operations require nominal provider-issued leases. Generated schemas now describe accepted
 Zod input, including conditional behavior after default-filled omissions.
 `validateWorkspaceLease` is now asynchronous to perform canonical path validation.
+
+Release-blocker corrections to this still-unpublished v0.4 candidate line, none of which
+change the set of documents Zod accepts: the `InteractionSettlement` "responded iff response"
+conditional is no longer dropped when the shared sub-schema is given its stable `$defs` name,
+so every published root that embeds it enforces the invariant; a git `ref` rejects a leading
+`-` via a JSON-Schema-representable `pattern` instead of a Zod-only predicate; and the local
+workspace provider forgets successfully released leases instead of retaining every lease a
+long-lived provider ever issued, while still tracking active and retryable ones.

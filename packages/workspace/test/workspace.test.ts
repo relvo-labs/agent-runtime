@@ -1,6 +1,8 @@
 import { mkdir, mkdtemp, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { WorkspaceLeaseIdSchema, createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
@@ -17,6 +19,31 @@ afterEach(async () => {
   const { rm } = await import('node:fs/promises');
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+/**
+ * Force a full mark-compact collection.
+ *
+ * Reachability is the property under test — a provider that keeps every lease
+ * it ever issued is a leak no behavioural assertion can see — so the test needs
+ * a real collection rather than a timer or a heuristic. `gc()` obtained this way
+ * is a synchronous, complete collection; the macrotask yields around it only
+ * retire the jobs that a `WeakRef` target is specified to survive, so this is
+ * bounded and deterministic rather than a poll.
+ */
+async function collectGarbage(): Promise<void> {
+  setFlagsFromString('--expose-gc');
+  let gc: unknown;
+  try {
+    gc = runInNewContext('gc');
+  } finally {
+    setFlagsFromString('--no-expose-gc');
+  }
+  if (typeof gc !== 'function') throw new TypeError('forced collection is unavailable');
+  for (let pass = 0; pass < 3; pass += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    (gc as () => void)();
+  }
+}
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-test-'));
@@ -153,6 +180,109 @@ describe('workspace ownership', () => {
     expect(retried.alreadyReleased).toBe(false);
     expect(afterSuccess.alreadyReleased).toBe(true);
     expect(removalCount).toBe(2);
+  });
+
+  it('releaseAll visits only leases it still holds and forgets successful ones', async () => {
+    const { borrowed, removed, provider } = await fixture();
+    const releasedDirectly = await provider.acquire({ kind: 'existing', path: borrowed });
+    const managed = await provider.acquire({ kind: 'managed', name: 'still-live' });
+
+    await releasedDirectly.release();
+
+    const reports = await provider.releaseAll();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.leaseId).toBe(managed.leaseId);
+    expect(reports[0]?.alreadyReleased).toBe(false);
+    // The forgotten lease must not be swept a second time.
+    expect(removed).toEqual([managed.root]);
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(removed).toEqual([managed.root]);
+  });
+
+  it('keeps a failed release tracked for retry and drops it only once it succeeds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-retention-test-'));
+    roots.push(root);
+    let removalCount = 0;
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async (path) => {
+        removalCount += 1;
+        if (removalCount === 1) throw new Error('transient removal failure');
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed', name: 'retryable' });
+
+    await expect(lease.release()).rejects.toThrow('transient removal failure');
+    // A failed release did not discharge the cleanup duty, so the provider must
+    // still hold the lease and releaseAll must retry it.
+    const retried = await provider.releaseAll();
+    expect(retried).toHaveLength(1);
+    expect(retried[0]).toMatchObject({ leaseId: lease.leaseId, alreadyReleased: false });
+    expect(removalCount).toBe(2);
+
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(removalCount).toBe(2);
+  });
+
+  it('coalesces a direct release with releaseAll without releasing twice', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-coalesce-test-'));
+    roots.push(root);
+    let removalCount = 0;
+    let releaseRemoval!: () => void;
+    let removalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      removalEntered = resolve;
+    });
+    const removalHeld = new Promise<void>((resolve) => {
+      releaseRemoval = resolve;
+    });
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async () => {
+        removalCount += 1;
+        removalEntered();
+        await removalHeld;
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed', name: 'coalesced' });
+
+    const direct = lease.release();
+    await entered;
+    const sweeping = provider.releaseAll();
+    releaseRemoval();
+    const [directReport, sweepReports] = await Promise.all([direct, sweeping]);
+    expect(directReport.alreadyReleased).toBe(false);
+    expect(sweepReports).toHaveLength(1);
+    expect(sweepReports[0]).toMatchObject({ leaseId: lease.leaseId, alreadyReleased: true });
+    expect(removalCount).toBe(1);
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(removalCount).toBe(1);
+  });
+
+  it('makes a successfully released lease collectible while an active one stays held', async () => {
+    const { borrowed, provider } = await fixture();
+    const active = await provider.acquire({ kind: 'existing', path: borrowed });
+
+    // Acquire, release and drop the only caller-side reference inside a scope
+    // the assertion cannot keep alive.
+    const released = await (async (): Promise<WeakRef<WorkspaceLease>> => {
+      const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+      const ref = new WeakRef<WorkspaceLease>(lease);
+      const report = await lease.release();
+      expect(report.alreadyReleased).toBe(false);
+      return ref;
+    })();
+    const stillHeld = new WeakRef<WorkspaceLease>(active);
+
+    await collectGarbage();
+    expect(released.deref(), 'a released lease must not be retained by its provider').toBeUndefined();
+    expect(stillHeld.deref(), 'an unreleased lease must stay tracked for releaseAll').toBe(active);
   });
 
   it('validates and cross-checks third-party lease descriptors', async () => {

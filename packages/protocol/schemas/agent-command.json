@@ -234,6 +234,7 @@
                 },
                 "ref": {
                   "minLength": 1,
+                  "pattern": "^[^-]",
                   "type": "string"
                 },
                 "remote": {

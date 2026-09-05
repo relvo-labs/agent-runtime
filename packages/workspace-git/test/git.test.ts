@@ -1,9 +1,12 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
+import type { WorkspaceLease } from '@relvo-labs/agent-workspace';
 import {
   READ_ONLY_GIT_COMMANDS,
   READ_ONLY_GIT_SUBCOMMANDS,
@@ -11,6 +14,29 @@ import {
   createGitWorkspaceProvider,
   type GitCommand,
 } from '../src/index.ts';
+
+/**
+ * Force a full mark-compact collection.
+ *
+ * A provider that keeps every lease it ever issued leaks in a way no
+ * behavioural assertion can observe, so reachability has to be tested directly.
+ * `gc()` obtained this way is a synchronous, complete collection; the macrotask
+ * yields only retire the jobs a `WeakRef` target is specified to survive.
+ */
+async function collectGarbage(): Promise<void> {
+  setFlagsFromString('--expose-gc');
+  let gc: unknown;
+  try {
+    gc = runInNewContext('gc');
+  } finally {
+    setFlagsFromString('--no-expose-gc');
+  }
+  if (typeof gc !== 'function') throw new TypeError('forced collection is unavailable');
+  for (let pass = 0; pass < 3; pass += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    (gc as () => void)();
+  }
+}
 
 const roots: string[] = [];
 
@@ -327,6 +353,68 @@ describe('git workspace boundary', () => {
     expect(commands).toEqual([]);
     await expect(provider.git(lease, ['status', '--short'])).rejects.toThrow();
     await expect(provider.releaseAll()).resolves.toEqual([]);
+  });
+
+  it('retries a failed release through releaseAll, proving both layers still track it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-sweep-retry-test-'));
+    roots.push(root);
+    let removals = 0;
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+      removeDirectory: async (path) => {
+        removals += 1;
+        if (removals === 1) throw new Error('transient removal failure');
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed', name: 'sweep-retry' });
+
+    await expect(lease.release()).rejects.toThrow('transient removal failure');
+
+    // The Git authority and the delegated local lease must both survive the
+    // failure, or the outstanding cleanup would be silently dropped.
+    const swept = await provider.releaseAll();
+    expect(swept).toHaveLength(1);
+    expect(swept[0]).toMatchObject({ leaseId: lease.leaseId, alreadyReleased: false });
+    expect(removals).toBe(2);
+
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(removals).toBe(2);
+  });
+
+  // Scope note: this proves the Git layer itself holds nothing after a
+  // successful release. The delegated `LocalLease` behind the authority is not
+  // reachable from this package's public surface, so its collectability is
+  // asserted directly in `packages/workspace/test/workspace.test.ts`.
+  it('retains no reference to a lease released through the Git provider', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-collectible-test-'));
+    roots.push(root);
+    const borrowed = join(root, 'borrowed');
+    const stillOpen = join(root, 'still-open');
+    await Promise.all([mkdir(borrowed), mkdir(stillOpen)]);
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+    });
+    const active = await provider.acquire({ kind: 'existing', path: stillOpen });
+
+    const released = await (async (): Promise<WeakRef<WorkspaceLease>> => {
+      const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+      const ref = new WeakRef<WorkspaceLease>(lease);
+      await expect(lease.release()).resolves.toMatchObject({ alreadyReleased: false });
+      return ref;
+    })();
+    const stillHeld = new WeakRef<WorkspaceLease>(active);
+
+    await collectGarbage();
+    expect(released.deref(), 'a released Git lease must not be retained by the provider').toBeUndefined();
+    expect(stillHeld.deref(), 'an unreleased Git lease must stay sweepable').toBe(active);
   });
 
   it('cleans an owned root when clone setup fails', async () => {

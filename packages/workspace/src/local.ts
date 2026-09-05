@@ -43,6 +43,12 @@ type LeaseRuntime = {
   readonly baseDirectory: string;
   readonly clock: Clock;
   readonly removeDirectory: (path: string) => Promise<void>;
+  /**
+   * Invoked exactly once, after a release has actually succeeded, so the
+   * issuing provider can stop holding the lease. A failed release does not
+   * fire it: the cleanup duty is still outstanding and must stay sweepable.
+   */
+  readonly onReleased?: (lease: WorkspaceLease) => void;
 };
 
 class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
@@ -131,6 +137,10 @@ class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
       destructiveOperations,
       releasedAt: this.#options.clock.now(),
     };
+    // Report first, then hand the provider its release notice. The lease itself
+    // remains fully usable (later calls still answer `alreadyReleased: true`);
+    // it is only the provider's strong reference that is dropped.
+    this.#options.onReleased?.(this);
     return this.#report;
   }
 }
@@ -229,9 +239,25 @@ export async function validateWorkspaceLease(
 export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOptions): WorkspaceProvider {
   const baseDirectory = resolve(options.baseDirectory);
   const removeDirectory = options.removeDirectory ?? ((path: string) => rm(path, { recursive: true, force: true }));
-  const leases: LocalLease<WorkspaceOwnership>[] = [];
+  /**
+   * Leases whose cleanup duty is still outstanding.
+   *
+   * A set, not an array, and entries are removed once a release has succeeded.
+   * A long-lived provider — the delegate inside `createGitWorkspaceProvider` is
+   * one — would otherwise pin every lease it ever issued for the lifetime of
+   * the process, and `releaseAll()` would re-walk a growing history of leases
+   * that have nothing left to release.
+   */
+  const outstanding = new Set<WorkspaceLease>();
 
-  const leaseOptions = { baseDirectory, clock: options.clock, removeDirectory };
+  const leaseOptions: LeaseRuntime = {
+    baseDirectory,
+    clock: options.clock,
+    removeDirectory,
+    onReleased: (lease) => {
+      outstanding.delete(lease);
+    },
+  };
 
   async function acquireExisting(path: string): Promise<LocalLease<'borrowed'>> {
     const root = await resolveRealPath(path);
@@ -314,7 +340,7 @@ export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOpti
       );
     }
 
-    leases.push(lease);
+    outstanding.add(lease);
     return lease;
   }
 
@@ -323,7 +349,9 @@ export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOpti
 
     async releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
       const reports: WorkspaceReleaseReport[] = [];
-      for (const lease of leases) reports.push(await lease.release());
+      // Snapshot the live set: a successful release removes its own entry, and
+      // a release already in flight is coalesced by the lease itself.
+      for (const lease of [...outstanding]) reports.push(await lease.release());
       return reports;
     },
   };

@@ -43,11 +43,14 @@ export const ManagedWorkspaceSpecSchema = z.strictObject({
     .strictObject({
       kind: z.literal('git'),
       remote: z.string().min(1),
-      ref: z
-        .string()
-        .min(1)
-        .refine((value) => !value.startsWith('-'), 'a git ref must not begin with `-`')
-        .optional(),
+      /**
+       * A ref beginning with `-` would be read by git as an option rather than
+       * a revision. Expressed as a `pattern` rather than a `.refine()` so the
+       * constraint survives into generated JSON Schema: an ECMA-262 regex is
+       * representable in Draft 2020-12, a predicate is not. `[^-]` on a string
+       * already bounded by `min(1)` is exactly `!value.startsWith('-')`.
+       */
+      ref: z.string().min(1).regex(/^[^-]/u, 'a git ref must not begin with `-`').optional(),
     })
     .optional(),
 });

@@ -121,12 +121,21 @@ const NAMED_DEFS: readonly (readonly [string, z.ZodType])[] = [
   ['workspace-spec', WorkspaceSpecSchema],
 ];
 
-/** Idempotent: safe to call more than once in a single process. */
+/**
+ * Idempotent: safe to call more than once in a single process.
+ *
+ * The `id` is *composed onto* whatever metadata the schema already carries.
+ * `z.globalRegistry.add` replaces the stored entry wholesale, so assigning
+ * `{ id }` alone would silently discard the conditional JSON Schema metadata
+ * that a `.meta({ if, then, else })` on a shared sub-schema uses to express a
+ * Zod `.refine()` in Draft 2020-12 — and the invariant would vanish from every
+ * published root that references it through `$defs`.
+ */
 export function registerStableDefNames(): readonly string[] {
   for (const [id, schema] of NAMED_DEFS) {
-    if (z.globalRegistry.get(schema)?.id !== id) {
-      z.globalRegistry.add(schema, { id });
-    }
+    const existing = z.globalRegistry.get(schema);
+    if (existing?.id === id) continue;
+    z.globalRegistry.add(schema, { ...existing, id });
   }
   return NAMED_DEFS.map(([id]) => id);
 }

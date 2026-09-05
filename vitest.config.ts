@@ -20,7 +20,12 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['packages/*/test/**/*.test.ts', 'tools/**/*.test.ts'],
+    // Root-relative patterns would resolve against the *package* directory when
+    // a package script runs `vitest run test`, so the documented
+    // `pnpm --filter <package> test` command would silently match nothing and
+    // exit non-zero. These patterns select the same files from the workspace
+    // root and from inside any one package.
+    include: ['**/test/**/*.test.ts', '**/tools/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/dist/**', 'tools/skills/__fixtures__/**'],
     environment: 'node',
     // Contract tests must be deterministic; a passing run must not depend on
