@@ -221,6 +221,111 @@ describe('provider event activation', () => {
     ]);
   });
 
+  it('rejects cyclic provider graphs before staging while preserving shared acyclic input', async () => {
+    const scripted = createScriptedProvider({
+      supportsRecovery: false,
+      defaultScript: [{ kind: 'succeed' }],
+    });
+    const provider: AgentProvider = {
+      describe: () => scripted.provider.describe(),
+      async createSession(init): Promise<ProviderSession> {
+        const session = await scripted.provider.createSession(init);
+        return {
+          async startRun(request): Promise<ProviderRun> {
+            const objectCycle: Record<string, unknown> = {};
+            objectCycle.self = objectCycle;
+            const arrayCycle: unknown[] = [];
+            arrayCycle.push(arrayCycle);
+            const mutualObject: Record<string, unknown> = {};
+            const mutualArray: unknown[] = [mutualObject];
+            mutualObject.array = mutualArray;
+            for (const [toolName, detail] of [
+              ['object-cycle', objectCycle],
+              ['array-cycle', { value: arrayCycle }],
+              ['mutual-cycle', mutualObject],
+            ] as const) {
+              request.sink.emit({
+                payload: { type: 'run.tool_activity', toolName, phase: 'invoked', detail },
+              } as ProviderEventInput);
+            }
+            const throwingDetail = {};
+            Object.defineProperty(throwingDetail, 'value', {
+              enumerable: true,
+              get(): never {
+                throw new Error('hostile getter');
+              },
+            });
+            expect(() =>
+              request.sink.emit({
+                payload: {
+                  type: 'run.tool_activity',
+                  toolName: 'throwing-accessor',
+                  phase: 'invoked',
+                  detail: throwingDetail,
+                },
+              }),
+            ).not.toThrow();
+            const throwingProxy = new Proxy(
+              { payload: { type: 'run.message_delta' as const, text: 'must not commit' } },
+              {
+                ownKeys(): never {
+                  throw new Error('hostile proxy');
+                },
+              },
+            );
+            expect(() => request.sink.emit(throwingProxy)).not.toThrow();
+
+            const shared = { value: 'before mutation' };
+            request.sink.emit({
+              payload: {
+                type: 'run.tool_activity',
+                toolName: 'shared-acyclic',
+                phase: 'succeeded',
+                detail: { left: shared, right: shared },
+              },
+            });
+            shared.value = 'after mutation';
+            return session.startRun(request);
+          },
+          respondToInteraction: (providerRef, response) => session.respondToInteraction(providerRef, response),
+          dispose: () => session.dispose(),
+        };
+      },
+    };
+    const value = await runtimeFixture(provider);
+    const sessionId = await open(value);
+    await value.runtime.submitTurn({
+      commandId: value.nextCommandId(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'cyclic provider input' }] },
+    });
+
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    const toolEvents = page.events.filter((event) => event.payload.type === 'run.tool_activity');
+    const invalidDiagnostics = page.events.filter(
+      (event) =>
+        event.payload.type === 'diagnostic' && event.payload.message.includes('provider emitted an invalid event'),
+    );
+    expect(toolEvents).toHaveLength(1);
+    expect(toolEvents[0]?.payload).toMatchObject({
+      toolName: 'shared-acyclic',
+      detail: { left: { value: 'before mutation' }, right: { value: 'before mutation' } },
+    });
+    expect(invalidDiagnostics).toHaveLength(5);
+    expect(
+      invalidDiagnostics.every(
+        (event) => event.payload.type === 'diagnostic' && event.payload.detail?.code === 'provider_contract_violation',
+      ),
+    ).toBe(true);
+    expect(
+      invalidDiagnostics.flatMap((event) => (event.payload.type === 'diagnostic' ? [event.payload.message] : [])),
+    ).toEqual(
+      Array.from({ length: 5 }, () => 'provider emitted an invalid event: input is not acyclic plain JSON data'),
+    );
+    expect(() => JSON.stringify(page)).not.toThrow();
+  });
+
   it('uses the same point-in-time snapshot semantics after activation', async () => {
     const scripted = createScriptedProvider({ supportsRecovery: false, defaultScript: [{ kind: 'succeed' }] });
     const completion = deferred<ProviderRunTermination>();

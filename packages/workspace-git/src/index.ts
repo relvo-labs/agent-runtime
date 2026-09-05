@@ -64,11 +64,8 @@ const ENFORCED_READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = Object.f
   Object.freeze(['rev-parse', '--verify', 'HEAD']),
   Object.freeze(['ls-files', '--cached', '--']),
 ]);
-const ENFORCED_READ_ONLY_GIT_KEYS: readonly string[] = Object.freeze(
-  ENFORCED_READ_ONLY_GIT_COMMANDS.map((argv) => JSON.stringify(argv)),
-);
 
-/** Detached documentation catalog. Enforcement uses private immutable keys. */
+/** Detached documentation catalog. Enforcement uses private immutable templates. */
 export const READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = Object.freeze(
   ENFORCED_READ_ONLY_GIT_COMMANDS.map((argv) => Object.freeze([...argv])),
 );
@@ -77,17 +74,44 @@ export const READ_ONLY_GIT_SUBCOMMANDS: readonly string[] = Object.freeze(
   ENFORCED_READ_ONLY_GIT_COMMANDS.flatMap((argv) => argv.slice(0, 1)),
 );
 
-export function assertReadOnly(argv: readonly string[]): void {
-  const allowed = ENFORCED_READ_ONLY_GIT_KEYS.includes(JSON.stringify(argv));
-  if (!allowed) {
-    throw new AgentRuntimeError(
-      agentError(
-        'workspace_ownership_violation',
-        `\`git ${argv.join(' ')}\` is not permitted against a borrowed workspace`,
-        { details: { argv: [...argv], allowed: [...READ_ONLY_GIT_SUBCOMMANDS] } },
-      ),
-    );
+function primitiveArgvSnapshot(argv: readonly string[]): readonly string[] | undefined {
+  try {
+    if (!Array.isArray(argv) || Object.getPrototypeOf(argv) !== Array.prototype) return undefined;
+    const length = argv.length;
+    if (!Number.isSafeInteger(length) || length < 1) return undefined;
+    const snapshot: string[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(argv, String(index));
+      if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'string') {
+        return undefined;
+      }
+      snapshot.push(descriptor.value);
+    }
+    return Object.freeze(snapshot);
+  } catch {
+    return undefined;
   }
+}
+
+function validateReadOnly(argv: readonly string[]): readonly string[] {
+  const snapshot = primitiveArgvSnapshot(argv);
+  if (
+    snapshot !== undefined &&
+    ENFORCED_READ_ONLY_GIT_COMMANDS.some(
+      (template) => template.length === snapshot.length && template.every((value, index) => snapshot[index] === value),
+    )
+  ) {
+    return snapshot;
+  }
+  throw new AgentRuntimeError(
+    agentError('workspace_ownership_violation', 'git argv is not permitted against a borrowed workspace', {
+      details: { argv: snapshot ?? [], allowed: [...READ_ONLY_GIT_SUBCOMMANDS] },
+    }),
+  );
+}
+
+export function assertReadOnly(argv: readonly string[]): void {
+  validateReadOnly(argv);
 }
 
 export type GitWorkspaceProvider = WorkspaceProvider & {
@@ -109,13 +133,14 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
   });
 
   async function run(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult> {
-    if (lease.ownership === 'borrowed') assertReadOnly(argv);
-    const hardenedArgv = lease.ownership === 'borrowed' ? ['--no-pager', '--no-optional-locks', ...argv] : [...argv];
+    const validatedArgv = lease.ownership === 'borrowed' ? validateReadOnly(argv) : argv;
+    const hardenedArgv =
+      lease.ownership === 'borrowed' ? ['--no-pager', '--no-optional-locks', ...validatedArgv] : [...validatedArgv];
     const result = await options.runGit({ argv: hardenedArgv, cwd: lease.root });
     if (result.exitCode !== 0) {
       throw new AgentRuntimeError(
-        agentError('workspace_unavailable', `git ${argv.join(' ')} failed with exit code ${String(result.exitCode)}`, {
-          details: { argv: [...argv], exitCode: result.exitCode, stderr: result.stderr.slice(0, 2000) },
+        agentError('workspace_unavailable', `git command failed with exit code ${String(result.exitCode)}`, {
+          details: { argv: [...validatedArgv], exitCode: result.exitCode, stderr: result.stderr.slice(0, 2000) },
         }),
       );
     }

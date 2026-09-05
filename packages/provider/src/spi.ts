@@ -39,7 +39,9 @@ export type { ProviderRecoveryRecord } from '@relvo-labs/agent-protocol';
  * order. It commits them only after the owning `session.opened` or `run.started`
  * event and records an explicit warning diagnostic if the deterministic tail
  * exceeds that bound. Mutating or reusing `input` after `emit` cannot rewrite
- * an emission or change whether it was valid.
+ * an emission or change whether it was valid. Cyclic/non-plain JavaScript input
+ * becomes a typed provider-contract diagnostic; it is never staged as an event
+ * value, and `emit` remains non-throwing.
  */
 export type ProviderEventSink = {
   emit(input: ProviderEventInput): void;

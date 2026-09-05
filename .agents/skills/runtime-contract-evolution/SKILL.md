@@ -119,6 +119,12 @@ Do not use this skill when:
    conditional metadata. Add each invariant to the Ajv parity corpus; a Zod-only
    `.refine()` without JSON Schema evidence is incomplete.
 
+   Graph acyclicity is the explicit exception because JSON text and the JSON Schema
+   instance model cannot represent object identity or cycles. Apply the shared guard in
+   Zod and at hostile in-process ingress, test cyclic JavaScript graphs separately, and
+   keep Ajv parity tests scoped to JSON-representable instances. Document that boundary;
+   do not invent a schema keyword that downstream validators cannot enforce.
+
 ## Verification
 
 ```bash

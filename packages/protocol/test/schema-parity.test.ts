@@ -75,8 +75,20 @@ const agentSessionBase = {
   sequence: 1,
   turnIds: [],
 };
+const sharedDetail = { value: 'shared' };
 
 const corpus: readonly ParityCase[] = [
+  {
+    schema: 'provider-event-input',
+    value: {
+      payload: {
+        type: 'run.tool_activity',
+        toolName: 'shared-acyclic',
+        phase: 'succeeded',
+        detail: { left: sharedDetail, right: sharedDetail },
+      },
+    },
+  },
   { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.4' } },
   { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
   { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.4' } },

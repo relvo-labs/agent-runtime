@@ -190,6 +190,14 @@ export function applyEvent(record: SessionRecord, envelope: EventEnvelope): void
     case 'run.finished': {
       const run = requireRun(record, envelope.runId, payload.type);
       if (run.turnId !== payload.turnId) violation('run.finished turn ownership does not match its run');
+      if (
+        run.pendingInteractionIds.length > 0 ||
+        [...record.interactions.values()].some(
+          (interaction) => interaction.runId === run.runId && interaction.status === 'pending',
+        )
+      ) {
+        violation('run.finished requires every interaction owned by the run to be settled first');
+      }
       if (run.termination !== undefined || !canTransition(RUN_STATE_TABLE, run.state, payload.termination.outcome)) {
         violation(`run.finished cannot apply ${run.state} -> ${payload.termination.outcome}`);
       }

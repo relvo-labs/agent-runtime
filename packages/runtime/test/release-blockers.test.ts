@@ -277,6 +277,36 @@ describe('interaction and completion finalization', () => {
     });
     expect(page.events.filter((event) => event.payload.type === 'run.finished')).toHaveLength(1);
   });
+
+  it('validates provider success against the pre-settlement awaiting-interaction state', async () => {
+    const { provider, control } = controlledProvider({ emitInteraction: true });
+    const value = await fixture(provider);
+    const sessionId = await open(value);
+    await value.runtime.submitTurn({
+      commandId: value.next(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'wait for an answer' }] },
+    });
+    expect((await value.runtime.getSession(sessionId))?.runs[0]?.state).toBe('awaiting_interaction');
+
+    control.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+
+    const snapshot = await value.runtime.getSession(sessionId);
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(snapshot?.runs[0]).toMatchObject({
+      state: 'failed',
+      pendingInteractionIds: [],
+      termination: { outcome: 'failed', error: { code: 'provider_contract_violation' } },
+    });
+    expect(snapshot?.interactions[0]).toMatchObject({
+      status: 'settled',
+      settlement: { outcome: 'cancelled' },
+    });
+    expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
+    expect(page.events.filter((event) => event.payload.type === 'run.finished')).toHaveLength(1);
+  });
 });
 
 describe('shutdown boundary', () => {
@@ -362,6 +392,28 @@ describe('shutdown boundary', () => {
     await shuttingDown;
     expect(state).toBe('closed');
     expect(settledWithoutProviderCompletion).toBe(true);
+  });
+
+  it('does not let a caller-owned command id suppress internal shutdown cleanup', async () => {
+    const { provider, control } = controlledProvider();
+    const value = await fixture(provider);
+    const sessionId = await open(value);
+    const collidingCommandId = CommandIdSchema.parse(`shutdown-${sessionId}`);
+    await value.runtime.submitTurn({
+      commandId: collidingCommandId,
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'reserve the old shutdown id' }] },
+    });
+
+    const first = value.runtime.shutdown();
+    const concurrent = value.runtime.shutdown();
+    expect(concurrent).toBe(first);
+    await Promise.all([first, concurrent]);
+    expect(control.disposed).toBe(1);
+    expect((await value.runtime.getSession(sessionId))?.session.state).toBe('closed');
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(control.disposed).toBe(1);
   });
 });
 

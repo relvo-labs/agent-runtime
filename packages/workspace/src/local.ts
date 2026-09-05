@@ -49,28 +49,45 @@ class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
   #report: WorkspaceReleaseReport | undefined;
   #releasePromise: Promise<WorkspaceReleaseReport> | undefined;
 
-  // Written out rather than declared as constructor parameter properties:
-  // `erasableSyntaxOnly` forbids them, because they are not type-only syntax.
-  readonly leaseId: WorkspaceLeaseId;
-  readonly ownership: O;
-  readonly root: string;
-  readonly acquiredAt: Timestamp;
+  readonly #leaseId: WorkspaceLeaseId;
+  readonly #ownership: O;
+  readonly #root: string;
+  readonly #acquiredAt: Timestamp;
   readonly #options: LeaseRuntime;
 
   constructor(leaseId: WorkspaceLeaseId, ownership: O, root: string, acquiredAt: Timestamp, options: LeaseRuntime) {
-    this.leaseId = leaseId;
-    this.ownership = ownership;
-    this.root = root;
-    this.acquiredAt = acquiredAt;
+    this.#leaseId = leaseId;
+    this.#ownership = ownership;
+    this.#root = root;
+    this.#acquiredAt = acquiredAt;
     this.#options = options;
+    // Public fields are accessors over canonical private authority. Freezing
+    // prevents callers from shadowing those accessors with forged own fields.
+    Object.freeze(this);
+  }
+
+  get leaseId(): WorkspaceLeaseId {
+    return this.#leaseId;
+  }
+
+  get ownership(): O {
+    return this.#ownership;
+  }
+
+  get root(): string {
+    return this.#root;
+  }
+
+  get acquiredAt(): Timestamp {
+    return this.#acquiredAt;
   }
 
   describe(): WorkspaceLeaseDescriptor {
     return {
-      leaseId: this.leaseId,
-      ownership: this.ownership,
-      root: this.root,
-      acquiredAt: this.acquiredAt,
+      leaseId: this.#leaseId,
+      ownership: this.#ownership,
+      root: this.#root,
+      acquiredAt: this.#acquiredAt,
       released: this.#released,
     };
   }
@@ -92,23 +109,23 @@ class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
   async #releaseOnce(): Promise<WorkspaceReleaseReport> {
     const destructiveOperations: string[] = [];
 
-    if (this.ownership === 'managed') {
+    if (this.#ownership === 'managed') {
       await assertRemovable({
-        target: this.root,
+        target: this.#root,
         baseDirectory: this.#options.baseDirectory,
-        ownership: this.ownership,
+        ownership: this.#ownership,
         alreadyReleased: this.#released,
       });
-      await this.#options.removeDirectory(this.root);
-      destructiveOperations.push(`rm -rf ${this.root}`);
+      await this.#options.removeDirectory(this.#root);
+      destructiveOperations.push(`rm -rf ${this.#root}`);
     }
     // A borrowed lease falls through with an empty operation list. That empty
     // array is the observable form of WS-01.
 
     this.#released = true;
     this.#report = {
-      leaseId: this.leaseId,
-      ownership: this.ownership,
+      leaseId: this.#leaseId,
+      ownership: this.#ownership,
       alreadyReleased: false,
       destructiveOperations,
       releasedAt: this.#options.clock.now(),

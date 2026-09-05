@@ -97,6 +97,37 @@ describe('git workspace boundary', () => {
     expect(commands).toEqual([]);
   });
 
+  it('rejects serialization and prototype tricks and never executes caller-owned argv', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-argv-test-'));
+    roots.push(root);
+    const borrowed = join(root, 'borrowed');
+    await mkdir(borrowed);
+    const commands: GitCommand[] = [];
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+
+    const ownToJson = ['diff', '--output=/tmp/outside'];
+    Object.defineProperty(ownToJson, 'toJSON', { value: () => ['status', '--short'] });
+    const inheritedToJson = ['checkout', 'main'];
+    const maliciousPrototype = Object.create(Array.prototype) as object;
+    Object.defineProperty(maliciousPrototype, 'toJSON', {
+      value: () => ['rev-parse', '--verify', 'HEAD'],
+    });
+    Object.setPrototypeOf(inheritedToJson, maliciousPrototype);
+
+    await expect(provider.git(lease, ownToJson)).rejects.toThrow();
+    await expect(provider.git(lease, inheritedToJson)).rejects.toThrow();
+    expect(commands).toEqual([]);
+  });
+
   it('cleans an owned root when clone setup fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'relvo-git-test-'));
     roots.push(root);

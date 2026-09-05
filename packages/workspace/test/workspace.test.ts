@@ -49,6 +49,23 @@ describe('workspace ownership', () => {
     expect((await stat(borrowed)).isDirectory()).toBe(true);
   });
 
+  it('does not trust caller-mutable lease fields for destructive authorization', async () => {
+    const { baseDirectory, borrowed, removed, provider } = await fixture();
+    await mkdir(baseDirectory, { recursive: true });
+    const callerData = join(baseDirectory, 'caller-data');
+    await mkdir(callerData);
+    const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+
+    expect(Reflect.set(lease, 'ownership', 'managed')).toBe(false);
+    expect(Reflect.set(lease, 'root', callerData)).toBe(false);
+    const report = await lease.release();
+
+    expect(report).toMatchObject({ ownership: 'borrowed', destructiveOperations: [] });
+    expect(removed).toEqual([]);
+    expect((await stat(callerData)).isDirectory()).toBe(true);
+    expect((await stat(borrowed)).isDirectory()).toBe(true);
+  });
+
   it('removes only a newly created managed root and is idempotent', async () => {
     const { removed, provider } = await fixture();
     const lease = await provider.acquire({ kind: 'managed', name: 'owned' });

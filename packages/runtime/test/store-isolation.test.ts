@@ -364,4 +364,57 @@ describe('projection transition validation', () => {
       }),
     ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
   });
+
+  it('rejects a terminal run event until every pending interaction is explicitly settled', async () => {
+    const value = setup();
+    const turnId = TurnIdSchema.parse(value.idFactory.next('turn'));
+    const runId = RunIdSchema.parse(value.idFactory.next('run'));
+    const interactionId = InteractionIdSchema.parse(value.idFactory.next('interaction'));
+    await value.store.commit((tx) => {
+      tx.createSession(value.session);
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'session.opened', providerId: 'scripted', workspace: value.session.workspace },
+      });
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'turn.started', turnId, input: { parts: [{ type: 'text', text: 'pending' }] } },
+      });
+      tx.emit({ sessionId: value.sessionId, runId, payload: { type: 'run.started', turnId, attempt: 1 } });
+      tx.emit({
+        sessionId: value.sessionId,
+        runId,
+        payload: {
+          type: 'interaction.requested',
+          interactionId,
+          turnId,
+          request: { kind: 'question', prompt: 'still pending', multiSelect: false },
+        },
+      });
+    });
+
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: {
+            type: 'run.finished',
+            turnId,
+            termination: {
+              outcome: 'failed',
+              at: value.clock.now(),
+              error: { code: 'internal', message: 'must settle first', retryable: false },
+            },
+          },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+
+    expect((await value.store.read(value.sessionId))?.runs[0]).toMatchObject({
+      state: 'awaiting_interaction',
+      pendingInteractionIds: [interactionId],
+    });
+    expect((await value.store.readInteraction(value.sessionId, interactionId))?.status).toBe('pending');
+  });
 });

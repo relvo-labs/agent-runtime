@@ -55,6 +55,10 @@ Do not use this skill when:
    There is no promotion from `borrowed` to `managed`. A caller cannot opt a borrowed
    directory into cleanup.
 
+   Concrete leases keep canonical ownership and root in private immutable state.
+   TypeScript `readonly` fields are not authority: freeze public accessors/views, and
+   make destructive checks read only values captured privately at acquisition.
+
 2. **Never write a destructive call that is not guarded.** Every removal must pass
    `assertRemovable()`, which requires _all_ of:
    - the lease exists and its `ownership === 'managed'`
@@ -82,6 +86,9 @@ Do not use this skill when:
    git directly from library code. Exact borrowed-workspace templates used for enforcement
    stay private and deeply immutable. Any exported command catalog is a deeply frozen,
    detached documentation snapshot; JavaScript mutation of it must never widen the policy.
+   Never compare argv by serialization. Require an ordinary array of own primitive string
+   entries, compare length and elements against private templates, and execute a detached
+   validated copy so `toJSON`, prototypes, accessors, or mutation cannot swap the command.
 
 6. **Leases outlive runs, not sessions.** A lease is acquired when a session opens and
    released when the session closes or fails. Interrupting a run must not touch the

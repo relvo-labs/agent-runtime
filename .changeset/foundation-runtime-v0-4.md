@@ -21,7 +21,12 @@ idempotency per command and session without blocking unrelated sessions. Store v
 mutation-isolated, provider emissions are snapshotted at each call, projection replay rejects
 impossible transitions and ownership, completion/interaction races settle once, and
 cleanup-aware shutdown coalesces concurrent attempts while preserving retry after provider or
-workspace failure. Line-bound wire documents enforce exact v0.4 in Zod and JSON Schema, and
-the borrowed-Git catalog cannot mutate its private enforcement policy. Zod/JSON Schema safety
-refinements have executable parity evidence. No package publication or live provider
-integration is included.
+workspace failure. Cyclic provider/JSON-value graphs are rejected before staging while shared
+acyclic references remain valid. Failed external effects reserve their command fingerprint;
+failed-open rollback cleanup remains visible to exact retry and shutdown, whose internal close
+cannot collide with caller command IDs. Provider completion is validated before interaction
+settlement and replay rejects terminal runs with pending interactions. Local lease cleanup uses
+private authority state, while borrowed-Git validates primitive argv and executes a detached
+copy immune to serialization/prototype tricks. Line-bound wire documents enforce exact v0.4 in
+Zod and JSON Schema. Zod/JSON Schema safety refinements have executable parity evidence. No
+package publication or live provider integration is included.

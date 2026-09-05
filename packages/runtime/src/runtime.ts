@@ -22,6 +22,7 @@ import {
   canonicalCommandFingerprint,
   canTransition,
   isCommandAdmissible,
+  isJsonValue,
   SubscriptionRequestSchema,
   toAgentError,
   WIRE_VERSION,
@@ -129,6 +130,21 @@ type LiveSession = {
   closing: boolean;
 };
 
+type CommandAttempt = {
+  readonly fingerprint: string;
+  readonly acceptedAt: Timestamp;
+  readonly command: AgentCommand;
+};
+
+type OpenRollback = {
+  readonly command: Extract<AgentCommand, { type: 'open_session' }>;
+  readonly acceptedAt: Timestamp;
+  readonly sessionId: SessionId;
+  readonly failure: CommandReceipt;
+  readonly providerSession?: ProviderSession;
+  readonly lease?: WorkspaceLease;
+};
+
 export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const clock = options.clock ?? createSystemClock();
   const idFactory = options.idFactory ?? createCounterIdFactory();
@@ -141,6 +157,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const pending = new Set<Promise<unknown>>();
   const commandQueues = new Map<string, Promise<void>>();
   const sessionQueues = new Map<string, Promise<void>>();
+  const commandAttempts = new Map<CommandId, CommandAttempt>();
+  const openRollbacks = new Map<CommandId, OpenRollback>();
   let lifecycle: 'accepting' | 'shutting_down' | 'shut_down' = 'accepting';
   let shutdownPromise: Promise<void> | undefined;
 
@@ -210,6 +228,39 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     });
   }
 
+  function reserveCommandAttempt(command: AgentCommand, acceptedAt: Timestamp): void {
+    if (!commandAttempts.has(command.commandId)) {
+      commandAttempts.set(command.commandId, {
+        fingerprint: canonicalCommandFingerprint(command),
+        acceptedAt,
+        command,
+      });
+    }
+  }
+
+  function attemptConflict(command: AgentCommand, attempt: CommandAttempt): CommandReceipt | undefined {
+    if (attempt.fingerprint === canonicalCommandFingerprint(command)) return undefined;
+    return receipt(
+      command,
+      'rejected',
+      {
+        error: agentError(
+          'command_id_conflict',
+          `command id \`${command.commandId}\` was already used with a different payload`,
+          { details: { commandId: command.commandId, commandType: command.type } },
+        ),
+      },
+      attempt.acceptedAt,
+    );
+  }
+
+  async function existingCommandOutcome(command: AgentCommand): Promise<CommandReceipt | undefined> {
+    const existing = await store.findReceipt(command.commandId);
+    if (existing !== undefined) return dedupe(command, existing);
+    const attempt = commandAttempts.get(command.commandId);
+    return attempt === undefined ? undefined : attemptConflict(command, attempt);
+  }
+
   type CleanupFailure = {
     readonly phase: 'run_interrupt' | 'provider_dispose' | 'workspace_release';
     readonly error: AgentError;
@@ -255,6 +306,43 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         ),
       },
     );
+  }
+
+  async function finishOpenRollback(rollback: OpenRollback): Promise<CommandReceipt> {
+    const failures: CleanupFailure[] = [];
+    if (rollback.providerSession !== undefined) {
+      try {
+        await rollback.providerSession.dispose();
+      } catch (error) {
+        failures.push({
+          phase: 'provider_dispose',
+          error: toAgentError(error, 'provider_unavailable'),
+          cause: error,
+        });
+      }
+    }
+    if (rollback.lease !== undefined) {
+      try {
+        await rollback.lease.release();
+      } catch (error) {
+        failures.push({
+          phase: 'workspace_release',
+          error: toAgentError(error, 'workspace_unavailable'),
+          cause: error,
+        });
+      }
+    }
+    if (failures.length > 0) throw sessionCleanupError(rollback.sessionId, failures);
+
+    await store.commit((tx) => {
+      tx.recordReceipt(rollback.command.commandId, {
+        fingerprint: canonicalCommandFingerprint(rollback.command),
+        receipt: rollback.failure,
+      });
+    });
+    openRollbacks.delete(rollback.command.commandId);
+    commandAttempts.delete(rollback.command.commandId);
+    return rollback.failure;
   }
 
   /**
@@ -323,13 +411,20 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
   /** Capture validity and values before control returns to provider code. */
   function captureProviderEvent(input: ProviderEventInput): CapturedProviderEvent {
-    const parsed = ProviderEventInputSchema.safeParse(input);
-    return parsed.success
-      ? { valid: true, input: freezeProviderValue(parsed.data) }
-      : {
-          valid: false,
-          diagnostic: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
-        };
+    try {
+      if (!isJsonValue(input)) {
+        return { valid: false, diagnostic: 'provider emitted an invalid event: input is not acyclic plain JSON data' };
+      }
+      const parsed = ProviderEventInputSchema.safeParse(input);
+      return parsed.success
+        ? { valid: true, input: freezeProviderValue(parsed.data) }
+        : {
+            valid: false,
+            diagnostic: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
+          };
+    } catch {
+      return { valid: false, diagnostic: 'provider emitted an invalid event: input could not be inspected safely' };
+    }
   }
 
   async function ingestProviderEvent(
@@ -351,6 +446,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             type: 'diagnostic',
             level: 'warning',
             message: captured.diagnostic,
+            detail: { code: 'provider_contract_violation' },
           },
         });
         return;
@@ -521,6 +617,20 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             // second completion is dropped rather than double-counted.
             if (!run || run.termination !== undefined) return;
 
+            // Validate against the state in which the provider completed. The
+            // cancellation events below may resume an awaiting run to running,
+            // but that bookkeeping must not make an impossible success valid.
+            const termination = canTransition(RUN_STATE_TABLE, run.state, stamped.outcome)
+              ? stamped
+              : {
+                  outcome: 'failed' as const,
+                  at: clock.now(),
+                  error: agentError(
+                    'provider_contract_violation',
+                    `provider completed with ${stamped.outcome} while run was ${run.state}`,
+                  ),
+                };
+
             for (const interactionId of run.pendingInteractionIds) {
               const interaction = tx.session(sessionId).interactions.get(interactionId);
               if (!interaction || interaction.status === 'settled') continue;
@@ -538,16 +648,6 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
             const current = tx.session(sessionId).runs.get(runId);
             if (current === undefined || current.termination !== undefined) return;
-            const termination = canTransition(RUN_STATE_TABLE, current.state, stamped.outcome)
-              ? stamped
-              : {
-                  outcome: 'failed' as const,
-                  at: clock.now(),
-                  error: agentError(
-                    'provider_contract_violation',
-                    `provider completed with ${stamped.outcome} while run was ${current.state}`,
-                  ),
-                };
 
             tx.emit({ sessionId, runId, payload: { type: 'run.finished', turnId, termination } });
 
@@ -605,29 +705,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
-    const duplicate = await store.findReceipt(command.commandId);
-    if (duplicate) {
-      const fingerprint = canonicalCommandFingerprint(command);
-      if (duplicate.fingerprint !== fingerprint) {
-        return receipt(
-          command,
-          'rejected',
-          {
-            error: agentError(
-              'command_id_conflict',
-              `command id \`${command.commandId}\` was already used with a different payload`,
-            ),
-          },
-          duplicate.receipt.acceptedAt,
-        );
-      }
-      return duplicate.receipt.disposition === 'rejected'
-        ? duplicate.receipt
-        : CommandReceiptSchema.parse({ ...duplicate.receipt, disposition: 'duplicate' });
-    }
+    const existing = await existingCommandOutcome(command);
+    if (existing !== undefined) return existing;
+    const rollback = openRollbacks.get(command.commandId);
+    if (rollback !== undefined) return await finishOpenRollback(rollback);
 
     const acceptedAt = clock.now();
     const sessionId = idFactory.next('session') as SessionId;
+    reserveCommandAttempt(command, acceptedAt);
 
     // Acquiring a workspace and a provider session are effects that cannot live
     // inside a store transaction, so they happen first and are rolled back by
@@ -699,20 +784,27 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         return produced;
       });
       await sessionEvents.activate();
+      commandAttempts.delete(command.commandId);
       return produced;
     } catch (error) {
       sessionEvents.discard();
       live.delete(sessionId);
-      await providerSession?.dispose().catch(() => undefined);
-      if (leaseSafeToRelease) await lease?.release().catch(() => undefined);
-      const failure = receipt(command, 'rejected', { error: toAgentError(error, 'internal') }, acceptedAt);
-      await store.commit((tx) => {
-        tx.recordReceipt(command.commandId, {
-          fingerprint: canonicalCommandFingerprint(command),
-          receipt: failure,
-        });
-      });
-      return failure;
+      const failure = receipt(
+        command,
+        'rejected',
+        { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'internal') },
+        acceptedAt,
+      );
+      const rollback: OpenRollback = {
+        command,
+        acceptedAt,
+        sessionId,
+        failure,
+        ...(providerSession === undefined ? {} : { providerSession }),
+        ...(!leaseSafeToRelease || lease === undefined ? {} : { lease }),
+      };
+      openRollbacks.set(command.commandId, rollback);
+      return await finishOpenRollback(rollback);
     }
   }
 
@@ -730,8 +822,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const command = parsed.command;
 
     const acceptedAt = clock.now();
-    const existing = await store.findReceipt(command.commandId);
-    if (existing) return dedupe(command, existing);
+    const existing = await existingCommandOutcome(command);
+    if (existing !== undefined) return existing;
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'submit_turn', acceptedAt);
@@ -814,8 +906,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const command = parsed.command;
 
     const acceptedAt = clock.now();
-    const existing = await store.findReceipt(command.commandId);
-    if (existing) return dedupe(command, existing);
+    const existing = await existingCommandOutcome(command);
+    if (existing !== undefined) return existing;
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'interrupt_run', acceptedAt);
@@ -877,8 +969,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const command = parsed.command;
 
     const acceptedAt = clock.now();
-    const existing = await store.findReceipt(command.commandId);
-    if (existing) return dedupe(command, existing);
+    const existing = await existingCommandOutcome(command);
+    if (existing !== undefined) return existing;
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'respond_to_interaction', acceptedAt);
@@ -1006,17 +1098,25 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     });
   }
 
-  async function closeSession(input: CloseSessionCommandInput): Promise<CommandReceipt> {
+  async function closeSession(input: CloseSessionCommandInput, internal = false): Promise<CommandReceipt> {
     const parsed = parseCommand(CloseSessionCommandSchema, input, 'close_session');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
-    const acceptedAt = clock.now();
-    const existing = await store.findReceipt(command.commandId);
-    if (existing) return dedupe(command, existing);
+    let acceptedAt: Timestamp;
+    if (!internal) {
+      const existing = await existingCommandOutcome(command);
+      if (existing !== undefined) return existing;
+      acceptedAt = commandAttempts.get(command.commandId)?.acceptedAt ?? clock.now();
+    } else {
+      acceptedAt = clock.now();
+    }
 
     const snapshot = await store.read(command.sessionId);
     if (!snapshot) {
+      if (internal) {
+        throw new AgentRuntimeError(agentError('unknown_session', `unknown session \`${command.sessionId}\``));
+      }
       return await rejectAndRecord(
         command,
         receipt(
@@ -1028,11 +1128,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       );
     }
     if (snapshot.session.state === 'closed' || snapshot.session.state === 'failed') {
-      return await recordApplied(
-        command,
-        { type: 'session_closed', sessionId: command.sessionId, interruptedActiveRun: false },
-        acceptedAt,
-      );
+      const result = { type: 'session_closed' as const, sessionId: command.sessionId, interruptedActiveRun: false };
+      return internal
+        ? receipt(command, 'applied', { result }, acceptedAt)
+        : await recordApplied(command, result, acceptedAt);
     }
 
     const session = requireOpenSession(command.sessionId);
@@ -1055,6 +1154,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         ),
       );
     }
+
+    if (!internal) reserveCommandAttempt(command, acceptedAt);
 
     await commitAndPublish((tx) => {
       const current = tx.session(command.sessionId).session.state;
@@ -1181,10 +1282,21 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         },
         acceptedAt,
       );
-      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
+      if (!internal) {
+        tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
+      }
       return value;
     });
     live.delete(command.sessionId);
+    if (internal) {
+      for (const [commandId, attempt] of commandAttempts) {
+        if ('sessionId' in attempt.command && attempt.command.sessionId === command.sessionId) {
+          commandAttempts.delete(commandId);
+        }
+      }
+    } else {
+      commandAttempts.delete(command.commandId);
+    }
     return produced;
   }
 
@@ -1339,6 +1451,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
         }
         const failures: { sessionId: SessionId; error: AgentError; cause: unknown }[] = [];
+        for (const rollback of [...openRollbacks.values()]) {
+          try {
+            await finishOpenRollback(rollback);
+          } catch (error) {
+            failures.push({ sessionId: rollback.sessionId, error: toAgentError(error, 'internal'), cause: error });
+          }
+        }
         for (const sessionId of [...live.keys()]) {
           const command = {
             commandId: `shutdown-${sessionId}` as CommandId,
@@ -1347,7 +1466,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             ifRunActive: 'interrupt' as const,
           };
           try {
-            await coordinateCommand(command, () => closeSession(command));
+            await serializeByKey(sessionQueues, sessionId, () => closeSession(command, true));
           } catch (error) {
             failures.push({ sessionId, error: toAgentError(error, 'internal'), cause: error });
           }
@@ -1356,9 +1475,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
         }
         if (failures.length > 0) throw shutdownCleanupError(failures);
-        if (live.size > 0) {
+        if (live.size > 0 || openRollbacks.size > 0) {
           throw new AgentRuntimeError(
-            agentError('internal', `runtime shutdown left ${String(live.size)} live session(s)`),
+            agentError(
+              'internal',
+              `runtime shutdown left ${String(live.size)} live session(s) and ${String(openRollbacks.size)} rollback cleanup(s)`,
+            ),
           );
         }
         await quiesce();

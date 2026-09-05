@@ -31,6 +31,7 @@ import type {
 } from '@relvo-labs/agent-workspace';
 
 import { coordinationEntryCountForTesting, createAgentRuntime, type AgentRuntime } from '../src/runtime.ts';
+import { createInMemoryStore, type RuntimeStore, type StoreTransaction } from '../src/store.ts';
 
 type CleanupControl = {
   disposeAttempts: number;
@@ -192,6 +193,191 @@ async function openAndStart(value: CleanupFixture): Promise<SessionId> {
   return opened.result.sessionId;
 }
 
+async function rollbackFixture(
+  releaseFailures: number,
+  options: { readonly failOpenCommit?: boolean; readonly disposeFailures?: number } = {},
+) {
+  const root = await mkdtemp(join(tmpdir(), 'relvo-open-rollback-test-'));
+  roots.push(root);
+  const borrowed = join(root, 'borrowed');
+  await mkdir(borrowed);
+  const clock = createFixedClock();
+  const ids = createCounterIdFactory();
+  let acquireAttempts = 0;
+  let createAttempts = 0;
+  let disposeAttempts = 0;
+  let disposeFailuresRemaining = options.disposeFailures ?? 0;
+  let releaseAttempts = 0;
+  let failuresRemaining = releaseFailures;
+  let released = false;
+  const lease: BorrowedWorkspaceLease = {
+    leaseId: WorkspaceLeaseIdSchema.parse(ids.next('workspaceLease')),
+    ownership: 'borrowed',
+    root: borrowed,
+    acquiredAt: clock.now(),
+    describe() {
+      return {
+        leaseId: this.leaseId,
+        ownership: this.ownership,
+        root: this.root,
+        acquiredAt: this.acquiredAt,
+        released,
+      };
+    },
+    release(): Promise<WorkspaceReleaseReport> {
+      releaseAttempts += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        return Promise.reject(new Error('rollback release failed'));
+      }
+      released = true;
+      return Promise.resolve({
+        leaseId: this.leaseId,
+        ownership: this.ownership,
+        alreadyReleased: false,
+        destructiveOperations: [],
+        releasedAt: clock.now(),
+      });
+    },
+  };
+  function acquire(_spec: ExistingWorkspaceSpec): Promise<BorrowedWorkspaceLease>;
+  function acquire(_spec: ManagedWorkspaceSpec): Promise<ManagedWorkspaceLease>;
+  function acquire(_spec: WorkspaceSpec): Promise<WorkspaceLease>;
+  function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
+    acquireAttempts += 1;
+    return spec.kind === 'existing'
+      ? Promise.resolve(lease)
+      : Promise.reject(new Error('managed workspaces are not used by this fixture'));
+  }
+  const workspaces: WorkspaceProvider = {
+    acquire,
+    releaseAll: () => Promise.reject(new Error('runtime must use retained rollback cleanup')),
+  };
+  const descriptor = defineProviderDescriptor({
+    providerId: 'rollback-test',
+    providerVersion: '0.1.0',
+    displayName: 'Rollback test provider',
+    run: { interrupt: { mode: 'unsupported' }, streaming: {} },
+    interaction: { approval: {}, question: {} },
+    workspace: { requires: 'directory' },
+    recovery: {},
+  });
+  const provider: AgentProvider = {
+    describe: () => descriptor,
+    createSession(): Promise<ProviderSession> {
+      createAttempts += 1;
+      if (!options.failOpenCommit) return Promise.reject(new Error('provider startup failed'));
+      return Promise.resolve({
+        startRun: () => Promise.reject(new Error('run is not used by this fixture')),
+        respondToInteraction: () => Promise.reject(new Error('interaction is not used by this fixture')),
+        dispose(): Promise<void> {
+          disposeAttempts += 1;
+          if (disposeFailuresRemaining > 0) {
+            disposeFailuresRemaining -= 1;
+            return Promise.reject(new Error('rollback dispose failed'));
+          }
+          return Promise.resolve();
+        },
+      });
+    },
+  };
+  const baseStore = createInMemoryStore({ clock, idFactory: ids });
+  let rejectNextCommit = options.failOpenCommit === true;
+  const store: RuntimeStore = {
+    get revision() {
+      return baseStore.revision;
+    },
+    commit<T>(mutate: (tx: StoreTransaction) => T) {
+      if (rejectNextCommit) {
+        rejectNextCommit = false;
+        return Promise.reject(new Error('open commit failed'));
+      }
+      return baseStore.commit(mutate);
+    },
+    read: (sessionId) => baseStore.read(sessionId),
+    readEvents: (sessionId, fromSequence, limit) => baseStore.readEvents(sessionId, fromSequence, limit),
+    readInteraction: (sessionId, interactionId) => baseStore.readInteraction(sessionId, interactionId),
+    findReceipt: (commandId) => baseStore.findReceipt(commandId),
+    listSessions: () => baseStore.listSessions(),
+  };
+  const runtime = createAgentRuntime({ workspaces, providers: [provider], clock, idFactory: ids, store });
+  runtimes.push(runtime);
+  return {
+    runtime,
+    borrowed,
+    counts: () => ({ acquireAttempts, createAttempts, disposeAttempts, releaseAttempts }),
+  };
+}
+
+describe('open rollback cleanup failures', () => {
+  it('retains failed rollback cleanup for an exact retry without reacquiring', async () => {
+    const value = await rollbackFixture(1);
+    const command = {
+      commandId: CommandIdSchema.parse('open-rollback-transient'),
+      type: 'open_session' as const,
+      providerId: 'rollback-test',
+      workspace: { kind: 'existing' as const, path: value.borrowed },
+    };
+
+    await expect(value.runtime.openSession(command)).rejects.toMatchObject({
+      error: { code: 'workspace_unavailable', details: { failures: [{ phase: 'workspace_release' }] } },
+    });
+    await expect(value.runtime.openSession({ ...command, providerOptions: { changed: true } })).resolves.toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 1 });
+
+    await expect(value.runtime.openSession(command)).resolves.toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'internal' },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 2 });
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('keeps persistent rollback cleanup visible to shutdown and its retries', async () => {
+    const value = await rollbackFixture(Number.POSITIVE_INFINITY);
+    const command = {
+      commandId: CommandIdSchema.parse('open-rollback-persistent'),
+      type: 'open_session' as const,
+      providerId: 'rollback-test',
+      workspace: { kind: 'existing' as const, path: value.borrowed },
+    };
+
+    await expect(value.runtime.openSession(command)).rejects.toMatchObject({
+      error: { code: 'workspace_unavailable' },
+    });
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({
+      error: { code: 'workspace_unavailable' },
+    });
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({
+      error: { code: 'workspace_unavailable' },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 3 });
+  });
+
+  it('best-effort retries both provider disposal and lease release after an open commit failure', async () => {
+    const value = await rollbackFixture(1, { failOpenCommit: true, disposeFailures: 1 });
+    const command = {
+      commandId: CommandIdSchema.parse('open-rollback-both-phases'),
+      type: 'open_session' as const,
+      providerId: 'rollback-test',
+      workspace: { kind: 'existing' as const, path: value.borrowed },
+    };
+
+    await expect(value.runtime.openSession(command)).rejects.toMatchObject({
+      error: {
+        code: 'provider_unavailable',
+        details: { failures: [{ phase: 'provider_dispose' }, { phase: 'workspace_release' }] },
+      },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 1, releaseAttempts: 1 });
+    await expect(value.runtime.openSession(command)).resolves.toMatchObject({ disposition: 'rejected' });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 2, releaseAttempts: 2 });
+  });
+});
+
 describe('close cleanup failures', () => {
   it.each([
     ['dispose-only', 1, 0, 'provider_unavailable', ['provider_dispose']],
@@ -277,6 +463,31 @@ describe('close cleanup failures', () => {
     expect(events.events.filter((event) => event.payload.type === 'turn.settled')).toHaveLength(1);
     expect(events.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(1);
     expect(value.control.interruptAttempts).toBe(2);
+    expect(value.control.disposeAttempts).toBe(2);
+    expect(value.control.releaseAttempts).toBe(2);
+  });
+
+  it('reserves the failed close fingerprint and rejects a changed retry before cleanup', async () => {
+    const value = await cleanupFixture(1, 1);
+    const sessionId = await openAndStart(value);
+    const command = {
+      commandId: value.next(),
+      type: 'close_session' as const,
+      sessionId,
+      ifRunActive: 'interrupt' as const,
+    };
+
+    await expect(value.runtime.closeSession(command)).rejects.toMatchObject({
+      error: { code: 'provider_unavailable' },
+    });
+    await expect(value.runtime.closeSession({ ...command, ifRunActive: 'reject' })).resolves.toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(value.control.disposeAttempts).toBe(1);
+    expect(value.control.releaseAttempts).toBe(1);
+
+    await expect(value.runtime.closeSession(command)).resolves.toMatchObject({ disposition: 'applied' });
     expect(value.control.disposeAttempts).toBe(2);
     expect(value.control.releaseAttempts).toBe(2);
   });

@@ -54,7 +54,9 @@ Do not use this skill when:
    a semantic payload only. It must never invent `eventId`, `sequence`, `occurredAt`,
    or a provider sequence. Runtime snapshots and validates the whole input synchronously
    during each `emit()` call, so object reuse or later mutation cannot rewrite history.
-   If you need envelope identity or ordering, you are in the wrong layer.
+   Pass ordinary acyclic data, not getters or proxies. Self/mutual cycles become a typed
+   provider-contract diagnostic before staging; repeated references are valid if the graph
+   is acyclic. If you need envelope identity or ordering, you are in the wrong layer.
 
 2. **Keep native identity internal.** Provider-native conversation IDs, thread handles,
    file descriptors and checkpoints stay behind `ProviderRun` / `ProviderSession`, which
@@ -95,6 +97,10 @@ Do not use this skill when:
    Emit a new interaction only while its run is `running` or
    `awaiting_interaction`. Once interruption begins, a late request is a provider-contract
    violation recorded as a diagnostic; it cannot create routing state or resume the run.
+
+   Do not report success while a run is awaiting an interaction. Runtime validates
+   completion against the pre-settlement run state, records explicit interaction
+   settlements, and only then records the terminal run event.
 
 6. **Respect the trust boundary.** An in-process provider is a **trusted plugin**. It runs
    with full process privileges. Do not write code, docs or permission prompts implying

@@ -8,6 +8,8 @@ import {
   AgentInteractionSchema,
   AgentRunSchema,
   CommandIdSchema,
+  JsonValueSchema,
+  ProviderEventInputSchema,
   RUN_STATE_TABLE,
   RunIdSchema,
   ProviderRecoveryRecordSchema,
@@ -41,6 +43,9 @@ describe('wire contract', () => {
     expect(AgentCommandSchema.safeParse({ ...base, providerOptions: { callback: () => undefined } }).success).toBe(
       false,
     );
+    const cyclicOptions: Record<string, unknown> = {};
+    cyclicOptions.self = cyclicOptions;
+    expect(AgentCommandSchema.safeParse({ ...base, providerOptions: cyclicOptions }).success).toBe(false);
   });
 
   it('rejects non-JSON objects and cycles at the explicit boundary guard', () => {
@@ -49,7 +54,45 @@ describe('wire contract', () => {
     expect(isJsonValue(new Error('no'))).toBe(false);
     expect(isJsonValue(new Map())).toBe(false);
     expect(isJsonValue(cyclic)).toBe(false);
+    const throwingAccessor = {};
+    Object.defineProperty(throwingAccessor, 'value', {
+      enumerable: true,
+      get(): never {
+        throw new Error('hostile getter');
+      },
+    });
+    expect(isJsonValue(throwingAccessor)).toBe(false);
     expect(isJsonValue({ ok: ['yes', 1, false, null] })).toBe(true);
+  });
+
+  it('rejects cyclic JavaScript graphs in authoritative JSON-value schemas', () => {
+    const objectCycle: Record<string, unknown> = {};
+    objectCycle.self = objectCycle;
+    const arrayCycle: unknown[] = [];
+    arrayCycle.push(arrayCycle);
+    const mutualObject: Record<string, unknown> = {};
+    const mutualArray: unknown[] = [mutualObject];
+    mutualObject.array = mutualArray;
+
+    for (const detail of [objectCycle, { arrayCycle }, mutualObject]) {
+      expect(JsonValueSchema.safeParse(detail).success).toBe(false);
+      expect(
+        ProviderEventInputSchema.safeParse({
+          payload: { type: 'run.tool_activity', toolName: 'cycle', phase: 'invoked', detail },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('accepts JSON-serializable shared references when the graph is acyclic', () => {
+    const shared = { value: 'shared' };
+    const graph = { left: shared, right: shared, list: [shared] };
+    expect(isJsonValue(graph)).toBe(true);
+    const parsed = ProviderEventInputSchema.safeParse({
+      payload: { type: 'run.tool_activity', toolName: 'shared', phase: 'succeeded', detail: graph },
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(() => JSON.stringify(parsed.data)).not.toThrow();
   });
 
   it('requires terminal run state and termination outcome to agree', () => {

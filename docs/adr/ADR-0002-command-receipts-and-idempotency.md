@@ -13,6 +13,13 @@ fingerprint and first receipt. Same ID plus same payload returns `duplicate` wit
 original result and time. Same ID plus another payload returns `command_id_conflict`.
 Persist rejections as well as success.
 
+An external effect that fails before a receipt can be committed retains its first
+fingerprint and acceptance time. Only the exact command may retry that effect or its
+cleanup; the same ID with changed payload returns `command_id_conflict`. Successful
+completion replaces the attempt reservation with the canonical receipt. In-memory
+reservations last for the Runtime instance; a durable implementation must persist the
+claim before invoking the effect.
+
 Within one Runtime instance, an active command-ID coordinator makes the receipt check and
 effect one critical section. A separate per-session coordinator serializes state-changing
 commands for one session, including competing interaction settlements, while unrelated
