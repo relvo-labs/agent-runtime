@@ -28,6 +28,7 @@ import { RunStateSchema, SessionStateSchema, TurnStateSchema } from './lifecycle
 import { InteractionRequestSchema, InteractionSettlementSchema } from './interaction.ts';
 import { RunTerminationSchema, TurnInputSchema, UsageSchema } from './entities.ts';
 import { WorkspaceLeaseDescriptorSchema, WorkspaceReleaseReportSchema } from './workspace.ts';
+import { WIRE_VERSION } from './version.ts';
 
 // ---------------------------------------------------------------------------
 // Payloads
@@ -203,7 +204,7 @@ export const EventEnvelopeSchema = z.strictObject({
    */
   sequence: SequenceSchema,
   occurredAt: TimestampSchema,
-  wireVersion: z.string().min(1),
+  wireVersion: z.literal(WIRE_VERSION),
   payload: EventPayloadSchema,
 });
 

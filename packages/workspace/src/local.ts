@@ -79,8 +79,14 @@ class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
     if (this.#releasePromise !== undefined) {
       return this.#releasePromise.then((report) => structuredClone({ ...report, alreadyReleased: true }));
     }
-    this.#releasePromise = this.#releaseOnce();
-    return this.#releasePromise.then((report) => structuredClone(report));
+    const operation = this.#releaseOnce();
+    this.#releasePromise = operation;
+    void operation.catch(() => {
+      // A failed cleanup did not release the lease. Clear only this attempt so
+      // a later caller can retry, while concurrent callers still share it.
+      if (!this.#released && this.#releasePromise === operation) this.#releasePromise = undefined;
+    });
+    return operation.then((report) => structuredClone(report));
   }
 
   async #releaseOnce(): Promise<WorkspaceReleaseReport> {

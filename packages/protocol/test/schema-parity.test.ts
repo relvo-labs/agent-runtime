@@ -53,8 +53,42 @@ const providerDescriptorBase = {
   recovery: { exportsRecoveryRecord: false, resumesFromRecoveryRecord: false },
   extensions: {},
 };
+const eventEnvelopeBase = {
+  eventId: 'evt_0000000000000001',
+  sessionId: 'ses_0000000000000001',
+  sequence: 1,
+  occurredAt: timestamp,
+  payload: { type: 'diagnostic', level: 'info', message: 'known' },
+};
+const agentSessionBase = {
+  sessionId: 'ses_0000000000000001',
+  state: 'ready',
+  providerId: 'fixture',
+  workspace: {
+    leaseId: 'wsl_0000000000000001',
+    ownership: 'borrowed',
+    root: '/workspace',
+    acquiredAt: timestamp,
+    released: false,
+  },
+  createdAt: timestamp,
+  sequence: 1,
+  turnIds: [],
+};
 
 const corpus: readonly ParityCase[] = [
+  { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.4' } },
+  { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
+  { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.4' } },
+  { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.5' } },
+  {
+    schema: 'provider-recovery-record',
+    value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.4', opaque: {} },
+  },
+  {
+    schema: 'provider-recovery-record',
+    value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.5', opaque: {} },
+  },
   { schema: 'turn-input', value: { parts: [{ type: 'file_ref', path: 'src/index.ts' }] } },
   { schema: 'turn-input', value: { parts: [{ type: 'file_ref', path: '/etc/passwd' }] } },
   { schema: 'turn-input', value: { parts: [{ type: 'file_ref', path: '../outside' }] } },
@@ -138,5 +172,21 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     const validate = ajv.compile(JSON_SCHEMAS[schema]);
     const zodAccepted = PUBLISHED_SCHEMAS[schema].safeParse(value).success;
     expect(validate(value), JSON.stringify(validate.errors)).toBe(zodAccepted);
+  });
+
+  it.each([
+    { schema: 'event-envelope' as const, value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
+    { schema: 'agent-session' as const, value: { ...agentSessionBase, wireVersion: '0.5' } },
+    {
+      schema: 'provider-recovery-record' as const,
+      value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.5', opaque: {} },
+    },
+  ])('rejects a version-only mismatch in both $schema validators', ({ schema, value }) => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS[schema]);
+    expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
+    expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
   });
 });

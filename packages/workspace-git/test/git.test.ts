@@ -4,7 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
-import { assertReadOnly, createGitWorkspaceProvider, type GitCommand } from '../src/index.ts';
+import {
+  READ_ONLY_GIT_COMMANDS,
+  READ_ONLY_GIT_SUBCOMMANDS,
+  assertReadOnly,
+  createGitWorkspaceProvider,
+  type GitCommand,
+} from '../src/index.ts';
 
 const roots: string[] = [];
 
@@ -62,6 +68,33 @@ describe('git workspace boundary', () => {
     const report = await lease.release();
     expect(commands).toEqual([{ argv: ['--no-pager', '--no-optional-locks', 'status', '--short'], cwd: lease.root }]);
     expect(report.destructiveOperations).toEqual([]);
+  });
+
+  it('keeps public command catalogs deeply frozen and detached from enforcement', async () => {
+    expect(Object.isFrozen(READ_ONLY_GIT_COMMANDS)).toBe(true);
+    expect(READ_ONLY_GIT_COMMANDS.every((argv) => Object.isFrozen(argv))).toBe(true);
+    expect(Object.isFrozen(READ_ONLY_GIT_SUBCOMMANDS)).toBe(true);
+    expect(Reflect.set(READ_ONLY_GIT_COMMANDS, '3', ['diff', '--output=/tmp/outside'])).toBe(false);
+    expect(Reflect.set(READ_ONLY_GIT_COMMANDS[0] ?? [], '0', 'diff')).toBe(false);
+    expect(Reflect.set(READ_ONLY_GIT_SUBCOMMANDS, '0', 'diff')).toBe(false);
+
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-catalog-test-'));
+    roots.push(root);
+    const borrowed = join(root, 'borrowed');
+    await mkdir(borrowed);
+    const commands: GitCommand[] = [];
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+    await expect(provider.git(lease, ['diff', '--output=/tmp/outside'])).rejects.toThrow();
+    expect(commands).toEqual([]);
   });
 
   it('cleans an owned root when clone setup fails', async () => {

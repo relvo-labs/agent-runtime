@@ -16,6 +16,7 @@
 
 import { z } from 'zod';
 import { JsonValueSchema } from './json.ts';
+import { WIRE_VERSION } from './version.ts';
 
 /** How a provider ends a single run without ending the session. */
 export const InterruptModeSchema = z.enum([
@@ -133,7 +134,7 @@ export const RecoveryCapabilitySchema = z.discriminatedUnion('exportsRecoveryRec
 export const ProviderRecoveryRecordSchema = z.strictObject({
   providerId: z.string().min(1).max(64),
   providerVersion: z.string().min(1).max(64),
-  wireVersion: z.string().min(1).max(16),
+  wireVersion: z.literal(WIRE_VERSION),
   opaque: JsonValueSchema,
 });
 

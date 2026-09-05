@@ -255,6 +255,28 @@ describe('interaction and completion finalization', () => {
       });
     },
   );
+
+  it('maps a semantically impossible provider interruption to one contract failure', async () => {
+    const { provider, control } = controlledProvider();
+    const value = await fixture(provider);
+    const sessionId = await open(value);
+    await value.runtime.submitTurn({
+      commandId: value.next(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'unexpected interruption' }] },
+    });
+    control.completion.resolve({ outcome: 'interrupted', reason: 'not requested' });
+    await value.runtime.quiesce();
+
+    const snapshot = await value.runtime.getSession(sessionId);
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(snapshot?.runs[0]).toMatchObject({
+      state: 'failed',
+      termination: { outcome: 'failed', error: { code: 'provider_contract_violation' } },
+    });
+    expect(page.events.filter((event) => event.payload.type === 'run.finished')).toHaveLength(1);
+  });
 });
 
 describe('shutdown boundary', () => {

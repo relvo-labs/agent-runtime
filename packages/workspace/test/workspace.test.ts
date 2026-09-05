@@ -92,6 +92,52 @@ describe('workspace ownership', () => {
     expect(removalCount).toBe(1);
   });
 
+  it('coalesces a failed concurrent release and permits one later retry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-test-'));
+    roots.push(root);
+    let removalCount = 0;
+    let continueFirst!: () => void;
+    let removalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      removalEntered = resolve;
+    });
+    const firstHeld = new Promise<void>((resolve) => {
+      continueFirst = resolve;
+    });
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async (path) => {
+        removalCount += 1;
+        if (removalCount === 1) {
+          removalEntered();
+          await firstHeld;
+          throw new Error('first removal failed');
+        }
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed', name: 'retryable' });
+
+    const first = lease.release();
+    const concurrent = lease.release();
+    await entered;
+    expect(removalCount).toBe(1);
+    continueFirst();
+    expect((await Promise.allSettled([first, concurrent])).map((result) => result.status)).toEqual([
+      'rejected',
+      'rejected',
+    ]);
+
+    const retried = await lease.release();
+    const afterSuccess = await lease.release();
+    expect(retried.alreadyReleased).toBe(false);
+    expect(afterSuccess.alreadyReleased).toBe(true);
+    expect(removalCount).toBe(2);
+  });
+
   it('validates and cross-checks third-party lease descriptors', () => {
     const clock = createFixedClock();
     const leaseId = WorkspaceLeaseIdSchema.parse(createCounterIdFactory().next('workspaceLease'));

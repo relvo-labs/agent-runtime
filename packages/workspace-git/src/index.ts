@@ -59,18 +59,26 @@ export type GitWorkspaceProviderOptions = {
  * observational commands accept output paths, external helpers, configuration,
  * pagers, and lock-taking behavior. Only these complete argv forms pass.
  */
-export const READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = [
-  ['status', '--short'],
-  ['rev-parse', '--verify', 'HEAD'],
-  ['ls-files', '--cached', '--'],
-];
+const ENFORCED_READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = Object.freeze([
+  Object.freeze(['status', '--short']),
+  Object.freeze(['rev-parse', '--verify', 'HEAD']),
+  Object.freeze(['ls-files', '--cached', '--']),
+]);
+const ENFORCED_READ_ONLY_GIT_KEYS: readonly string[] = Object.freeze(
+  ENFORCED_READ_ONLY_GIT_COMMANDS.map((argv) => JSON.stringify(argv)),
+);
 
-export const READ_ONLY_GIT_SUBCOMMANDS: readonly string[] = READ_ONLY_GIT_COMMANDS.flatMap((argv) => argv.slice(0, 1));
+/** Detached documentation catalog. Enforcement uses private immutable keys. */
+export const READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = Object.freeze(
+  ENFORCED_READ_ONLY_GIT_COMMANDS.map((argv) => Object.freeze([...argv])),
+);
+
+export const READ_ONLY_GIT_SUBCOMMANDS: readonly string[] = Object.freeze(
+  ENFORCED_READ_ONLY_GIT_COMMANDS.flatMap((argv) => argv.slice(0, 1)),
+);
 
 export function assertReadOnly(argv: readonly string[]): void {
-  const allowed = READ_ONLY_GIT_COMMANDS.some(
-    (candidate) => candidate.length === argv.length && candidate.every((value, index) => value === argv[index]),
-  );
+  const allowed = ENFORCED_READ_ONLY_GIT_KEYS.includes(JSON.stringify(argv));
   if (!allowed) {
     throw new AgentRuntimeError(
       agentError(

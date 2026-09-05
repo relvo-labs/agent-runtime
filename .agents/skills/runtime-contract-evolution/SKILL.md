@@ -95,6 +95,12 @@ Do not use this skill when:
    `sequence` and `occurredAt`. Providers supply semantic payload only. If a change makes
    a provider responsible for identity or ordering, it is wrong — revise it.
 
+   A line-bound DTO that carries `wireVersion` uses `z.literal(WIRE_VERSION)`, which must
+   generate JSON Schema `const`. Keep intentionally permissive negotiation input (such as
+   `ProviderDescriptor`) separate and require an explicit compatibility check. Add a
+   version-only mismatch to both Zod and Ajv tests; a mismatch combined with another
+   invalid field does not prove version enforcement.
+
 6. **Bump `WIRE_VERSION`** in `packages/protocol/src/version.ts` for any breaking class,
    and record the reason in `docs/adr/`.
 

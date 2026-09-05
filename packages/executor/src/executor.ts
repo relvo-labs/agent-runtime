@@ -56,7 +56,11 @@ export type AgentExecutor = {
   /** Settle a pending interaction. Settling twice is idempotent. */
   respondToInteraction(command: RespondToInteractionCommandInput): Promise<CommandReceipt>;
 
-  /** Dispose the provider session and release the workspace lease. Terminal. */
+  /**
+   * Dispose the provider session and release the workspace lease. Terminal only
+   * after both succeed; incomplete cleanup rejects without persisting a receipt
+   * so the same command ID can retry.
+   */
   closeSession(command: CloseSessionCommandInput): Promise<CommandReceipt>;
 
   /**
@@ -87,7 +91,8 @@ export type AgentExecutor = {
   /**
    * Stop mutation admission, drain admitted commands, and release every
    * session, lease, provider, and subscription. Concurrent calls return the
-   * same cleanup promise; later mutations reject.
+   * same attempt promise; later mutations reject. A failed attempt keeps
+   * admission closed and subscriptions live, and a later call retries cleanup.
    */
   shutdown(): Promise<void>;
 };

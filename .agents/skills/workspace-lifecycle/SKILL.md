@@ -65,10 +65,12 @@ Do not use this skill when:
 
    If you are tempted to add a `force` flag that bypasses this, stop.
 
-3. **Release is idempotent and reports what it did.** `release()` returns a
-   `WorkspaceReleaseReport` containing `destructiveOperations: string[]`. For a borrowed
-   lease this array must be empty — that is a tested invariant, not a convention. Calling
-   `release()` twice returns `{ alreadyReleased: true }` and performs nothing.
+3. **Release is concurrency-idempotent, retryable on failure, and reports what it did.**
+   Concurrent `release()` callers await one in-flight operation. If it rejects, clear only
+   that attempt so a later caller can retry. After success, every later call returns
+   `{ alreadyReleased: true }` and performs nothing. `WorkspaceReleaseReport` contains
+   `destructiveOperations: string[]`; for a borrowed lease this array must be empty — that
+   is a tested invariant, not a convention. Never fabricate a success report after failure.
 
 4. **Do not follow symlinks out of the base directory.** Resolve with `fs.realpath`
    before comparing paths, and compare on path segments (`a/b` is not inside `a/bc`).
@@ -77,7 +79,9 @@ Do not use this skill when:
    under the configured base. `existing` git workspaces are _inspected only_ — no
    `checkout`, `clean`, `reset`, `stash` or branch mutation. Shell out through the
    injected `runGit` seam so tests can assert the exact argv that would run; never call
-   git directly from library code.
+   git directly from library code. Exact borrowed-workspace templates used for enforcement
+   stay private and deeply immutable. Any exported command catalog is a deeply frozen,
+   detached documentation snapshot; JavaScript mutation of it must never widen the policy.
 
 6. **Leases outlive runs, not sessions.** A lease is acquired when a session opens and
    released when the session closes or fails. Interrupting a run must not touch the

@@ -8,7 +8,7 @@ Live provider sessions may contain child processes, sockets, callbacks, and nati
 
 ## Decision
 
-Keep `ProviderSession` and `ProviderRun` as non-serializable in-process handles. `ProviderRun.completion` resolves a Zod-defined provider termination input without a timestamp. Runtime parses it and owns terminal time. A rejected or malformed completion is normalized to one failed run with `provider_contract_violation`, never swallowed. A capable adapter may export a versioned recovery record containing provider ID/version, wire version, and a JSON-safe opaque value. Only that provider interprets the opaque value. Resume is optional and capability-gated.
+Keep `ProviderSession` and `ProviderRun` as non-serializable in-process handles. `ProviderRun.completion` resolves a Zod-defined provider termination input without a timestamp. Runtime parses it and owns terminal time. A rejected, malformed, or lifecycle-impossible completion is normalized to one failed run with `provider_contract_violation`, never swallowed. A capable adapter may export a versioned recovery record containing provider ID/version, exact line-bound wire version, and a JSON-safe opaque value. Only that provider interprets the opaque value. Resume is optional and capability-gated.
 
 ## Consequences
 

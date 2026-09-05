@@ -34,10 +34,12 @@ export type { ProviderRecoveryRecord } from '@relvo-labs/agent-protocol';
  * Where a provider writes its semantic output.
  *
  * `emit` is synchronous and must not throw. Providers may emit before
- * `createSession()` or `startRun()` returns. Runtime stages the first 256 such
- * emissions in order, commits them only after the owning `session.opened` or
- * `run.started` event, and records an explicit warning diagnostic if the
- * deterministic tail exceeds that bound.
+ * `createSession()` or `startRun()` returns. Runtime parses, clones, and freezes
+ * each value during this call, then stages the first 256 captured results in
+ * order. It commits them only after the owning `session.opened` or `run.started`
+ * event and records an explicit warning diagnostic if the deterministic tail
+ * exceeds that bound. Mutating or reusing `input` after `emit` cannot rewrite
+ * an emission or change whether it was valid.
  */
 export type ProviderEventSink = {
   emit(input: ProviderEventInput): void;
@@ -135,7 +137,8 @@ export type ProviderSession = {
   respondToInteraction(providerRef: string, response: InteractionResponse): Promise<void>;
 
   /**
-   * Release provider resources. Idempotent.
+   * Release provider resources. Idempotent, including after a rejected attempt:
+   * callers may retry until disposal succeeds.
    *
    * This is NOT a way to cancel a run — use `ProviderRun.interrupt`. Disposing
    * with a run in flight is legal, but the runtime will have interrupted it

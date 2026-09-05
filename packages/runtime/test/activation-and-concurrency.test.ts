@@ -13,7 +13,9 @@ import {
 } from '@relvo-labs/agent-protocol';
 import type {
   AgentProvider,
+  ProviderEventSink,
   ProviderRun,
+  ProviderRunTermination,
   ProviderRunRequest,
   ProviderSession,
   ProviderSessionInit,
@@ -167,6 +169,172 @@ describe('provider event activation', () => {
       level: 'warning',
       message: expect.stringContaining('44 provider events exceeded the 256-event pre-activation buffer'),
     });
+  });
+
+  it('snapshots mutable provider emissions at each synchronous emit call', async () => {
+    const scripted = createScriptedProvider({
+      supportsRecovery: false,
+      defaultScript: [{ kind: 'succeed' }],
+    });
+    const provider: AgentProvider = {
+      describe: () => scripted.provider.describe(),
+      async createSession(init): Promise<ProviderSession> {
+        const session = await scripted.provider.createSession(init);
+        return {
+          async startRun(request): Promise<ProviderRun> {
+            const reused = { payload: { type: 'run.message_delta' as const, text: 'first value' } };
+            request.sink.emit(reused);
+            reused.payload.text = 'second value';
+            request.sink.emit(reused);
+
+            const invalidThenValid = { payload: { type: 'run.message_delta' as const, text: '' } };
+            request.sink.emit(invalidThenValid);
+            invalidThenValid.payload.text = 'must not become valid';
+
+            const validThenInvalid = { payload: { type: 'run.message_delta' as const, text: 'stable value' } };
+            request.sink.emit(validThenInvalid);
+            validThenInvalid.payload.text = '';
+            return session.startRun(request);
+          },
+          respondToInteraction: (providerRef, response) => session.respondToInteraction(providerRef, response),
+          dispose: () => session.dispose(),
+        };
+      },
+    };
+    const value = await runtimeFixture(provider);
+    const sessionId = await open(value);
+    await value.runtime.submitTurn({
+      commandId: value.nextCommandId(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'snapshot each emission' }] },
+    });
+
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(
+      page.events.flatMap((event) => (event.payload.type === 'run.message_delta' ? [event.payload.text] : [])),
+    ).toEqual(['first value', 'second value', 'stable value']);
+    expect(page.events.filter((event) => event.payload.type === 'diagnostic')).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ message: expect.stringContaining('provider emitted an invalid event') }),
+      }),
+    ]);
+  });
+
+  it('uses the same point-in-time snapshot semantics after activation', async () => {
+    const scripted = createScriptedProvider({ supportsRecovery: false, defaultScript: [{ kind: 'succeed' }] });
+    const completion = deferred<ProviderRunTermination>();
+    let runSink: ProviderEventSink | undefined;
+    const provider: AgentProvider = {
+      describe: () => scripted.provider.describe(),
+      async createSession(init): Promise<ProviderSession> {
+        const session = await scripted.provider.createSession(init);
+        return {
+          startRun(request): Promise<ProviderRun> {
+            runSink = request.sink;
+            return Promise.resolve({ completion: completion.promise, interrupt: () => Promise.resolve() });
+          },
+          respondToInteraction: (providerRef, response) => session.respondToInteraction(providerRef, response),
+          dispose: () => session.dispose(),
+        };
+      },
+    };
+    const value = await runtimeFixture(provider);
+    const sessionId = await open(value);
+    await value.runtime.submitTurn({
+      commandId: value.nextCommandId(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'active snapshots' }] },
+    });
+    const reused = { payload: { type: 'run.message_delta' as const, text: 'active first' } };
+    runSink?.emit(reused);
+    reused.payload.text = 'active second';
+    runSink?.emit(reused);
+    reused.payload.text = 'mutated after both calls';
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(
+      page.events.flatMap((event) => (event.payload.type === 'run.message_delta' ? [event.payload.text] : [])),
+    ).toEqual(['active first', 'active second']);
+  });
+
+  it('rejects a provider interaction emitted after its run starts interrupting', async () => {
+    const scripted = createScriptedProvider({ supportsRecovery: false, defaultScript: [{ kind: 'succeed' }] });
+    let runSink: ProviderEventSink | undefined;
+    const completion = deferred<ProviderRunTermination>();
+    const provider: AgentProvider = {
+      describe: () => scripted.provider.describe(),
+      async createSession(init): Promise<ProviderSession> {
+        const session = await scripted.provider.createSession(init);
+        return {
+          startRun(request): Promise<ProviderRun> {
+            runSink = request.sink;
+            return Promise.resolve({ completion: completion.promise, interrupt: () => Promise.resolve() });
+          },
+          respondToInteraction: (providerRef, response) => session.respondToInteraction(providerRef, response),
+          dispose: () => session.dispose(),
+        };
+      },
+    };
+    const value = await runtimeFixture(provider);
+    const sessionId = await open(value);
+    const submitted = await value.runtime.submitTurn({
+      commandId: value.nextCommandId(),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'interrupt before question' }] },
+    });
+    if (submitted.result?.type !== 'turn_accepted') throw new Error('run did not start');
+    await value.runtime.interruptRun({
+      commandId: value.nextCommandId(),
+      type: 'interrupt_run',
+      sessionId,
+      runId: submitted.result.runId,
+    });
+    runSink?.emit({
+      payload: {
+        type: 'interaction.requested',
+        providerRef: 'late-question',
+        request: { kind: 'question', prompt: 'Too late?', multiSelect: false },
+      },
+    });
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+    const snapshot = await value.runtime.getSession(sessionId);
+    const page = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(snapshot?.runs[0]?.state).toBe('interrupting');
+    expect(snapshot?.interactions).toEqual([]);
+    expect(page.events.some((event) => event.payload.type === 'interaction.requested')).toBe(false);
+    expect(page.events).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          type: 'diagnostic',
+          message: expect.stringContaining('interaction.requested'),
+        }),
+      }),
+    );
+
+    completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    runSink?.emit({
+      payload: {
+        type: 'interaction.requested',
+        providerRef: 'terminal-question',
+        request: { kind: 'question', prompt: 'Even later?', multiSelect: false },
+      },
+    });
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    const terminalSnapshot = await value.runtime.getSession(sessionId);
+    const terminalPage = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(terminalSnapshot?.runs[0]?.state).toBe('succeeded');
+    expect(terminalSnapshot?.interactions).toEqual([]);
+    expect(
+      terminalPage.events.filter(
+        (event) => event.payload.type === 'diagnostic' && event.payload.message.includes('interaction.requested'),
+      ),
+    ).toHaveLength(2);
   });
 });
 

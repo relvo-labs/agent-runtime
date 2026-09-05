@@ -20,6 +20,7 @@ import { AgentErrorSchema } from './errors.ts';
 import { AgentInteractionSchema } from './interaction.ts';
 import { JsonObjectSchema } from './json.ts';
 import { WorkspaceLeaseDescriptorSchema } from './workspace.ts';
+import { WIRE_VERSION } from './version.ts';
 
 // ---------------------------------------------------------------------------
 // Turn input
@@ -167,7 +168,7 @@ export const AgentSessionSchema = z.strictObject({
   state: SessionStateSchema,
   providerId: z.string().min(1),
   /** The wire version this session was opened under. */
-  wireVersion: z.string().min(1),
+  wireVersion: z.literal(WIRE_VERSION),
   workspace: WorkspaceLeaseDescriptorSchema,
   createdAt: TimestampSchema,
   /** Highest event sequence committed for this session. */

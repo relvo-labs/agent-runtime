@@ -44,8 +44,7 @@
           "type": "string"
         },
         "wireVersion": {
-          "maxLength": 16,
-          "minLength": 1,
+          "const": "0.4",
           "type": "string"
         }
       },

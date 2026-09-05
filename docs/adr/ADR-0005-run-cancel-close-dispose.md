@@ -8,12 +8,26 @@ Killing a provider session to cancel one attempt destroys conversation state and
 
 ## Decision
 
-`interrupt_run` targets one Run and normally leaves the Session ready. `close_session` is terminal, first settling active work according to policy, then disposing provider resources and releasing the workspace. `ProviderSession.dispose()` is idempotent cleanup, not the ordinary run-cancellation API. A provider unable to interrupt independently declares that limitation.
+`interrupt_run` targets one Run and normally leaves the Session ready. `close_session`
+terminalizes active work according to policy and requires both provider disposal and
+workspace release before the Session becomes terminal. `ProviderSession.dispose()` is
+idempotent cleanup, not the ordinary run-cancellation API. A provider unable to interrupt
+independently declares that limitation.
+
+A close attempt invokes provider disposal and lease release once each, even if the first
+operation rejects. Either failure rejects as a retryable `AgentRuntimeError` with an
+ordered, phase-tagged failure list. Runtime does not emit `session.closed`, persist the
+close receipt, or remove the live session until both operations have succeeded. The
+session remains `closing`, and the exact command ID may retry because no receipt exists.
+Run fallback events are emitted at most once, and only after interrupt or successful
+disposal makes their terminal state truthful.
 
 Runtime shutdown is memoized. Its first call synchronously closes mutation admission,
 drains commands already admitted, closes every resulting live session, releases leases,
 and closes subscriptions. Concurrent callers receive the same cleanup promise; later
-mutations reject and cannot acquire a workspace or create a provider session.
+mutations reject and cannot acquire a workspace or create a provider session. A cleanup
+failure rejects that attempt without closing subscriptions or declaring shutdown complete.
+The next `shutdown()` call starts another cleanup attempt while admission remains closed.
 
 ## Consequences
 

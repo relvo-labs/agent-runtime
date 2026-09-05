@@ -51,8 +51,10 @@ Do not use this skill when:
 ## Procedure
 
 1. **Emit semantic input, not envelopes.** A provider produces `ProviderEventInput`:
-   a payload plus optional `providerSequence` hint. It must never invent `eventId`,
-   `sequence` or `occurredAt`. If you need those, you are in the wrong layer.
+   a semantic payload only. It must never invent `eventId`, `sequence`, `occurredAt`,
+   or a provider sequence. Runtime snapshots and validates the whole input synchronously
+   during each `emit()` call, so object reuse or later mutation cannot rewrite history.
+   If you need envelope identity or ordering, you are in the wrong layer.
 
 2. **Keep native identity internal.** Provider-native conversation IDs, thread handles,
    file descriptors and checkpoints stay behind `ProviderRun` / `ProviderSession`, which
@@ -80,8 +82,8 @@ Do not use this skill when:
 4. **Separate interrupt from dispose.**
    - `ProviderRun.interrupt(reason)` ends **one run**. The session survives and must
      still accept a new run.
-   - `ProviderSession.dispose()` releases provider resources. It must be idempotent and
-     must not be used to cancel a run.
+   - `ProviderSession.dispose()` releases provider resources. It must be idempotent,
+     remain safe to retry after rejection, and must not be used to cancel a run.
      A provider that can only kill the whole session declares
      `run.interrupt.mode = 'unsupported'` rather than silently disposing.
 
@@ -89,6 +91,10 @@ Do not use this skill when:
    `respondToInteraction`, the provider must either apply the response or reject it with
    a typed error. Re-delivering the same `interactionId` must be a no-op, not a second
    application.
+
+   Emit a new interaction only while its run is `running` or
+   `awaiting_interaction`. Once interruption begins, a late request is a provider-contract
+   violation recorded as a diagnostic; it cannot create routing state or resume the run.
 
 6. **Respect the trust boundary.** An in-process provider is a **trusted plugin**. It runs
    with full process privileges. Do not write code, docs or permission prompts implying
@@ -111,6 +117,10 @@ pnpm gate
 A new provider implementation must pass the shared conformance suite exported from
 `@relvo-labs/agent-provider/testing` without modifying the suite. If the suite must
 change to accommodate a provider, the SPI is under-specified — fix the SPI.
+
+Runtime cleanup tests inject disposal rejection and require a later identical close attempt
+to retry safely. An adapter that treats a rejected `dispose()` call as permanently consumed
+does not satisfy the SPI.
 
 ## Provenance
 

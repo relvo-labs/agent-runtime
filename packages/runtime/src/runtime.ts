@@ -9,6 +9,7 @@
 
 import {
   AgentRuntimeError,
+  RUN_STATE_TABLE,
   CommandIdSchema,
   CommandReceiptSchema,
   CloseSessionCommandSchema,
@@ -19,6 +20,7 @@ import {
   ProviderEventInputSchema,
   agentError,
   canonicalCommandFingerprint,
+  canTransition,
   isCommandAdmissible,
   SubscriptionRequestSchema,
   toAgentError,
@@ -208,6 +210,53 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     });
   }
 
+  type CleanupFailure = {
+    readonly phase: 'run_interrupt' | 'provider_dispose' | 'workspace_release';
+    readonly error: AgentError;
+    readonly cause: unknown;
+  };
+
+  function sessionCleanupError(sessionId: SessionId, failures: readonly CleanupFailure[]): AgentRuntimeError {
+    const code = failures.some((failure) => failure.phase === 'provider_dispose')
+      ? 'provider_unavailable'
+      : 'workspace_unavailable';
+    return new AgentRuntimeError(
+      agentError(code, `session \`${sessionId}\` cleanup did not complete`, {
+        details: {
+          sessionId,
+          failures: failures.map(({ phase, error }) => ({ phase, error })),
+        },
+      }),
+      {
+        cause: new AggregateError(
+          failures.map((failure) => failure.cause),
+          'session cleanup failed',
+        ),
+      },
+    );
+  }
+
+  function shutdownCleanupError(
+    failures: readonly { readonly sessionId: SessionId; readonly error: AgentError; readonly cause: unknown }[],
+  ): AgentRuntimeError {
+    const code = failures.some((failure) => failure.error.code === 'provider_unavailable')
+      ? 'provider_unavailable'
+      : 'workspace_unavailable';
+    return new AgentRuntimeError(
+      agentError(code, `runtime shutdown could not close ${String(failures.length)} session(s)`, {
+        details: {
+          failures: failures.map(({ sessionId, error }) => ({ sessionId, error })),
+        },
+      }),
+      {
+        cause: new AggregateError(
+          failures.map((failure) => failure.cause),
+          'runtime shutdown cleanup failed',
+        ),
+      },
+    );
+  }
+
   /**
    * Parse caller input into a validated command.
    *
@@ -261,32 +310,53 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
   const PRE_ACTIVATION_EVENT_LIMIT = 256;
 
+  type CapturedProviderEvent =
+    | { readonly valid: true; readonly input: ProviderEventInput }
+    | { readonly valid: false; readonly diagnostic: string };
+
+  function freezeProviderValue<T>(value: T, seen = new WeakSet<object>()): T {
+    if (value === null || typeof value !== 'object' || seen.has(value)) return value;
+    seen.add(value);
+    for (const child of Object.values(value)) freezeProviderValue(child, seen);
+    return Object.freeze(value);
+  }
+
+  /** Capture validity and values before control returns to provider code. */
+  function captureProviderEvent(input: ProviderEventInput): CapturedProviderEvent {
+    const parsed = ProviderEventInputSchema.safeParse(input);
+    return parsed.success
+      ? { valid: true, input: freezeProviderValue(parsed.data) }
+      : {
+          valid: false,
+          diagnostic: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
+        };
+  }
+
   async function ingestProviderEvent(
     sessionId: SessionId,
     runId: RunId | undefined,
-    input: ProviderEventInput,
+    captured: CapturedProviderEvent,
   ): Promise<void> {
     // A provider must never be able to break the runtime by emitting
     // something malformed; the worst outcome is a recorded diagnostic.
-    const parsed = ProviderEventInputSchema.safeParse(input);
     await commitAndPublish((tx) => {
       if (!tx.hasSession(sessionId)) return;
       const state = tx.session(sessionId).session.state;
       if (state === 'closed' || state === 'failed') return;
 
-      if (!parsed.success) {
+      if (!captured.valid) {
         tx.emit({
           sessionId,
           payload: {
             type: 'diagnostic',
             level: 'warning',
-            message: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
+            message: captured.diagnostic,
           },
         });
         return;
       }
 
-      const payload = parsed.data.payload;
+      const payload = captured.input.payload;
 
       if (runId === undefined && payload.type !== 'diagnostic') {
         tx.emit({
@@ -302,7 +372,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
       if (runId !== undefined) {
         const run = tx.session(sessionId).runs.get(runId);
-        if (!run || run.termination !== undefined) return;
+        if (!run || (run.termination !== undefined && payload.type !== 'interaction.requested')) return;
       }
 
       if (payload.type === 'interaction.requested') {
@@ -312,6 +382,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         const session = live.get(sessionId);
         const run = tx.session(sessionId).runs.get(runId);
         if (!session || !run) return;
+        if (run.state !== 'running' && run.state !== 'awaiting_interaction') {
+          tx.emit({
+            sessionId,
+            runId,
+            payload: {
+              type: 'diagnostic',
+              level: 'warning',
+              message: `provider contract violation: emitted \`interaction.requested\` while run was ${run.state}; the request was rejected`,
+            },
+          });
+          return;
+        }
         if (session.refToInteraction.has(providerRef)) {
           tx.emit({
             sessionId,
@@ -354,14 +436,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     let phase: 'staging' | 'draining' | 'active' | 'discarded' = 'staging';
     let accepted = 0;
     let dropped = 0;
-    let staged: ProviderEventInput[] = [];
+    let staged: CapturedProviderEvent[] = [];
 
     return {
       sink: {
         emit(input: ProviderEventInput): void {
           if (phase === 'discarded') return;
+          const captured = captureProviderEvent(input);
           if (phase === 'active') {
-            track(ingestProviderEvent(sessionId, runId, input));
+            track(ingestProviderEvent(sessionId, runId, captured));
             return;
           }
           if (accepted >= PRE_ACTIVATION_EVENT_LIMIT) {
@@ -369,7 +452,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             return;
           }
           accepted += 1;
-          staged.push(input);
+          staged.push(captured);
         },
       },
       async activate(): Promise<void> {
@@ -378,17 +461,21 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         while (staged.length > 0) {
           const batch = staged;
           staged = [];
-          for (const input of batch) await ingestProviderEvent(sessionId, runId, input);
+          for (const captured of batch) await ingestProviderEvent(sessionId, runId, captured);
         }
         phase = 'active';
         if (dropped > 0) {
-          await ingestProviderEvent(sessionId, runId, {
-            payload: {
-              type: 'diagnostic',
-              level: 'warning',
-              message: `${String(dropped)} provider events exceeded the ${String(PRE_ACTIVATION_EVENT_LIMIT)}-event pre-activation buffer for ${owner}; the deterministic tail was not accepted`,
-            },
-          });
+          await ingestProviderEvent(
+            sessionId,
+            runId,
+            captureProviderEvent({
+              payload: {
+                type: 'diagnostic',
+                level: 'warning',
+                message: `${String(dropped)} provider events exceeded the ${String(PRE_ACTIVATION_EVENT_LIMIT)}-event pre-activation buffer for ${owner}; the deterministic tail was not accepted`,
+              },
+            }),
+          );
         }
       },
       discard(): void {
@@ -449,12 +536,25 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
               });
             }
 
-            tx.emit({ sessionId, runId, payload: { type: 'run.finished', turnId, termination: stamped } });
+            const current = tx.session(sessionId).runs.get(runId);
+            if (current === undefined || current.termination !== undefined) return;
+            const termination = canTransition(RUN_STATE_TABLE, current.state, stamped.outcome)
+              ? stamped
+              : {
+                  outcome: 'failed' as const,
+                  at: clock.now(),
+                  error: agentError(
+                    'provider_contract_violation',
+                    `provider completed with ${stamped.outcome} while run was ${current.state}`,
+                  ),
+                };
+
+            tx.emit({ sessionId, runId, payload: { type: 'run.finished', turnId, termination } });
 
             const turnState =
-              stamped.outcome === 'succeeded'
+              termination.outcome === 'succeeded'
                 ? 'completed'
-                : stamped.outcome === 'interrupted'
+                : termination.outcome === 'interrupted'
                   ? 'cancelled'
                   : 'failed';
             const output = tx.session(sessionId).turns.get(turnId)?.output;
@@ -465,7 +565,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
                 turnId,
                 state: turnState,
                 ...(output === undefined ? {} : { output }),
-                ...(stamped.outcome === 'failed' ? { error: stamped.error } : {}),
+                ...(termination.outcome === 'failed' ? { error: termination.error } : {}),
               },
             });
           });
@@ -970,61 +1070,104 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     // what releases the provider. Using dispose to cancel would lose the run's
     // terminal event.
     let interruptedActiveRun = false;
+    const interruptFailures: CleanupFailure[] = [];
     for (const [, providerRun] of activeRuns) {
       try {
         await providerRun.interrupt('session closing');
         interruptedActiveRun = true;
-      } catch {
-        // A provider that cannot interrupt still gets disposed below.
+      } catch (error) {
+        // Successful provider disposal is still a truthful terminal fallback.
+        // Keep the interrupt error in case disposal also fails.
+        interruptFailures.push({
+          phase: 'run_interrupt',
+          error: toAgentError(error, 'provider_unavailable'),
+          cause: error,
+        });
       }
     }
-    await session.providerSession.dispose().catch(() => undefined);
 
-    // Closing the session is the terminal fallback when an adapter cannot
-    // interrupt a run independently. Persist the cancellation before releasing
-    // the workspace; a late provider completion sees the existing termination
-    // and is ignored by `superviseRun`.
-    await commitAndPublish((tx) => {
-      const record = tx.session(command.sessionId);
-      for (const [runId, run] of record.runs) {
-        if (run.termination !== undefined) continue;
-        for (const interactionId of run.pendingInteractionIds) {
-          const interaction = record.interactions.get(interactionId);
-          if (!interaction || interaction.status === 'settled') continue;
+    const cleanupFailures: CleanupFailure[] = [];
+    let providerDisposed = false;
+    try {
+      await session.providerSession.dispose();
+      providerDisposed = true;
+    } catch (error) {
+      cleanupFailures.push({
+        phase: 'provider_dispose',
+        error: toAgentError(error, 'provider_unavailable'),
+        cause: error,
+      });
+    }
+
+    let release: Awaited<ReturnType<WorkspaceLease['release']>> | undefined;
+    try {
+      release = await session.lease.release();
+    } catch (error) {
+      cleanupFailures.push({
+        phase: 'workspace_release',
+        error: toAgentError(error, 'workspace_unavailable'),
+        cause: error,
+      });
+    }
+
+    const providerRunsEnded = providerDisposed || interruptFailures.length === 0;
+    if (!providerRunsEnded) cleanupFailures.unshift(...interruptFailures);
+
+    // Closing the session is the terminal fallback when interrupt or successful
+    // disposal proves the provider-side run has ended. A late provider
+    // completion sees the existing termination and is ignored by `superviseRun`.
+    if (providerRunsEnded) {
+      await commitAndPublish((tx) => {
+        const record = tx.session(command.sessionId);
+        for (const [runId, run] of record.runs) {
+          if (run.termination !== undefined) continue;
+          if (run.state !== 'interrupting') {
+            tx.emit({
+              sessionId: command.sessionId,
+              runId,
+              payload: { type: 'run.state_changed', from: run.state, to: 'interrupting' },
+            });
+          }
+          for (const interactionId of run.pendingInteractionIds) {
+            const interaction = record.interactions.get(interactionId);
+            if (!interaction || interaction.status === 'settled') continue;
+            tx.emit({
+              sessionId: command.sessionId,
+              runId,
+              payload: {
+                type: 'interaction.settled',
+                interactionId,
+                turnId: interaction.turnId,
+                settlement: { outcome: 'cancelled', settledAt: clock.now() },
+              },
+            });
+          }
+          const termination = { outcome: 'interrupted' as const, at: clock.now(), reason: 'session closing' };
           tx.emit({
             sessionId: command.sessionId,
             runId,
-            payload: {
-              type: 'interaction.settled',
-              interactionId,
-              turnId: interaction.turnId,
-              settlement: { outcome: 'cancelled', settledAt: clock.now() },
-            },
+            payload: { type: 'run.finished', turnId: run.turnId, termination },
+          });
+          tx.emit({
+            sessionId: command.sessionId,
+            payload: { type: 'turn.settled', turnId: run.turnId, state: 'cancelled' },
           });
         }
-        const termination = { outcome: 'interrupted' as const, at: clock.now(), reason: 'session closing' };
-        tx.emit({
-          sessionId: command.sessionId,
-          runId,
-          payload: { type: 'run.finished', turnId: run.turnId, termination },
-        });
-        tx.emit({
-          sessionId: command.sessionId,
-          payload: { type: 'turn.settled', turnId: run.turnId, state: 'cancelled' },
-        });
-      }
-    });
-    session.runs.clear();
-    for (const stop of session.stopSupervision.values()) stop();
-    session.stopSupervision.clear();
-    session.interactionRefs.clear();
-    session.refToInteraction.clear();
-    session.interactionRuns.clear();
+      });
+      session.runs.clear();
+      for (const stop of session.stopSupervision.values()) stop();
+      session.stopSupervision.clear();
+      session.interactionRefs.clear();
+      session.refToInteraction.clear();
+      session.interactionRuns.clear();
+    }
 
-    const release = await session.lease.release();
-    live.delete(command.sessionId);
+    if (cleanupFailures.length > 0) throw sessionCleanupError(command.sessionId, cleanupFailures);
+    if (release === undefined) {
+      throw new AgentRuntimeError(agentError('workspace_unavailable', 'workspace release produced no report'));
+    }
 
-    return await commitAndPublish((tx) => {
+    const produced = await commitAndPublish((tx) => {
       tx.emit({
         sessionId: command.sessionId,
         payload: { type: 'session.closed', reason: 'requested', workspaceRelease: release },
@@ -1041,6 +1184,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
       return value;
     });
+    live.delete(command.sessionId);
+    return produced;
   }
 
   // -------------------------------------------------------------------------
@@ -1189,10 +1334,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     shutdown(): Promise<void> {
       if (shutdownPromise !== undefined) return shutdownPromise;
       lifecycle = 'shutting_down';
-      shutdownPromise = (async () => {
+      const attempt = (async () => {
         while (commandQueues.size > 0 || sessionQueues.size > 0) {
           await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
         }
+        const failures: { sessionId: SessionId; error: AgentError; cause: unknown }[] = [];
         for (const sessionId of [...live.keys()]) {
           const command = {
             commandId: `shutdown-${sessionId}` as CommandId,
@@ -1200,21 +1346,34 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             sessionId,
             ifRunActive: 'interrupt' as const,
           };
-          await coordinateCommand(command, () => closeSession(command)).catch(() => undefined);
+          try {
+            await coordinateCommand(command, () => closeSession(command));
+          } catch (error) {
+            failures.push({ sessionId, error: toAgentError(error, 'internal'), cause: error });
+          }
         }
         while (commandQueues.size > 0 || sessionQueues.size > 0) {
           await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
         }
-        try {
-          await quiesce();
-        } finally {
-          // Runtime releases only leases it independently validated and tracked;
-          // a provider-wide sweep could invoke a suspect mismatched lease.
-          hub.closeAll();
-          lifecycle = 'shut_down';
+        if (failures.length > 0) throw shutdownCleanupError(failures);
+        if (live.size > 0) {
+          throw new AgentRuntimeError(
+            agentError('internal', `runtime shutdown left ${String(live.size)} live session(s)`),
+          );
         }
+        await quiesce();
+        // Runtime releases only leases it independently validated and tracked;
+        // a provider-wide sweep could invoke a suspect mismatched lease.
+        hub.closeAll();
+        lifecycle = 'shut_down';
       })();
-      return shutdownPromise;
+      shutdownPromise = attempt;
+      void attempt.catch(() => {
+        // Admission stays closed, but the next shutdown call gets a new cleanup
+        // attempt after every concurrent observer has received this rejection.
+        if (shutdownPromise === attempt) shutdownPromise = undefined;
+      });
+      return attempt;
     },
   };
 

@@ -11,11 +11,14 @@ turns a misbehaving provider into an activation-time memory leak.
 
 ## Decision
 
-Each creation call receives an inactive sink. Before activation it retains the first 256
-`ProviderEventInput` values in emission order and counts, but does not retain, any
-deterministic tail. Runtime first atomically commits `session.opened` or `turn.started` +
-`run.started`, installs the in-process owner handle, then drains retained inputs in order.
-Only after the drain does the sink become live.
+Each creation call receives an inactive sink. Every synchronous `emit()` parses, clones,
+and freezes its input before returning to provider code. Before activation the sink retains
+the first 256 captured valid values or captured invalid-input diagnostics in emission order
+and counts, but does not retain, any deterministic tail. Reusing or mutating an input object
+therefore cannot rewrite an earlier emission or change whether that emission was valid.
+Runtime first atomically commits `session.opened` or `turn.started` + `run.started`, installs
+the in-process owner handle, then drains retained results in order. Only after the drain does
+the sink become live; active emissions use the same point-in-time capture rule.
 
 If the bound was crossed, Runtime appends a warning diagnostic after the retained inputs
 that states the exact rejected count and buffer size. A provider event is therefore never
@@ -28,3 +31,6 @@ command receipt reports the creation failure.
 Normalized provider events always follow the start event for their owning identity.
 Providers can emit synchronously without adding timers or deferring their own callbacks.
 The cap is an in-process safety boundary, not flow control for an already-active sink.
+An interaction request is accepted only while its owning run is running or already awaiting
+another interaction. Requests emitted while interrupting or terminal are replaced by a
+provider-contract diagnostic and cannot reverse the run state.

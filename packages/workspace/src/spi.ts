@@ -30,9 +30,11 @@ export type WorkspaceLease = {
   /**
    * Release the lease.
    *
-   * MUST be idempotent. For `borrowed` ownership this performs no destructive
-   * operation, and the returned report proves it with an empty
-   * `destructiveOperations` array.
+   * MUST be idempotent. Concurrent callers share one attempt; a rejected
+   * attempt remains retryable, and only a successful release makes later calls
+   * no-ops. For `borrowed` ownership this performs no destructive operation,
+   * and the returned report proves it with an empty `destructiveOperations`
+   * array.
    */
   release(): Promise<WorkspaceReleaseReport>;
 };

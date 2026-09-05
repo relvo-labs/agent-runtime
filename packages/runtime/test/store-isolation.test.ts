@@ -195,3 +195,173 @@ describe('in-memory store mutation isolation', () => {
     });
   });
 });
+
+describe('projection transition validation', () => {
+  it('rejects mismatched from-states, late interactions, and terminal rewrites atomically', async () => {
+    const value = setup();
+    const turnId = TurnIdSchema.parse(value.idFactory.next('turn'));
+    const runId = RunIdSchema.parse(value.idFactory.next('run'));
+    await value.store.commit((tx) => {
+      tx.createSession(value.session);
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'session.opened', providerId: 'scripted', workspace: value.session.workspace },
+      });
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'turn.started', turnId, input: { parts: [{ type: 'text', text: 'transition' }] } },
+      });
+      tx.emit({ sessionId: value.sessionId, runId, payload: { type: 'run.started', turnId, attempt: 1 } });
+    });
+
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          payload: { type: 'session.state_changed', from: 'opening', to: 'failed' },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          payload: { type: 'turn.state_changed', turnId, from: 'accepted', to: 'failed' },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: { type: 'run.state_changed', from: 'awaiting_interaction', to: 'interrupting' },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+    expect((await value.store.read(value.sessionId))?.runs[0]?.state).toBe('running');
+
+    await value.store.commit((tx) => {
+      tx.emit({
+        sessionId: value.sessionId,
+        runId,
+        payload: { type: 'run.state_changed', from: 'running', to: 'interrupting' },
+      });
+    });
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: {
+            type: 'interaction.requested',
+            interactionId: InteractionIdSchema.parse(value.idFactory.next('interaction')),
+            turnId,
+            request: { kind: 'question', prompt: 'late', multiSelect: false },
+          },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+
+    await value.store.commit((tx) => {
+      tx.emit({
+        sessionId: value.sessionId,
+        runId,
+        payload: {
+          type: 'run.finished',
+          turnId,
+          termination: { outcome: 'interrupted', at: value.clock.now() },
+        },
+      });
+    });
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: { type: 'run.state_changed', from: 'interrupted', to: 'running' },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+    expect((await value.store.read(value.sessionId))?.runs[0]).toMatchObject({
+      state: 'interrupted',
+      termination: { outcome: 'interrupted' },
+    });
+  });
+
+  it('rejects interaction ownership and repeat-settlement violations', async () => {
+    const value = setup();
+    const turnId = TurnIdSchema.parse(value.idFactory.next('turn'));
+    const otherTurnId = TurnIdSchema.parse(value.idFactory.next('turn'));
+    const runId = RunIdSchema.parse(value.idFactory.next('run'));
+    const interactionId = InteractionIdSchema.parse(value.idFactory.next('interaction'));
+    await value.store.commit((tx) => {
+      tx.createSession(value.session);
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'session.opened', providerId: 'scripted', workspace: value.session.workspace },
+      });
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'turn.started', turnId, input: { parts: [{ type: 'text', text: 'one' }] } },
+      });
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: { type: 'turn.started', turnId: otherTurnId, input: { parts: [{ type: 'text', text: 'two' }] } },
+      });
+      tx.emit({ sessionId: value.sessionId, runId, payload: { type: 'run.started', turnId, attempt: 1 } });
+    });
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: {
+            type: 'interaction.requested',
+            interactionId,
+            turnId: otherTurnId,
+            request: { kind: 'question', prompt: 'wrong owner', multiSelect: false },
+          },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+
+    await value.store.commit((tx) => {
+      tx.emit({
+        sessionId: value.sessionId,
+        runId,
+        payload: {
+          type: 'interaction.requested',
+          interactionId,
+          turnId,
+          request: { kind: 'question', prompt: 'valid', multiSelect: false },
+        },
+      });
+      tx.emit({
+        sessionId: value.sessionId,
+        runId,
+        payload: {
+          type: 'interaction.settled',
+          interactionId,
+          turnId,
+          settlement: { outcome: 'cancelled', settledAt: value.clock.now() },
+        },
+      });
+    });
+    await expect(
+      value.store.commit((tx) => {
+        tx.emit({
+          sessionId: value.sessionId,
+          runId,
+          payload: {
+            type: 'interaction.settled',
+            interactionId,
+            turnId,
+            settlement: { outcome: 'cancelled', settledAt: value.clock.now() },
+          },
+        });
+      }),
+    ).rejects.toMatchObject({ error: { code: 'illegal_state_transition' } });
+  });
+});
