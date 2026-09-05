@@ -166,6 +166,9 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             for (const event of page.events) {
               if (event.sequence <= lastEmitted) continue; // step 3
               lastEmitted = event.sequence;
+              if (event.payload.type === 'session.closed') {
+                subscriber.terminal = event.payload.reason === 'failed' ? 'session_failed' : 'session_closed';
+              }
               if (!matches(event)) continue;
               yield {
                 type: 'event',
@@ -237,10 +240,12 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             }
 
             if (subscriber.terminal !== undefined) {
+              const reason = subscriber.terminal;
+              detach();
               yield {
                 type: 'closed',
                 cursor: cursorFromSequence(lastEmitted),
-                reason: subscriber.terminal,
+                reason,
               };
               return;
             }

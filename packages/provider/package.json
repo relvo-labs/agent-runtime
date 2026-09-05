@@ -35,7 +35,8 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@relvo-labs/agent-protocol": "workspace:^"
+    "@relvo-labs/agent-protocol": "workspace:^",
+    "zod": "catalog:"
   },
   "repository": {
     "type": "git",

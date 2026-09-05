@@ -6,8 +6,9 @@
  * you can rebuild the projection by replaying the log, then the projection can
  * never be ahead of the log.
  *
- * Unknown event types are ignored rather than rejected — a consumer of an older
- * build must tolerate an event it does not model, and so must this fold.
+ * Event envelopes are validated by the closed protocol schema before they
+ * reach this fold. A new event variant therefore requires a new pre-1.0 wire
+ * minor; this function makes no same-line forward-compatibility claim.
  */
 
 import type { AgentRun, AgentTurn, EventEnvelope, RunId } from '@relvo-labs/agent-protocol';

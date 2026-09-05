@@ -91,8 +91,8 @@ git diff --name-only origin/main... | grep -q '^packages/' && ls .changeset/*.md
 pnpm gate
 ```
 
-CI fails a PR that modifies `packages/**` without adding a `.changeset/*.md`, unless the
-PR is labelled `no-release`.
+CI fails a PR that modifies `packages/**` without a valid `.changeset/*.md`. This
+foundation has no label-based bypass in its workflow.
 
 ## Provenance
 

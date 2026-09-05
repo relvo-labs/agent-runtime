@@ -113,13 +113,28 @@ type StoreState = {
 };
 
 function cloneRecord(record: SessionRecord): SessionRecord {
-  return {
-    session: { ...record.session },
-    turns: new Map(record.turns),
-    runs: new Map(record.runs),
-    interactions: new Map(record.interactions),
-    events: [...record.events],
-  };
+  return structuredClone(record);
+}
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  if (value instanceof Map) {
+    for (const [key, entry] of value) {
+      deepFreeze(key, seen);
+      deepFreeze(entry, seen);
+    }
+  } else if (value instanceof Set) {
+    for (const entry of value) deepFreeze(entry, seen);
+  } else {
+    for (const entry of Object.values(value)) deepFreeze(entry, seen);
+  }
+  return Object.freeze(value);
+}
+
+/** Clone first so no object reachable by a caller aliases committed state. */
+function isolated<T>(value: T): T {
+  return deepFreeze(structuredClone(value));
 }
 
 export type InMemoryStoreOptions = {
@@ -175,7 +190,7 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
         }
 
         const tx: StoreTransaction = {
-          session: draftOf,
+          session: (sessionId) => isolated(draftOf(sessionId)),
           hasSession: (sessionId) => draftSessions.has(sessionId),
 
           createSession(session: AgentSession): void {
@@ -184,14 +199,15 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
                 agentError('invalid_request', `session \`${session.sessionId}\` already exists`),
               );
             }
-            draftSessions.set(session.sessionId, {
-              session,
+            const ownedSession = structuredClone(session);
+            draftSessions.set(ownedSession.sessionId, {
+              session: ownedSession,
               turns: new Map(),
               runs: new Map(),
               interactions: new Map(),
               events: [],
             });
-            touched.add(session.sessionId);
+            touched.add(ownedSession.sessionId);
           },
 
           emit(input: EmitInput): EventEnvelope {
@@ -205,7 +221,7 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
               sequence,
               occurredAt: options.clock.now(),
               wireVersion: WIRE_VERSION,
-              payload: input.payload,
+              payload: structuredClone(input.payload),
             };
 
             record.events.push(envelope);
@@ -218,10 +234,13 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
           },
 
           recordReceipt(commandId: CommandId, receiptRecord: ReceiptRecord): void {
-            draftReceipts.set(commandId, receiptRecord);
+            draftReceipts.set(commandId, structuredClone(receiptRecord));
           },
 
-          findReceipt: (commandId: CommandId) => draftReceipts.get(commandId),
+          findReceipt: (commandId: CommandId) => {
+            const found = draftReceipts.get(commandId);
+            return found === undefined ? undefined : isolated(found);
+          },
         };
 
         // If `mutate` throws, we simply never swap. The draft — including every
@@ -229,52 +248,60 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
         const value = mutate(tx);
 
         state = { revision: state.revision + 1, sessions: draftSessions, receipts: draftReceipts };
-        return { value, revision: state.revision, events: appended };
+        return { value: isolated(value), revision: state.revision, events: isolated(appended) };
       });
     },
 
     read(sessionId: SessionId): Promise<SessionSnapshot | undefined> {
       const record = state.sessions.get(sessionId);
       if (!record) return Promise.resolve(undefined);
-      return Promise.resolve({
-        session: { ...record.session },
-        turns: [...record.turns.values()],
-        runs: [...record.runs.values()],
-        interactions: [...record.interactions.values()],
-        revision: state.revision,
-      });
+      return Promise.resolve(
+        isolated({
+          session: { ...record.session },
+          turns: [...record.turns.values()],
+          runs: [...record.runs.values()],
+          interactions: [...record.interactions.values()],
+          revision: state.revision,
+        }),
+      );
     },
 
     readEvents(sessionId: SessionId, fromSequence: Sequence, limit?: number): Promise<EventPage> {
       const record = state.sessions.get(sessionId);
       const pageSize = limit ?? defaultPageSize;
       if (!record) {
-        return Promise.resolve({
-          events: [],
-          nextSequence: fromSequence,
-          revision: state.revision,
-          hasMore: false,
-        });
+        return Promise.resolve(
+          isolated({
+            events: [],
+            nextSequence: fromSequence,
+            revision: state.revision,
+            hasMore: false,
+          }),
+        );
       }
       // `fromSequence` is a POSITION, not an index: it means "everything after
       // this point". `0` therefore means "from the beginning".
       const matching = record.events.filter((event) => event.sequence > fromSequence);
       const page = matching.slice(0, pageSize);
       const last = page.at(-1);
-      return Promise.resolve({
-        events: page,
-        nextSequence: last?.sequence ?? fromSequence,
-        revision: state.revision,
-        hasMore: matching.length > page.length,
-      });
+      return Promise.resolve(
+        isolated({
+          events: page,
+          nextSequence: last?.sequence ?? fromSequence,
+          revision: state.revision,
+          hasMore: matching.length > page.length,
+        }),
+      );
     },
 
     readInteraction(sessionId: SessionId, interactionId: InteractionId): Promise<AgentInteraction | undefined> {
-      return Promise.resolve(state.sessions.get(sessionId)?.interactions.get(interactionId));
+      const found = state.sessions.get(sessionId)?.interactions.get(interactionId);
+      return Promise.resolve(found === undefined ? undefined : isolated(found));
     },
 
     findReceipt(commandId: CommandId): Promise<ReceiptRecord | undefined> {
-      return Promise.resolve(state.receipts.get(commandId));
+      const found = state.receipts.get(commandId);
+      return Promise.resolve(found === undefined ? undefined : isolated(found));
     },
 
     listSessions(): Promise<readonly SessionId[]> {

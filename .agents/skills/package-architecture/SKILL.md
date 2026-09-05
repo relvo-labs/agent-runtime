@@ -30,6 +30,7 @@ Do not use this skill when:
 ## Owns
 
 - `tools/repo/check-dag.ts` — mechanical layering gate
+- `tools/repo/check-static.ts` — foundation scope and no-live-adapter boundary
 - `tsconfig.base.json` — shared compiler options
 - `tsconfig.json` — the workspace typecheck project and its `paths` map
 - `pnpm-workspace.yaml#packages` — workspace globs
@@ -60,7 +61,9 @@ Do not use this skill when:
    L1  agent-executor            → protocol
        agent-provider            → protocol
        agent-workspace           → protocol
-   L2  agent-workspace-git       → protocol, workspace
+   L2  agent-provider-codex      → protocol, provider
+       agent-provider-claude     → protocol, provider
+       agent-workspace-git       → protocol, workspace
    L3  agent-runtime             → protocol, executor, provider, workspace
    ```
 

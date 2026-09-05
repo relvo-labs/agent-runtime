@@ -15,6 +15,7 @@ Use this skill when a change touches any of:
 - a third-party entry in any `dependencies` / `devDependencies` / `peerDependencies`
 - the `catalog:` block of `pnpm-workspace.yaml`
 - `pnpm-lock.yaml`
+- `tools/repo/check-supply-chain.ts` or `tools/repo/check-licenses.ts`
 - `.npmrc`
 - `onlyBuiltDependencies`
 - the `packageManager` pin
@@ -36,6 +37,8 @@ Do not use this skill when:
 - `pnpm-workspace.yaml#minimumReleaseAge` — the publish-cooldown policy
 - `package.json#packageManager` — the exact pnpm pin
 - `docs/adr/ADR-0013-supply-chain-policy.md` — the policy decision record
+- `tools/repo/check-supply-chain.ts` — effective dependency-policy validation
+- `tools/repo/check-licenses.ts` — production dependency license validation
 
 ## Does not own
 

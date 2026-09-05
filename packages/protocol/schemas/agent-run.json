@@ -178,6 +178,128 @@
   "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-run.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "not": {
+          "required": [
+            "termination"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "succeeded",
+              "failed",
+              "interrupted"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "termination"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "termination": {
+            "properties": {
+              "outcome": {
+                "const": "succeeded"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "termination": {
+            "properties": {
+              "outcome": {
+                "const": "failed"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "interrupted"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "termination": {
+            "properties": {
+              "outcome": {
+                "const": "interrupted"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "awaiting_interaction"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "pendingInteractionIds": {
+            "minItems": 1,
+            "type": "array"
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "attempt": {
       "exclusiveMinimum": 0,

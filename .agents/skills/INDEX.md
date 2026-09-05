@@ -42,6 +42,10 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `pnpm-workspace.yaml#packages` | `package-architecture` |
 | `tools/repo/check-artifacts.ts` | `package-artifact-validation` |
 | `tools/repo/check-dag.ts` | `package-architecture` |
+| `tools/repo/check-engines.ts` | `local-ci-parity` |
+| `tools/repo/check-licenses.ts` | `pnpm-supply-chain` |
+| `tools/repo/check-static.ts` | `package-architecture` |
+| `tools/repo/check-supply-chain.ts` | `pnpm-supply-chain` |
 | `tools/repo/gate.ts` | `local-ci-parity` |
 | `tools/repo/generate-schemas.ts` | `runtime-contract-evolution` |
 | `tools/repo/schema-defs.ts` | `runtime-contract-evolution` |
@@ -65,7 +69,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Path:** `.agents/skills/local-ci-parity/SKILL.md`
 - **Description:** Keep one canonical credential-free gate that runs identically on a developer machine and in GitHub Actions, with no step that only exists in one place.
 - **Tags:** `ci`, `gate`, `github-actions`, `reproducibility`
-- **Owns:** `.github/workflows`, `.nvmrc`, `docs/adr/ADR-0014-ci-and-gate-parity.md`, `tools/repo/gate.ts`
+- **Owns:** `.github/workflows`, `.nvmrc`, `docs/adr/ADR-0014-ci-and-gate-parity.md`, `tools/repo/check-engines.ts`, `tools/repo/gate.ts`
 - **Relationships:** `boundary-with` → `changesets-release`, `boundary-with` → `package-artifact-validation`, `depends-on` → `pnpm-supply-chain`
 
 ### `package-architecture`
@@ -74,7 +78,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Path:** `.agents/skills/package-architecture/SKILL.md`
 - **Description:** Add or restructure workspace packages, wire the TypeScript project graph and keep the dependency DAG acyclic with the runtime free of concrete provider adapters.
 - **Tags:** `dag`, `layering`, `monorepo`, `pnpm-workspace`, `tsconfig`
-- **Owns:** `docs/adr/ADR-0010-package-dag-and-layering.md`, `packages/runtime/src`, `pnpm-workspace.yaml#packages`, `tools/repo/check-dag.ts`, `tsconfig.base.json`, `tsconfig.json`
+- **Owns:** `docs/adr/ADR-0010-package-dag-and-layering.md`, `packages/runtime/src`, `pnpm-workspace.yaml#packages`, `tools/repo/check-dag.ts`, `tools/repo/check-static.ts`, `tsconfig.base.json`, `tsconfig.json`
 - **Relationships:** `boundary-with` → `package-artifact-validation`, `boundary-with` → `pnpm-supply-chain`, `boundary-with` → `provider-adapter-development`, `delegates-to` → `public-api-evolution`
 
 ### `package-artifact-validation`
@@ -92,7 +96,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Path:** `.agents/skills/pnpm-supply-chain/SKILL.md`
 - **Description:** Add or update third-party dependencies, keep the lockfile authoritative and keep dependency lifecycle scripts denied by default.
 - **Tags:** `audit`, `catalog`, `dependencies`, `install-scripts`, `lockfile`, `pnpm`
-- **Owns:** `.npmrc`, `docs/adr/ADR-0013-supply-chain-policy.md`, `package.json#packageManager`, `pnpm-lock.yaml`, `pnpm-workspace.yaml#catalog`, `pnpm-workspace.yaml#minimumReleaseAge`, `pnpm-workspace.yaml#onlyBuiltDependencies`
+- **Owns:** `.npmrc`, `docs/adr/ADR-0013-supply-chain-policy.md`, `package.json#packageManager`, `pnpm-lock.yaml`, `pnpm-workspace.yaml#catalog`, `pnpm-workspace.yaml#minimumReleaseAge`, `pnpm-workspace.yaml#onlyBuiltDependencies`, `tools/repo/check-licenses.ts`, `tools/repo/check-supply-chain.ts`
 - **Relationships:** `boundary-with` → `package-architecture`, `depends-on` → `local-ci-parity`
 
 ### `provider-adapter-development`

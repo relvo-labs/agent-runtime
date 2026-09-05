@@ -16,15 +16,16 @@
  *     making a provider's internals part of the contract.
  */
 
-import type {
-  AgentError,
-  InteractionResponse,
-  JsonObject,
-  ProviderDescriptor,
-  ProviderEventInput,
-  ProviderRecoveryRecord,
-  RunTermination,
-  TurnInput,
+import { z } from 'zod';
+import {
+  AgentErrorSchema,
+  type AgentError,
+  type InteractionResponse,
+  type JsonObject,
+  type ProviderDescriptor,
+  type ProviderEventInput,
+  type ProviderRecoveryRecord,
+  type TurnInput,
 } from '@relvo-labs/agent-protocol';
 
 export type { ProviderRecoveryRecord } from '@relvo-labs/agent-protocol';
@@ -32,9 +33,11 @@ export type { ProviderRecoveryRecord } from '@relvo-labs/agent-protocol';
 /**
  * Where a provider writes its semantic output.
  *
- * `emit` is synchronous and must not throw: a provider losing an event because
- * the sink rejected is worse than the runtime absorbing a malformed one and
- * recording a diagnostic.
+ * `emit` is synchronous and must not throw. Providers may emit before
+ * `createSession()` or `startRun()` returns. Runtime stages the first 256 such
+ * emissions in order, commits them only after the owning `session.opened` or
+ * `run.started` event, and records an explicit warning diagnostic if the
+ * deterministic tail exceeds that bound.
  */
 export type ProviderEventSink = {
   emit(input: ProviderEventInput): void;
@@ -79,6 +82,17 @@ export type ProviderRunRequest = {
 };
 
 /**
+ * Provider-owned terminal input. Runtime validates it and adds the terminal
+ * timestamp; adapters never manufacture runtime time.
+ */
+export const ProviderRunTerminationSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({ outcome: z.literal('succeeded') }),
+  z.strictObject({ outcome: z.literal('failed'), error: AgentErrorSchema }),
+  z.strictObject({ outcome: z.literal('interrupted'), reason: z.string().max(2000).optional() }),
+]);
+export type ProviderRunTermination = z.infer<typeof ProviderRunTerminationSchema>;
+
+/**
  * A single provider execution.
  *
  * Not serialisable, not a DTO, and never exposed to a consumer. The runtime
@@ -86,10 +100,11 @@ export type ProviderRunRequest = {
  */
 export type ProviderRun = {
   /**
-   * Resolves when the run reaches its terminal outcome. The runtime awaits this
-   * to stamp `run.finished`; a provider must settle it exactly once.
+   * Resolves with a schema-valid, timestamp-free terminal outcome. Runtime
+   * parses it, owns the timestamp, and maps rejection or malformed data to one
+   * typed failed outcome. A provider must settle it exactly once.
    */
-  readonly completion: Promise<RunTermination>;
+  readonly completion: Promise<ProviderRunTermination>;
 
   /**
    * End this run without ending the session.
@@ -103,7 +118,11 @@ export type ProviderRun = {
 
 /** A provider-side conversation. Holds native handles; never serialised. */
 export type ProviderSession = {
-  /** Begin a run. The provider must not start more than the descriptor allows. */
+  /**
+   * Begin a run. The provider must not start more than the descriptor allows.
+   * Emitting synchronously through `request.sink` is valid; Runtime preserves
+   * those emissions behind the owning run-start event.
+   */
   startRun(request: ProviderRunRequest): Promise<ProviderRun>;
 
   /**
@@ -144,6 +163,10 @@ export type AgentProvider = {
   /** Structured capabilities. Read before every capability-gated operation. */
   describe(): ProviderDescriptor;
 
+  /**
+   * Create a session. Emitting synchronously through `init.sink` is valid;
+   * Runtime preserves those emissions behind the owning session-open event.
+   */
   createSession(init: ProviderSessionInit): Promise<ProviderSession>;
 
   /** Optional: reconstruct from a previously exported record. */

@@ -18,7 +18,6 @@ import {
   type InteractionRequest,
   type InteractionResponse,
   type JsonObject,
-  type RunTermination,
   type TurnInput,
   type Usage,
   agentError,
@@ -30,6 +29,7 @@ import {
   type AgentProvider,
   type ProviderRecoveryRecord,
   type ProviderRun,
+  type ProviderRunTermination,
   type ProviderRunRequest,
   type ProviderSession,
   type ProviderSessionInit,
@@ -111,14 +111,14 @@ function deferred<T>(): Deferred<T> {
 }
 
 class ScriptedRun implements ProviderRun {
-  readonly completion: Promise<RunTermination>;
+  readonly completion: Promise<ProviderRunTermination>;
 
   #steps: ScriptStep[];
   #index = 0;
   #terminated = false;
   #interruptRequested = false;
   #blockedOn: string | undefined;
-  readonly #settle: Deferred<RunTermination>;
+  readonly #settle: Deferred<ProviderRunTermination>;
   readonly #request: ProviderRunRequest;
   readonly #interruptMode: NonNullable<ScriptedProviderOptions['interruptMode']>;
   readonly #onInterrupt: (runRef: string) => void;
@@ -133,7 +133,7 @@ class ScriptedRun implements ProviderRun {
     this.#steps = [...steps];
     this.#interruptMode = interruptMode;
     this.#onInterrupt = onInterrupt;
-    this.#settle = deferred<RunTermination>();
+    this.#settle = deferred<ProviderRunTermination>();
     this.completion = this.#settle.promise;
   }
 
@@ -217,12 +217,11 @@ class ScriptedRun implements ProviderRun {
           });
           return;
         case 'succeed':
-          this.#finish({ outcome: 'succeeded', at: '' as RunTermination['at'] });
+          this.#finish({ outcome: 'succeeded' });
           return;
         case 'fail':
           this.#finish({
             outcome: 'failed',
-            at: '' as RunTermination['at'],
             error: agentError('provider_rejected', step.message),
           });
           return;
@@ -231,18 +230,17 @@ class ScriptedRun implements ProviderRun {
 
     // A script that runs out without an explicit terminal step still has to
     // produce exactly one terminal outcome.
-    this.#finish({ outcome: 'succeeded', at: '' as RunTermination['at'] });
+    this.#finish({ outcome: 'succeeded' });
   }
 
   #finishInterrupted(reason?: string): void {
     this.#finish({
       outcome: 'interrupted',
-      at: '' as RunTermination['at'],
       ...(reason === undefined ? {} : { reason }),
     });
   }
 
-  #finish(termination: RunTermination): void {
+  #finish(termination: ProviderRunTermination): void {
     if (this.#terminated) return; // exactly one terminal outcome, ever
     this.#terminated = true;
     this.#blockedOn = undefined;
@@ -331,16 +329,16 @@ export function createScriptedProvider(options: ScriptedProviderOptions = {}): {
   const state = { startedRuns: [] as string[], interruptedRuns: [] as string[], disposedSessions: [] as string[] };
   let sessionCounter = 0;
 
+  const interruptMode = options.interruptMode ?? 'immediate';
   const descriptor = defineProviderDescriptor({
     providerId: options.providerId ?? 'scripted',
     providerVersion: '0.1.0',
     displayName: 'Scripted test provider',
     run: {
-      interrupt: {
-        mode: options.interruptMode ?? 'immediate',
-        deliversPartialOutput: true,
-        sessionRemainsUsable: (options.interruptMode ?? 'immediate') !== 'unsupported',
-      },
+      interrupt:
+        interruptMode === 'unsupported'
+          ? { mode: 'unsupported' }
+          : { mode: interruptMode, deliversPartialOutput: true, sessionRemainsUsable: true },
       streaming: { messageDeltas: true, toolActivity: true, incrementalUsage: true },
       maxConcurrentRunsPerSession: 1,
     },

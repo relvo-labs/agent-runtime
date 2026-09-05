@@ -365,6 +365,112 @@
   "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-interaction.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "not": {
+          "required": [
+            "settlement"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "settled"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "settlement"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {
+              "kind": {
+                "const": "question"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ]
+      },
+      "then": {
+        "properties": {
+          "settlement": {
+            "properties": {
+              "response": {
+                "properties": {
+                  "kind": {
+                    "const": "question"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {
+              "kind": {
+                "const": "approval"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ]
+      },
+      "then": {
+        "properties": {
+          "settlement": {
+            "properties": {
+              "response": {
+                "properties": {
+                  "kind": {
+                    "const": "approval"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "expiresAt": {
       "$ref": "#/$defs/timestamp"

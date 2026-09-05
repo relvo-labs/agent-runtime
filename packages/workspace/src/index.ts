@@ -6,9 +6,15 @@
  * borrowed, and borrowed directories are never destroyed.
  */
 
-export type { WorkspaceLease, WorkspaceProvider } from './spi.ts';
+export type {
+  WorkspaceLease,
+  WorkspaceProvider,
+  WorkspaceLeaseFor,
+  BorrowedWorkspaceLease,
+  ManagedWorkspaceLease,
+} from './spi.ts';
 
-export { createLocalWorkspaceProvider, type LocalWorkspaceProviderOptions } from './local.ts';
+export { createLocalWorkspaceProvider, validateWorkspaceLease, type LocalWorkspaceProviderOptions } from './local.ts';
 
 export {
   assertRemovable,

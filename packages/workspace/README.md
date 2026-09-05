@@ -1,3 +1,3 @@
 # `@relvo-labs/agent-workspace`
 
-Workspace SPI and guarded local implementation. Existing directories are borrowed and never removed; managed directories are newly created, ownership-bound, and released idempotently.
+Workspace SPI and guarded local implementation. Existing directories are borrowed and never removed; third-party descriptors are validated and cross-checked; managed directories are newly created, ownership-bound, and released through one concurrency-idempotent operation.

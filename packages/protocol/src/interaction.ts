@@ -127,6 +127,11 @@ export const InteractionSettlementSchema = z
   .refine((value) => (value.outcome === 'responded') === (value.response !== undefined), {
     message: 'a `responded` settlement must carry a response, and only a `responded` settlement may carry one',
     path: ['response'],
+  })
+  .meta({
+    if: { properties: { outcome: { const: 'responded' } }, required: ['outcome'] },
+    then: { required: ['response'] },
+    else: { not: { required: ['response'] } },
   });
 
 export type InteractionSettlement = z.infer<typeof InteractionSettlementSchema>;
@@ -160,7 +165,60 @@ export const AgentInteractionSchema = z
       message: 'a response must have the same `kind` as its request',
       path: ['settlement', 'response', 'kind'],
     },
-  );
+  )
+  .meta({
+    allOf: [
+      {
+        if: { properties: { status: { const: 'settled' } }, required: ['status'] },
+        then: { required: ['settlement'] },
+        else: { not: { required: ['settlement'] } },
+      },
+      {
+        if: {
+          properties: {
+            request: { type: 'object', properties: { kind: { const: 'question' } }, required: ['kind'] },
+          },
+          required: ['request'],
+        },
+        then: {
+          properties: {
+            settlement: {
+              type: 'object',
+              properties: {
+                response: {
+                  type: 'object',
+                  properties: { kind: { const: 'question' } },
+                  required: ['kind'],
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        if: {
+          properties: {
+            request: { type: 'object', properties: { kind: { const: 'approval' } }, required: ['kind'] },
+          },
+          required: ['request'],
+        },
+        then: {
+          properties: {
+            settlement: {
+              type: 'object',
+              properties: {
+                response: {
+                  type: 'object',
+                  properties: { kind: { const: 'approval' } },
+                  required: ['kind'],
+                },
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
 
 export type AgentInteraction = z.infer<typeof AgentInteractionSchema>;
 

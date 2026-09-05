@@ -84,6 +84,10 @@ export type AgentExecutor = {
    */
   subscribe(request: SubscriptionRequestInput): EventSubscription;
 
-  /** Release every session, lease and provider. Idempotent. */
+  /**
+   * Stop mutation admission, drain admitted commands, and release every
+   * session, lease, provider, and subscription. Concurrent calls return the
+   * same cleanup promise; later mutations reject.
+   */
   shutdown(): Promise<void>;
 };

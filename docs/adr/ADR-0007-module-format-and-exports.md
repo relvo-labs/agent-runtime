@@ -8,7 +8,7 @@ Dual ESM/CJS packages create two module identities for stateful registries. A bu
 
 ## Decision
 
-Publish ESM-only packages with explicit `exports`, types-first conditions, `.js` runtime files, `.d.ts` declarations, and a `./package.json` export. tsdown is the current declaration/bundle implementation. It may be replaced if tarball paths, export semantics, declarations, source compatibility, and Node 22/24 behavior remain unchanged.
+Publish ESM-only packages with explicit `exports`, types-first conditions, `.js` runtime files, `.d.ts` declarations, and a `./package.json` export. tsdown is the current declaration/bundle implementation. It may be replaced if tarball paths, export semantics, declarations, source compatibility, and behavior across the supported Node 22/24/26 matrix remain unchanged.
 
 ## Consequences
 

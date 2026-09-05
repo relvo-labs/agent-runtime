@@ -18,9 +18,10 @@ export type {
   ProviderEventSink,
   ProviderWorkspaceView,
   ProviderRecoveryRecord,
+  ProviderRunTermination,
 } from './spi.ts';
 
-export { ProviderRejection, isProviderRejection } from './spi.ts';
+export { ProviderRejection, ProviderRunTerminationSchema, isProviderRejection } from './spi.ts';
 
 export {
   defineProviderDescriptor,

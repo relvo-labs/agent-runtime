@@ -7,8 +7,8 @@
  * change whenever a new question is asked, and push callers into guessing.
  *
  * A descriptor is a closed, nested structure with defaults, so:
- *   - adding a new dimension is a compatible change (existing adapters get the
- *     conservative default),
+ *   - a new dimension can start conservative, but still requires a new exact
+ *     pre-1.0 wire minor because old strict readers reject unknown fields,
  *   - a provider can state a degree of support rather than yes/no,
  *   - `extensions` gives provider-specific facts a home without polluting the
  *     shared shape.
@@ -27,8 +27,7 @@ export const InterruptModeSchema = z.enum([
   'unsupported',
 ]);
 
-export const InterruptCapabilitySchema = z.strictObject({
-  mode: InterruptModeSchema,
+const supportedInterruptCapability = {
   /** Whether output already produced before the interrupt is still delivered. */
   deliversPartialOutput: z.boolean().default(true),
   /**
@@ -37,7 +36,16 @@ export const InterruptCapabilitySchema = z.strictObject({
    * that a boolean `supportsInterrupt: true` would have hidden.
    */
   sessionRemainsUsable: z.boolean().default(true),
-});
+};
+
+export const InterruptCapabilitySchema = z.discriminatedUnion('mode', [
+  z.strictObject({ mode: z.enum(['immediate', 'cooperative']), ...supportedInterruptCapability }),
+  z.strictObject({
+    mode: z.literal('unsupported'),
+    deliversPartialOutput: z.literal(false).default(false),
+    sessionRemainsUsable: z.literal(false).default(false),
+  }),
+]);
 
 export const StreamingCapabilitySchema = z.strictObject({
   /** Incremental assistant text as the run proceeds. */
@@ -107,12 +115,19 @@ export const WorkspaceCapabilitySchema = z.strictObject({
   writes: z.boolean().default(true),
 });
 
-export const RecoveryCapabilitySchema = z.strictObject({
-  /** Provider can export a serialisable record that reconstructs a session. */
-  exportsRecoveryRecord: z.boolean().default(false),
-  /** Provider can resume from a previously exported record. */
-  resumesFromRecoveryRecord: z.boolean().default(false),
-});
+export const RecoveryCapabilitySchema = z.discriminatedUnion('exportsRecoveryRecord', [
+  z.strictObject({
+    /** Provider cannot resume a record it cannot export under this contract. */
+    exportsRecoveryRecord: z.literal(false).default(false),
+    resumesFromRecoveryRecord: z.literal(false).default(false),
+  }),
+  z.strictObject({
+    /** Provider can export a serialisable record that reconstructs a session. */
+    exportsRecoveryRecord: z.literal(true),
+    /** Provider can resume from a previously exported record. */
+    resumesFromRecoveryRecord: z.boolean().default(false),
+  }),
+]);
 
 /** Serializable provider state. Only the named provider interprets `opaque`. */
 export const ProviderRecoveryRecordSchema = z.strictObject({

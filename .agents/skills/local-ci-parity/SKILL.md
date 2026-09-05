@@ -30,6 +30,7 @@ Do not use this skill when:
 
 - `.github/workflows` — every hosted workflow
 - `tools/repo/gate.ts` — the canonical step list
+- `tools/repo/check-engines.ts` — supported-runtime and hosted-workflow bootstrap policy
 - `.nvmrc` — the baseline Node version and, with it, the supported matrix
 - `docs/adr/ADR-0014-ci-and-gate-parity.md` — the parity decision record
 
@@ -73,8 +74,8 @@ Do not use this skill when:
    | 24.20.0 | Active LTS      | yes   | `.nvmrc` baseline, primary job |
    | 26.x    | Current         | yes   | supported, bounded to major 26 |
 
-   Only the baseline job runs the artifact gate (it performs a real install); the other
-   lines run lint/typecheck/test/build. Update this table and `engines` together.
+   Every matrix job runs the complete canonical gate, including package artifact checks.
+   Update this table and `engines` together.
 
 5. **Pin actions and lock the toolchain.** Pin every action to its full immutable commit.
    Use `actions/checkout` with credential persistence disabled, then `pnpm/setup` to
@@ -83,13 +84,15 @@ Do not use this skill when:
    frozen install next. Do not depend on `actions/setup-node` or Corepack: supported Node
    installations, including Node 26, need not ship Corepack. Never `npm i -g pnpm@latest`.
 
+   Changesets needs its configured base as a local Git ref. Checkout must fetch complete
+   history and materialize `refs/heads/main` from `refs/remotes/origin/main`; full history
+   with only the remote-tracking ref still fails `git merge-base main HEAD`.
+
 6. **Concurrency and permissions.** Every workflow sets `permissions: contents: read` at
    the top level and a `concurrency` group keyed on the ref, so superseded runs cancel.
 
-7. **Do not add a step that is green because it is skipped.** If a step cannot run in an
-   environment, it must fail loudly or be removed — not silently no-op. `gate.ts` prints
-   an explicit `SKIP` line with a reason and exits non-zero in CI mode when a required
-   step is skipped.
+7. **Do not add a step that is green because it is skipped.** The canonical gate has no
+   environment-dependent skip path. If a required step cannot run, it fails.
 
 ## Verification
 

@@ -9,7 +9,8 @@
 
 import {
   AgentRuntimeError,
-  AgentCommandSchema,
+  CommandIdSchema,
+  CommandReceiptSchema,
   CloseSessionCommandSchema,
   InterruptRunCommandSchema,
   OpenSessionCommandSchema,
@@ -56,11 +57,12 @@ import {
   canAcceptWorkspace,
   canInterruptRun,
   isProviderRejection,
+  ProviderRunTerminationSchema,
   type AgentProvider,
   type ProviderRun,
   type ProviderSession,
 } from '@relvo-labs/agent-provider';
-import type { WorkspaceLease, WorkspaceProvider } from '@relvo-labs/agent-workspace';
+import { validateWorkspaceLease, type WorkspaceLease, type WorkspaceProvider } from '@relvo-labs/agent-workspace';
 
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 import { createSubscriptionHub, type SubscriptionHub } from './subscriptions.ts';
@@ -85,6 +87,24 @@ export type AgentRuntime = AgentExecutor & {
   quiesce(): Promise<void>;
 };
 
+const coordinationStates = new WeakMap<
+  AgentRuntime,
+  {
+    readonly commandQueues: ReadonlyMap<string, Promise<void>>;
+    readonly sessionQueues: ReadonlyMap<string, Promise<void>>;
+  }
+>();
+
+/** @internal Deterministic keyed-coordination cleanup diagnostic for tests. */
+export function coordinationEntryCountForTesting(runtime: AgentRuntime): {
+  readonly commands: number;
+  readonly sessions: number;
+} {
+  const state = coordinationStates.get(runtime);
+  if (state === undefined) throw new Error('runtime was not created by createAgentRuntime');
+  return { commands: state.commandQueues.size, sessions: state.sessionQueues.size };
+}
+
 /** Live, non-serialisable state. Deliberately never touches the store. */
 type LiveSession = {
   readonly sessionId: SessionId;
@@ -94,6 +114,8 @@ type LiveSession = {
   readonly lease: WorkspaceLease;
   /** Non-terminal runs, by our RunId. */
   readonly runs: Map<RunId, ProviderRun>;
+  /** Resolve tracked supervision once close has supplied the terminal fallback. */
+  readonly stopSupervision: Map<RunId, () => void>;
   /** InteractionId → the provider's own correlation token. */
   readonly interactionRefs: Map<InteractionId, string>;
   /** Provider ref → InteractionId, for the reverse lookup on emit. */
@@ -115,16 +137,43 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const live = new Map<SessionId, LiveSession>();
   /** In-flight internal work, awaited by `quiesce`. */
   const pending = new Set<Promise<unknown>>();
-  let shuttingDown = false;
-  let commandQueue: Promise<void> = Promise.resolve();
+  const commandQueues = new Map<string, Promise<void>>();
+  const sessionQueues = new Map<string, Promise<void>>();
+  let lifecycle: 'accepting' | 'shutting_down' | 'shut_down' = 'accepting';
+  let shutdownPromise: Promise<void> | undefined;
 
-  function serializeCommand<T>(operation: () => Promise<T>): Promise<T> {
-    const result = commandQueue.then(operation, operation);
-    commandQueue = result.then(
+  function serializeByKey<T>(queues: Map<string, Promise<void>>, key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = queues.get(key) ?? Promise.resolve();
+    const result = previous.then(operation, operation);
+    const tail = result.then(
       () => undefined,
       () => undefined,
     );
-    return result;
+    queues.set(key, tail);
+    return result.finally(() => {
+      if (queues.get(key) === tail) queues.delete(key);
+    });
+  }
+
+  function coordinateCommand<T>(input: unknown, operation: () => Promise<T>): Promise<T> {
+    const candidate =
+      typeof input === 'object' && input !== null ? (input as { commandId?: unknown; sessionId?: unknown }) : {};
+    const withinSession = (): Promise<T> =>
+      typeof candidate.sessionId === 'string'
+        ? serializeByKey(sessionQueues, candidate.sessionId, operation)
+        : operation();
+    return typeof candidate.commandId === 'string'
+      ? serializeByKey(commandQueues, candidate.commandId, withinSession)
+      : withinSession();
+  }
+
+  function coordinateMutation<T>(input: unknown, operation: () => Promise<T>): Promise<T> {
+    if (lifecycle !== 'accepting') {
+      return Promise.reject(
+        new AgentRuntimeError(agentError('session_closed', `runtime is ${lifecycle.replace('_', ' ')}`)),
+      );
+    }
+    return coordinateCommand(input, operation);
   }
 
   function track(work: Promise<unknown>): void {
@@ -148,7 +197,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     payload: { result?: CommandResult; error?: AgentError; sequence?: Sequence },
     acceptedAt: Timestamp,
   ): CommandReceipt {
-    return {
+    return CommandReceiptSchema.parse({
       commandId: command.commandId,
       commandType: command.type,
       disposition,
@@ -156,7 +205,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       ...(payload.error === undefined ? {} : { error: payload.error }),
       ...(payload.sequence === undefined ? {} : { sequence: payload.sequence }),
       acceptedAt,
-    };
+    });
   }
 
   /**
@@ -175,20 +224,25 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   function parseCommand<T extends AgentCommand>(
     schema: SafeParser<T>,
     raw: unknown,
+    commandType: T['type'],
   ): { ok: true; command: T } | { ok: false; receipt: CommandReceipt } {
     const parsed = schema.safeParse(raw);
     if (parsed.success) return { ok: true, command: parsed.data };
 
-    const partial = (raw ?? {}) as { commandId?: string; type?: string };
+    const partial = (raw ?? {}) as { commandId?: unknown };
+    const commandId = CommandIdSchema.safeParse(partial.commandId);
+    if (!commandId.success) {
+      throw new AgentRuntimeError(agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'));
+    }
     return {
       ok: false,
-      receipt: {
-        commandId: (partial.commandId ?? 'unknown-command') as CommandId,
-        commandType: (partial.type ?? 'submit_turn') as CommandReceipt['commandType'],
+      receipt: CommandReceiptSchema.parse({
+        commandId: commandId.data,
+        commandType,
         disposition: 'rejected',
         error: agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'),
         acceptedAt: clock.now(),
-      },
+      }),
     };
   }
 
@@ -205,93 +259,141 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   // Provider event ingestion
   // -------------------------------------------------------------------------
 
-  function sinkFor(sessionId: SessionId, runId: RunId | undefined) {
+  const PRE_ACTIVATION_EVENT_LIMIT = 256;
+
+  async function ingestProviderEvent(
+    sessionId: SessionId,
+    runId: RunId | undefined,
+    input: ProviderEventInput,
+  ): Promise<void> {
+    // A provider must never be able to break the runtime by emitting
+    // something malformed; the worst outcome is a recorded diagnostic.
+    const parsed = ProviderEventInputSchema.safeParse(input);
+    await commitAndPublish((tx) => {
+      if (!tx.hasSession(sessionId)) return;
+      const state = tx.session(sessionId).session.state;
+      if (state === 'closed' || state === 'failed') return;
+
+      if (!parsed.success) {
+        tx.emit({
+          sessionId,
+          payload: {
+            type: 'diagnostic',
+            level: 'warning',
+            message: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
+          },
+        });
+        return;
+      }
+
+      const payload = parsed.data.payload;
+
+      if (runId === undefined && payload.type !== 'diagnostic') {
+        tx.emit({
+          sessionId,
+          payload: {
+            type: 'diagnostic',
+            level: 'warning',
+            message: `provider emitted run-scoped event \`${payload.type}\` on the session sink`,
+          },
+        });
+        return;
+      }
+
+      if (runId !== undefined) {
+        const run = tx.session(sessionId).runs.get(runId);
+        if (!run || run.termination !== undefined) return;
+      }
+
+      if (payload.type === 'interaction.requested') {
+        if (runId === undefined) return;
+        const interactionId = idFactory.next('interaction') as InteractionId;
+        const providerRef = payload.providerRef;
+        const session = live.get(sessionId);
+        const run = tx.session(sessionId).runs.get(runId);
+        if (!session || !run) return;
+        if (session.refToInteraction.has(providerRef)) {
+          tx.emit({
+            sessionId,
+            runId,
+            payload: {
+              type: 'diagnostic',
+              level: 'warning',
+              message: `provider reused active interaction reference \`${providerRef}\``,
+            },
+          });
+          return;
+        }
+        session.interactionRefs.set(interactionId, providerRef);
+        session.refToInteraction.set(providerRef, interactionId);
+        session.interactionRuns.set(interactionId, runId);
+        tx.emit({
+          sessionId,
+          runId,
+          payload: {
+            type: 'interaction.requested',
+            interactionId,
+            turnId: run.turnId,
+            request: payload.request,
+          },
+        });
+        return;
+      }
+
+      tx.emit({
+        sessionId,
+        ...(runId === undefined ? {} : { runId }),
+        payload,
+      });
+    }).catch(() => {
+      // Losing one provider event must not take down the session.
+    });
+  }
+
+  function stagedSinkFor(sessionId: SessionId, runId: RunId | undefined, owner: 'session' | 'run') {
+    let phase: 'staging' | 'draining' | 'active' | 'discarded' = 'staging';
+    let accepted = 0;
+    let dropped = 0;
+    let staged: ProviderEventInput[] = [];
+
     return {
-      emit(input: ProviderEventInput): void {
-        // A provider must never be able to break the runtime by emitting
-        // something malformed; the worst outcome is a recorded diagnostic.
-        const parsed = ProviderEventInputSchema.safeParse(input);
-        track(
-          commitAndPublish((tx) => {
-            if (!tx.hasSession(sessionId)) return;
-            const state = tx.session(sessionId).session.state;
-            if (state === 'closed' || state === 'failed') return;
-
-            if (!parsed.success) {
-              tx.emit({
-                sessionId,
-                payload: {
-                  type: 'diagnostic',
-                  level: 'warning',
-                  message: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
-                },
-              });
-              return;
-            }
-
-            const payload = parsed.data.payload;
-
-            if (runId === undefined && payload.type !== 'diagnostic') {
-              tx.emit({
-                sessionId,
-                payload: {
-                  type: 'diagnostic',
-                  level: 'warning',
-                  message: `provider emitted run-scoped event \`${payload.type}\` on the session sink`,
-                },
-              });
-              return;
-            }
-
-            if (runId !== undefined) {
-              const run = tx.session(sessionId).runs.get(runId);
-              if (!run || run.termination !== undefined) return;
-            }
-
-            if (payload.type === 'interaction.requested') {
-              if (runId === undefined) return;
-              const interactionId = idFactory.next('interaction') as InteractionId;
-              const providerRef = payload.providerRef;
-              const session = live.get(sessionId);
-              const run = tx.session(sessionId).runs.get(runId);
-              if (!session || !run) return;
-              if (session.refToInteraction.has(providerRef)) {
-                tx.emit({
-                  sessionId,
-                  runId,
-                  payload: {
-                    type: 'diagnostic',
-                    level: 'warning',
-                    message: `provider reused active interaction reference \`${providerRef}\``,
-                  },
-                });
-                return;
-              }
-              session.interactionRefs.set(interactionId, providerRef);
-              session.refToInteraction.set(providerRef, interactionId);
-              session.interactionRuns.set(interactionId, runId);
-              tx.emit({
-                sessionId,
-                runId,
-                payload: {
-                  type: 'interaction.requested',
-                  interactionId,
-                  turnId: run.turnId,
-                  request: payload.request,
-                },
-              });
-              return;
-            }
-
-            tx.emit({
-              sessionId,
-              ...(runId === undefined ? {} : { runId }),
-              payload,
-            });
-          }).catch(() => {
-            // Losing one provider event must not take down the session.
-          }),
-        );
+      sink: {
+        emit(input: ProviderEventInput): void {
+          if (phase === 'discarded') return;
+          if (phase === 'active') {
+            track(ingestProviderEvent(sessionId, runId, input));
+            return;
+          }
+          if (accepted >= PRE_ACTIVATION_EVENT_LIMIT) {
+            dropped += 1;
+            return;
+          }
+          accepted += 1;
+          staged.push(input);
+        },
+      },
+      async activate(): Promise<void> {
+        if (phase !== 'staging') return;
+        phase = 'draining';
+        while (staged.length > 0) {
+          const batch = staged;
+          staged = [];
+          for (const input of batch) await ingestProviderEvent(sessionId, runId, input);
+        }
+        phase = 'active';
+        if (dropped > 0) {
+          await ingestProviderEvent(sessionId, runId, {
+            payload: {
+              type: 'diagnostic',
+              level: 'warning',
+              message: `${String(dropped)} provider events exceeded the ${String(PRE_ACTIVATION_EVENT_LIMIT)}-event pre-activation buffer for ${owner}; the deterministic tail was not accepted`,
+            },
+          });
+        }
+      },
+      discard(): void {
+        phase = 'discarded';
+        staged = [];
       },
     };
   }
@@ -301,10 +403,30 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   // -------------------------------------------------------------------------
 
   function superviseRun(sessionId: SessionId, turnId: TurnId, runId: RunId, providerRun: ProviderRun): void {
-    track(
-      providerRun.completion
-        .then(async (termination) => {
-          const stamped = { ...termination, at: clock.now() };
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    const sessionAtStart = live.get(sessionId);
+    sessionAtStart?.stopSupervision.set(runId, stop);
+
+    const settle = async (completion: unknown, rejected: boolean): Promise<void> => {
+      await serializeByKey(sessionQueues, sessionId, async () => {
+        const parsed = rejected ? undefined : ProviderRunTerminationSchema.safeParse(completion);
+        const stamped =
+          parsed?.success === true
+            ? { ...parsed.data, at: clock.now() }
+            : {
+                outcome: 'failed' as const,
+                at: clock.now(),
+                error: agentError(
+                  'provider_contract_violation',
+                  rejected
+                    ? 'provider completion promise rejected instead of returning a terminal outcome'
+                    : `provider returned an invalid completion: ${parsed?.error.issues[0]?.message ?? 'schema mismatch'}`,
+                ),
+              };
+        try {
           await commitAndPublish((tx) => {
             if (!tx.hasSession(sessionId)) return;
             const run = tx.session(sessionId).runs.get(runId);
@@ -343,10 +465,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
                 turnId,
                 state: turnState,
                 ...(output === undefined ? {} : { output }),
-                ...(stamped.error === undefined ? {} : { error: stamped.error }),
+                ...(stamped.outcome === 'failed' ? { error: stamped.error } : {}),
               },
             });
           });
+        } finally {
           const session = live.get(sessionId);
           if (session) {
             session.runs.delete(runId);
@@ -358,10 +481,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
               if (providerRef !== undefined) session.refToInteraction.delete(providerRef);
             }
           }
-        })
-        .catch(() => {
-          live.get(sessionId)?.runs.delete(runId);
-        }),
+        }
+      });
+    };
+    const completion = providerRun.completion.then(
+      (completion) => settle(completion, false),
+      (error: unknown) => settle(error, true),
+    );
+    track(
+      Promise.race([completion, stopped]).finally(() => {
+        const session = live.get(sessionId);
+        if (session?.stopSupervision.get(runId) === stop) session.stopSupervision.delete(runId);
+      }),
     );
   }
 
@@ -370,7 +501,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   // -------------------------------------------------------------------------
 
   async function openSession(input: OpenSessionCommandInput): Promise<CommandReceipt> {
-    const parsed = parseCommand(OpenSessionCommandSchema, input);
+    const parsed = parseCommand(OpenSessionCommandSchema, input, 'open_session');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
@@ -390,7 +521,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           duplicate.receipt.acceptedAt,
         );
       }
-      return { ...duplicate.receipt, disposition: 'duplicate' };
+      return duplicate.receipt.disposition === 'rejected'
+        ? duplicate.receipt
+        : CommandReceiptSchema.parse({ ...duplicate.receipt, disposition: 'duplicate' });
     }
 
     const acceptedAt = clock.now();
@@ -400,18 +533,23 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     // inside a store transaction, so they happen first and are rolled back by
     // hand if the commit is impossible.
     let lease: WorkspaceLease | undefined;
+    let leaseSafeToRelease = false;
     let providerSession: ProviderSession | undefined;
+    const sessionEvents = stagedSinkFor(sessionId, undefined, 'session');
     try {
       const provider = registry.get(command.providerId);
-      const descriptor = provider.describe();
+      const descriptor = registry.descriptor(command.providerId);
       lease = await options.workspaces.acquire(command.workspace);
+      leaseSafeToRelease = command.workspace.kind === 'managed' && lease.ownership === 'managed';
+      const leaseDescriptor = validateWorkspaceLease(command.workspace, lease);
+      leaseSafeToRelease = true;
       const workspaceCapability = canAcceptWorkspace(descriptor, lease.ownership);
       if (!workspaceCapability.ok) throw new AgentRuntimeError(workspaceCapability.error);
 
       providerSession = await provider.createSession({
         options: command.providerOptions ?? {},
         workspace: { root: lease.root, ownership: lease.ownership },
-        sink: sinkFor(sessionId, undefined),
+        sink: sessionEvents.sink,
       });
 
       const session: AgentSession = {
@@ -419,13 +557,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         state: 'opening',
         providerId: descriptor.providerId,
         wireVersion: WIRE_VERSION,
-        workspace: lease.describe(),
+        workspace: leaseDescriptor,
         createdAt: acceptedAt,
         sequence: 0 as Sequence,
         turnIds: [],
       };
-      const acquiredLease = lease;
-
       live.set(sessionId, {
         sessionId,
         provider,
@@ -433,6 +569,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         providerSession,
         lease,
         runs: new Map(),
+        stopSupervision: new Map(),
         interactionRefs: new Map(),
         refToInteraction: new Map(),
         interactionRuns: new Map(),
@@ -442,14 +579,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       });
 
       const result: CommandResult = { type: 'session_opened', sessionId };
-      return await commitAndPublish((tx) => {
+      const produced = await commitAndPublish((tx) => {
         tx.createSession(session);
         tx.emit({
           sessionId,
           payload: {
             type: 'session.opened',
             providerId: descriptor.providerId,
-            workspace: acquiredLease.describe(),
+            workspace: leaseDescriptor,
           },
         });
         const produced = receipt(
@@ -461,10 +598,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: produced });
         return produced;
       });
+      await sessionEvents.activate();
+      return produced;
     } catch (error) {
+      sessionEvents.discard();
       live.delete(sessionId);
       await providerSession?.dispose().catch(() => undefined);
-      await lease?.release().catch(() => undefined);
+      if (leaseSafeToRelease) await lease?.release().catch(() => undefined);
       const failure = receipt(command, 'rejected', { error: toAgentError(error, 'internal') }, acceptedAt);
       await store.commit((tx) => {
         tx.recordReceipt(command.commandId, {
@@ -485,7 +625,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   async function submitTurn(input: SubmitTurnCommandInput): Promise<CommandReceipt> {
-    const parsed = parseCommand(SubmitTurnCommandSchema, input);
+    const parsed = parseCommand(SubmitTurnCommandSchema, input, 'submit_turn');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
@@ -522,14 +662,16 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     session.turnAttempts.set(turnId, attempt);
 
     let providerRun: ProviderRun;
+    const runEvents = stagedSinkFor(command.sessionId, runId, 'run');
     session.startingRun = true;
     try {
       providerRun = await session.providerSession.startRun({
         input: command.input,
-        sink: sinkFor(command.sessionId, runId),
+        sink: runEvents.sink,
         runRef: runId,
       });
     } catch (error) {
+      runEvents.discard();
       return await rejectAndRecord(
         command,
         receipt(
@@ -561,12 +703,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       return value;
     });
 
+    await runEvents.activate();
     superviseRun(command.sessionId, turnId, runId, providerRun);
     return produced;
   }
 
   async function interruptRun(input: InterruptRunCommandInput): Promise<CommandReceipt> {
-    const parsed = parseCommand(InterruptRunCommandSchema, input);
+    const parsed = parseCommand(InterruptRunCommandSchema, input, 'interrupt_run');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
@@ -629,7 +772,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   async function respondToInteraction(input: RespondToInteractionCommandInput): Promise<CommandReceipt> {
-    const parsed = parseCommand(RespondToInteractionCommandSchema, input);
+    const parsed = parseCommand(RespondToInteractionCommandSchema, input, 'respond_to_interaction');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
@@ -728,6 +871,17 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     }
 
     return await commitAndPublish((tx) => {
+      const current = tx.session(command.sessionId).interactions.get(command.interactionId);
+      if (current === undefined || current.status === 'settled') {
+        const value = receipt(
+          command,
+          'rejected',
+          { error: agentError('interaction_already_settled', `interaction \`${command.interactionId}\` is settled`) },
+          acceptedAt,
+        );
+        tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
+        return value;
+      }
       tx.emit({
         sessionId: command.sessionId,
         runId,
@@ -753,7 +907,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   async function closeSession(input: CloseSessionCommandInput): Promise<CommandReceipt> {
-    const parsed = parseCommand(CloseSessionCommandSchema, input);
+    const parsed = parseCommand(CloseSessionCommandSchema, input, 'close_session');
     if (!parsed.ok) return parsed.receipt;
     const command = parsed.command;
 
@@ -861,6 +1015,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       }
     });
     session.runs.clear();
+    for (const stop of session.stopSupervision.values()) stop();
+    session.stopSupervision.clear();
     session.interactionRefs.clear();
     session.refToInteraction.clear();
     session.interactionRuns.clear();
@@ -906,7 +1062,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         existing.receipt.acceptedAt,
       );
     }
-    return { ...existing.receipt, disposition: 'duplicate' };
+    return existing.receipt.disposition === 'rejected'
+      ? existing.receipt
+      : CommandReceiptSchema.parse({ ...existing.receipt, disposition: 'duplicate' });
   }
 
   function guardCommand(
@@ -981,31 +1139,38 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
   const runtime: AgentRuntime = {
     registerProvider: (provider) => {
+      if (lifecycle !== 'accepting') {
+        throw new AgentRuntimeError(agentError('session_closed', `runtime is ${lifecycle.replace('_', ' ')}`));
+      }
       registry.register(provider);
     },
     quiesce,
 
-    openSession: (command) => serializeCommand(() => openSession(command)),
-    submitTurn: (command) => serializeCommand(() => submitTurn(command)),
-    interruptRun: (command) => serializeCommand(() => interruptRun(command)),
-    respondToInteraction: (command) => serializeCommand(() => respondToInteraction(command)),
-    closeSession: (command) => serializeCommand(() => closeSession(command)),
+    openSession: (command) => coordinateMutation(command, () => openSession(command)),
+    submitTurn: (command) => coordinateMutation(command, () => submitTurn(command)),
+    interruptRun: (command) => coordinateMutation(command, () => interruptRun(command)),
+    respondToInteraction: (command) => coordinateMutation(command, () => respondToInteraction(command)),
+    closeSession: (command) => coordinateMutation(command, () => closeSession(command)),
 
     dispatch(rawCommand: AgentCommandInput): Promise<CommandReceipt> {
-      const parsed = parseCommand(AgentCommandSchema, rawCommand);
-      if (!parsed.ok) return Promise.resolve(parsed.receipt);
-      const command = parsed.command;
-      switch (command.type) {
+      const commandType = (rawCommand as { readonly type?: unknown }).type;
+      switch (commandType) {
         case 'open_session':
-          return serializeCommand(() => openSession(command));
+          return coordinateMutation(rawCommand, () => openSession(rawCommand as OpenSessionCommandInput));
         case 'submit_turn':
-          return serializeCommand(() => submitTurn(command));
+          return coordinateMutation(rawCommand, () => submitTurn(rawCommand as SubmitTurnCommandInput));
         case 'interrupt_run':
-          return serializeCommand(() => interruptRun(command));
+          return coordinateMutation(rawCommand, () => interruptRun(rawCommand as InterruptRunCommandInput));
         case 'respond_to_interaction':
-          return serializeCommand(() => respondToInteraction(command));
+          return coordinateMutation(rawCommand, () =>
+            respondToInteraction(rawCommand as RespondToInteractionCommandInput),
+          );
         case 'close_session':
-          return serializeCommand(() => closeSession(command));
+          return coordinateMutation(rawCommand, () => closeSession(rawCommand as CloseSessionCommandInput));
+        default:
+          return Promise.reject(
+            new AgentRuntimeError(agentError('invalid_request', 'command type is missing or unknown')),
+          );
       }
     },
 
@@ -1021,24 +1186,38 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       return hub.subscribe(SubscriptionRequestSchema.parse(request));
     },
 
-    async shutdown(): Promise<void> {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      for (const sessionId of [...live.keys()]) {
-        await serializeCommand(() =>
-          closeSession({
+    shutdown(): Promise<void> {
+      if (shutdownPromise !== undefined) return shutdownPromise;
+      lifecycle = 'shutting_down';
+      shutdownPromise = (async () => {
+        while (commandQueues.size > 0 || sessionQueues.size > 0) {
+          await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
+        }
+        for (const sessionId of [...live.keys()]) {
+          const command = {
             commandId: `shutdown-${sessionId}` as CommandId,
-            type: 'close_session',
+            type: 'close_session' as const,
             sessionId,
-            ifRunActive: 'interrupt',
-          }),
-        ).catch(() => undefined);
-      }
-      await quiesce();
-      await options.workspaces.releaseAll();
-      hub.closeAll();
+            ifRunActive: 'interrupt' as const,
+          };
+          await coordinateCommand(command, () => closeSession(command)).catch(() => undefined);
+        }
+        while (commandQueues.size > 0 || sessionQueues.size > 0) {
+          await Promise.allSettled([...commandQueues.values(), ...sessionQueues.values()]);
+        }
+        try {
+          await quiesce();
+        } finally {
+          // Runtime releases only leases it independently validated and tracked;
+          // a provider-wide sweep could invoke a suspect mismatched lease.
+          hub.closeAll();
+          lifecycle = 'shut_down';
+        }
+      })();
+      return shutdownPromise;
     },
   };
 
+  coordinationStates.set(runtime, { commandQueues, sessionQueues });
   return runtime;
 }

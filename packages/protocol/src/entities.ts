@@ -37,8 +37,10 @@ export const FileRefPartSchema = z.strictObject({
     .string()
     .min(1)
     .max(4096)
-    .refine((value) => !value.startsWith('/'), 'file references must be workspace-relative')
-    .refine((value) => !value.split('/').includes('..'), 'file references must not traverse outside the workspace'),
+    .regex(
+      /^(?![\\/])(?![A-Za-z]:[\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$)).+$/,
+      'file references must be relative and must not traverse outside the workspace',
+    ),
 });
 
 export const TurnInputPartSchema = z.discriminatedUnion('type', [TextPartSchema, FileRefPartSchema]);
@@ -104,6 +106,35 @@ export const AgentRunSchema = z
   .refine((value) => value.state !== 'awaiting_interaction' || value.pendingInteractionIds.length > 0, {
     message: 'a run awaiting interaction must have at least one pending interaction',
     path: ['pendingInteractionIds'],
+  })
+  .meta({
+    allOf: [
+      {
+        if: { properties: { state: { enum: ['succeeded', 'failed', 'interrupted'] } }, required: ['state'] },
+        then: { required: ['termination'] },
+        else: { not: { required: ['termination'] } },
+      },
+      {
+        if: { properties: { state: { const: 'succeeded' } }, required: ['state'] },
+        then: {
+          properties: { termination: { type: 'object', properties: { outcome: { const: 'succeeded' } } } },
+        },
+      },
+      {
+        if: { properties: { state: { const: 'failed' } }, required: ['state'] },
+        then: { properties: { termination: { type: 'object', properties: { outcome: { const: 'failed' } } } } },
+      },
+      {
+        if: { properties: { state: { const: 'interrupted' } }, required: ['state'] },
+        then: {
+          properties: { termination: { type: 'object', properties: { outcome: { const: 'interrupted' } } } },
+        },
+      },
+      {
+        if: { properties: { state: { const: 'awaiting_interaction' } }, required: ['state'] },
+        then: { properties: { pendingInteractionIds: { type: 'array', minItems: 1 } } },
+      },
+    ],
   });
 
 export type AgentRun = z.infer<typeof AgentRunSchema>;

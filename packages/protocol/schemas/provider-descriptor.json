@@ -65,31 +65,59 @@
       "type": "object"
     },
     "interrupt-capability": {
-      "additionalProperties": false,
-      "properties": {
-        "deliversPartialOutput": {
-          "default": true,
-          "type": "boolean"
-        },
-        "mode": {
-          "enum": [
-            "immediate",
-            "cooperative",
-            "unsupported"
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "deliversPartialOutput": {
+              "default": true,
+              "type": "boolean"
+            },
+            "mode": {
+              "enum": [
+                "immediate",
+                "cooperative"
+              ],
+              "type": "string"
+            },
+            "sessionRemainsUsable": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "deliversPartialOutput",
+            "sessionRemainsUsable"
           ],
-          "type": "string"
+          "type": "object"
         },
-        "sessionRemainsUsable": {
-          "default": true,
-          "type": "boolean"
+        {
+          "additionalProperties": false,
+          "properties": {
+            "deliversPartialOutput": {
+              "const": false,
+              "default": false,
+              "type": "boolean"
+            },
+            "mode": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "sessionRemainsUsable": {
+              "const": false,
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "deliversPartialOutput",
+            "sessionRemainsUsable"
+          ],
+          "type": "object"
         }
-      },
-      "required": [
-        "mode",
-        "deliversPartialOutput",
-        "sessionRemainsUsable"
-      ],
-      "type": "object"
+      ]
     },
     "json-value": {
       "anyOf": [
@@ -142,22 +170,46 @@
       "type": "object"
     },
     "recovery-capability": {
-      "additionalProperties": false,
-      "properties": {
-        "exportsRecoveryRecord": {
-          "default": false,
-          "type": "boolean"
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "exportsRecoveryRecord": {
+              "const": false,
+              "default": false,
+              "type": "boolean"
+            },
+            "resumesFromRecoveryRecord": {
+              "const": false,
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "exportsRecoveryRecord",
+            "resumesFromRecoveryRecord"
+          ],
+          "type": "object"
         },
-        "resumesFromRecoveryRecord": {
-          "default": false,
-          "type": "boolean"
+        {
+          "additionalProperties": false,
+          "properties": {
+            "exportsRecoveryRecord": {
+              "const": true,
+              "type": "boolean"
+            },
+            "resumesFromRecoveryRecord": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "exportsRecoveryRecord",
+            "resumesFromRecoveryRecord"
+          ],
+          "type": "object"
         }
-      },
-      "required": [
-        "exportsRecoveryRecord",
-        "resumesFromRecoveryRecord"
-      ],
-      "type": "object"
+      ]
     },
     "run-capability": {
       "additionalProperties": false,

@@ -25,40 +25,44 @@ At most one run is active in a session in v0.4. A run emits one `run.finished` e
 
 ## Commands, receipts, and idempotency
 
-Every mutation carries a caller-generated `commandId`. The store records the canonical payload fingerprint and first receipt. Repeating the same ID and payload returns the original result with `duplicate`; the effect is not repeated. Reusing the ID with a different payload returns `command_id_conflict`. Rejections are recorded too, so identical retries remain deterministic.
+Every mutation carries a caller-generated `commandId`. The store records the canonical payload fingerprint and first receipt. Repeating the same ID and payload returns the original successful result with `duplicate`; the effect is not repeated. An identical rejected command replays the original schema-valid `rejected` receipt unchanged. Reusing the ID with a different payload returns `command_id_conflict`. Raw input without a valid command ID and known command discriminant fails with a typed validation exception rather than manufacturing false receipt identity.
 
 Command receipts report `applied`, `duplicate`, or `rejected`, the first acceptance time, and the highest event sequence committed by the command when applicable.
 
+One Runtime instance coordinates active work first by command ID and then by session. This makes the receipt check and effect atomic in-process, admits at most one competing interaction response, and does not serialize unrelated sessions. Entries exist only while work or waiters remain. Multiple Runtime processes require a host-provided single-writer boundary or a durable transactional command claim before provider side effects; the in-memory coordination map is not distributed locking.
+
 ## Interactions
 
-Question and approval requests and responses are separately discriminated. Responses must match request kind, permitted choices, selection cardinality, and approval mode. A pending interaction is settled once as responded, cancelled, expired, or withdrawn. A repeated identical command is handled by command idempotency; a new command targeting a settled interaction is stale and rejected. Run termination cancels any still-pending interaction.
+Question and approval requests and responses are separately discriminated. Responses must match request kind, permitted choices, selection cardinality, and approval mode. A pending interaction is settled once as responded, cancelled, expired, or withdrawn. Response commands and provider completion finalization share the per-session transition coordinator and re-check pending state inside the commit, so a completion race cannot append a second settlement. A repeated identical command is handled by command idempotency; a new command targeting a settled interaction is stale and rejected.
 
 ## Events, replay, and backpressure
 
-The runtime stamps event ID, session/run identity, timestamp, wire version, and a gapless 1-based per-session sequence. `fromSequence` is an exclusive durable position; zero means all history. A subscriber is attached before history is read, but retains only a constant-space published-sequence high-water mark until iteration begins and while replay is active. It drains durable events through that mark, atomically switches to bounded live buffering, emits `caught_up`, then receives live events without a gap, duplicate, or reordering. Closing the subscription or returning its iterator unregisters it idempotently, including before the first `next()` call.
+The runtime stamps event ID, session/run identity, timestamp, wire version, and a gapless 1-based per-session sequence. `fromSequence` is an exclusive durable position; zero means all history. A subscriber is attached before history is read, but retains only a constant-space published-sequence high-water mark until iteration begins and while replay is active. It drains durable events through that mark, atomically switches to bounded live buffering, emits `caught_up`, then receives live events without a gap, duplicate, or reordering. A historical terminal event is remembered during replay, followed by `closed` and immediate unregister after `caught_up`. Closing the subscription or returning its iterator unregisters it idempotently, including before the first `next()` call.
 
 Each live subscriber has a bounded buffer. Overflow is explicit and includes the first undelivered sequence, count, buffer size, timestamp, and cursor that resumes from durable storage. `signal_and_close` ends the stream; `signal_and_skip` continues after acknowledging the gap. Durable events remain in the store.
 
 ## Atomic persistence
 
-One store commit allocates sequences, appends event envelopes, folds projections, and records command receipts against one revision. A failed mutation swaps no state. Durable implementations must preserve this atomic boundary; they may not independently update the event log and projection.
+One store commit allocates sequences, appends event envelopes, folds projections, and records command receipts against one revision. A failed mutation swaps no state. The in-memory store deep-clones ingress and returns isolated frozen transaction views, commit returns, snapshots, event pages, interactions, and receipt records; caller mutation cannot change committed state or revision. Durable implementations must preserve this atomic and mutation-isolation boundary; they may not independently update the event log and projection.
 
 ## Providers and recovery
 
-Capabilities are structured descriptors for interrupt behavior, streaming, interactions, workspace needs, and recovery. Differences are facts, not booleans hidden by false equivalence. Runtime depends only on the neutral SPI and registers concrete adapters from the host.
+Capabilities are structured descriptors for interrupt behavior, streaming, interactions, workspace needs, and recovery. Differences are facts, not booleans hidden by false equivalence. Registration parses and deep-freezes one descriptor snapshot; listing and capability checks never call mutable `describe()` again. Runtime depends only on the neutral SPI and registers concrete adapters from the host.
 
-Provider sessions and runs are non-serializable in-process handles. Optional recovery crosses persistence only as `{ providerId, providerVersion, wireVersion, opaque: JsonValue }`. The opaque member is interpreted only by its provider. Resume is unavailable unless explicitly described and implemented.
+Provider sessions and runs are non-serializable in-process handles. Provider completion omits runtime-owned time, is parsed before use, and becomes exactly one stamped terminal outcome. Rejection or malformed completion becomes a typed failed provider-contract outcome. Optional recovery crosses persistence only as `{ providerId, providerVersion, wireVersion, opaque: JsonValue }`. The opaque member is interpreted only by its provider. Resume is unavailable unless explicitly described and implemented.
+
+Provider sinks may emit synchronously before `createSession()` or `startRun()` returns. Runtime stages the first 256 inputs in order, commits the owning start event first, then drains the inputs before making the sink live. It records a durable warning diagnostic with the exact rejected count if the deterministic tail exceeds the staging bound.
 
 An in-process adapter is trusted with host privileges. Approval metadata is advisory intent for UX and audit, not a sandbox guarantee.
 
 ## Workspace ownership
 
-An `existing` spec creates an immutable borrowed lease: runtime may neither create nor destructively clean it. A `managed` spec creates a fresh root inside the provider's configured base. Removal is allowed only for that realpath-resolved owned root, strictly below the base, never for the base or a filesystem root, and only once. Release reports every destructive operation.
+An `existing` spec creates an immutable borrowed lease: runtime may neither create nor destructively clean it. Runtime parses and independently cross-checks every third-party descriptor against the live lease and requested ownership. It never invokes release on an existing-to-managed mismatch. A `managed` spec creates a fresh root inside the provider's configured base. Removal is allowed only for that realpath-resolved owned root, strictly below the base, never for the base or a filesystem root, and through one memoized in-flight operation. Release reports every destructive operation.
 
-Workspace-Git sends commands through an injected seam. Borrowed trees allow read-only inspection only. Managed clone failure releases the newly owned root. Credentials remain the host's concern.
+Workspace-Git sends commands through an injected seam. Borrowed trees accept only exact fixed query argv and force no-pager/no-optional-lock behavior; output, external diff/textconv, config injection, and arbitrary options fail before execution. Managed clone failure releases the newly owned root. Credentials remain the host's concern.
 
 ## Compatibility and packaging
 
-Wire version `0.4` is independent of npm versions. Generated schema `$id` values include the wire line. Packages are ESM-only with explicit exports and inferred declarations. tsdown is the current build implementation, not part of the public contract; ADR-0007 defines replacement constraints.
+Wire version `0.4` is independent of npm versions. Pre-1.0 compatibility is exact by wire minor: strict-object fields and closed-union members require a new minor after publication. Generated schema `$id` values include the wire line, and an Ajv Draft 2020-12 corpus proves safety-refinement parity with Zod. Packages are ESM-only with explicit exports and inferred declarations. tsdown is the current build implementation, not part of the public contract; ADR-0007 defines replacement constraints.
 
 The package DAG is acyclic: protocol at L0; executor/provider/workspace at L1; provider scaffolds and workspace-git at L2; runtime at L3. Runtime may never import a concrete provider adapter.

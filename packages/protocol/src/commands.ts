@@ -218,6 +218,11 @@ export const CommandReceiptSchema = z
   .refine((value) => (value.disposition === 'rejected') === (value.result === undefined), {
     message: 'a receipt carries a result if and only if it was not rejected',
     path: ['result'],
+  })
+  .meta({
+    if: { properties: { disposition: { const: 'rejected' } }, required: ['disposition'] },
+    then: { required: ['error'], not: { required: ['result'] } },
+    else: { required: ['result'], not: { required: ['error'] } },
   });
 
 export type CommandReceipt = z.infer<typeof CommandReceiptSchema>;

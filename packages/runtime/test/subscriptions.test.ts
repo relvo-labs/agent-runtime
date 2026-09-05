@@ -52,6 +52,35 @@ function event(
   });
 }
 
+function terminalEvent(
+  idFactory: ReturnType<typeof createCounterIdFactory>,
+  clock: ReturnType<typeof createFixedClock>,
+  sessionId: ReturnType<typeof SessionIdSchema.parse>,
+  reason: 'requested' | 'failed',
+): EventEnvelope {
+  return EventEnvelopeSchema.parse({
+    eventId: idFactory.next('event'),
+    sessionId,
+    sequence: 2,
+    occurredAt: clock.now(),
+    wireVersion: WIRE_VERSION,
+    payload: {
+      type: 'session.closed',
+      reason,
+      workspaceRelease: {
+        leaseId: idFactory.next('workspaceLease'),
+        ownership: 'borrowed',
+        alreadyReleased: false,
+        destructiveOperations: [],
+        releasedAt: clock.now(),
+      },
+      ...(reason === 'failed'
+        ? { error: { code: 'provider_contract_violation', message: 'failed session', retryable: false } }
+        : {}),
+    },
+  });
+}
+
 describe('subscription hub buffering', () => {
   it('does not retain live notifications before the iterator is first consumed', async () => {
     const clock = createFixedClock();
@@ -117,6 +146,29 @@ describe('subscription hub buffering', () => {
 
     expect(hub.subscriberCount).toBe(1);
     await iterator.return?.();
+    expect(hub.subscriberCount).toBe(0);
+  });
+
+  it.each([
+    ['requested', 'session_closed'],
+    ['failed', 'session_failed'],
+  ] as const)('closes a late subscriber after replaying an already-%s session', async (terminalReason, closeReason) => {
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const sessionId = SessionIdSchema.parse(idFactory.next('session'));
+    const events = [event(idFactory, clock, sessionId, 1), terminalEvent(idFactory, clock, sessionId, terminalReason)];
+    const hub = createSubscriptionHub({ store: readableStore(events), clock });
+    const iterator = hub
+      .subscribe(SubscriptionRequestSchema.parse({ sessionId, fromSequence: 0 }))
+      [Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'event', event: { sequence: 1 } } });
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: 'event', event: { sequence: 2, payload: { type: 'session.closed' } } },
+    });
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'caught_up', sequence: 2 } });
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'closed', reason: closeReason } });
     expect(hub.subscriberCount).toBe(0);
   });
 });

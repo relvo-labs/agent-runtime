@@ -470,6 +470,7 @@
             "path": {
               "maxLength": 4096,
               "minLength": 1,
+              "pattern": "^(?![\\\\/])(?![A-Za-z]:[\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$",
               "type": "string"
             },
             "type": {
@@ -565,6 +566,112 @@
     "interactions": {
       "items": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "else": {
+              "not": {
+                "required": [
+                  "settlement"
+                ]
+              }
+            },
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "settled"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "settlement"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "request": {
+                  "properties": {
+                    "kind": {
+                      "const": "question"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "request"
+              ]
+            },
+            "then": {
+              "properties": {
+                "settlement": {
+                  "properties": {
+                    "response": {
+                      "properties": {
+                        "kind": {
+                          "const": "question"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "request": {
+                  "properties": {
+                    "kind": {
+                      "const": "approval"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "request"
+              ]
+            },
+            "then": {
+              "properties": {
+                "settlement": {
+                  "properties": {
+                    "response": {
+                      "properties": {
+                        "kind": {
+                          "const": "approval"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "expiresAt": {
             "$ref": "#/$defs/timestamp"
@@ -619,6 +726,128 @@
     "runs": {
       "items": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "else": {
+              "not": {
+                "required": [
+                  "termination"
+                ]
+              }
+            },
+            "if": {
+              "properties": {
+                "state": {
+                  "enum": [
+                    "succeeded",
+                    "failed",
+                    "interrupted"
+                  ]
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "required": [
+                "termination"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "succeeded"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "properties": {
+                "termination": {
+                  "properties": {
+                    "outcome": {
+                      "const": "succeeded"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "failed"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "properties": {
+                "termination": {
+                  "properties": {
+                    "outcome": {
+                      "const": "failed"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "interrupted"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "properties": {
+                "termination": {
+                  "properties": {
+                    "outcome": {
+                      "const": "interrupted"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "awaiting_interaction"
+                }
+              },
+              "required": [
+                "state"
+              ]
+            },
+            "then": {
+              "properties": {
+                "pendingInteractionIds": {
+                  "minItems": 1,
+                  "type": "array"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "attempt": {
             "exclusiveMinimum": 0,

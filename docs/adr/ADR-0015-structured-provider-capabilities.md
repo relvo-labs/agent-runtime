@@ -8,7 +8,7 @@ A growing boolean bag cannot express cooperative versus immediate interrupt, par
 
 ## Decision
 
-Use nested descriptors for run interruption/streaming, question and approval modes, workspace requirements, and recovery. Defaults are conservative. Providers state unsupported behavior and may add JSON-safe namespaced extensions; core does not manufacture common behavior that the adapter cannot guarantee.
+Use nested descriptors for run interruption/streaming, question and approval modes, workspace requirements, and recovery. Defaults are conservative. Registration parses the descriptor once, deep-freezes the normalized snapshot, and uses that snapshot for listing and every capability decision. Contradictions such as resume without recovery export, or positive interrupt guarantees with an unsupported interrupt mode, are invalid. Providers may add JSON-safe namespaced extensions; core does not manufacture common behavior that the adapter cannot guarantee.
 
 ## Consequences
 

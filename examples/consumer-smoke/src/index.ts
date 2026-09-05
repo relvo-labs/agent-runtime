@@ -1,11 +1,16 @@
 import { EXECUTOR_CONFORMANCE_CASES, type AgentExecutor } from '@relvo-labs/agent-executor';
 import { WIRE_VERSION, createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
-import { defineProviderDescriptor, type AgentProvider } from '@relvo-labs/agent-provider';
+import {
+  ProviderRunTerminationSchema,
+  defineProviderDescriptor,
+  type AgentProvider,
+  type ProviderRunTermination,
+} from '@relvo-labs/agent-provider';
 import { CLAUDE_ADAPTER_STATUS } from '@relvo-labs/agent-provider-claude';
 import { CODEX_ADAPTER_STATUS } from '@relvo-labs/agent-provider-codex';
 import { createAgentRuntime } from '@relvo-labs/agent-runtime';
 import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
-import { assertReadOnly, type GitRunner } from '@relvo-labs/agent-workspace-git';
+import { READ_ONLY_GIT_COMMANDS, assertReadOnly, type GitRunner } from '@relvo-labs/agent-workspace-git';
 
 const clock = createFixedClock();
 const idFactory = createCounterIdFactory();
@@ -21,12 +26,15 @@ const descriptor = defineProviderDescriptor({
   recovery: {},
 });
 const provider: AgentProvider | undefined = undefined;
+const termination: ProviderRunTermination = ProviderRunTerminationSchema.parse({ outcome: 'succeeded' });
 const gitRunner: GitRunner = (command) => Promise.resolve({ exitCode: 0, stdout: command.argv.join(' '), stderr: '' });
 
 assertReadOnly(['status', '--short']);
 void runtime;
 void descriptor;
 void provider;
+void termination;
+void READ_ONLY_GIT_COMMANDS;
 void gitRunner;
 void EXECUTOR_CONFORMANCE_CASES;
 void WIRE_VERSION;

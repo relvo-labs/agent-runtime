@@ -14,7 +14,9 @@ that high-water mark, atomically switch to bounded live buffering, then announce
 `caught_up`. An event crossing the transition is therefore read durably or buffered live,
 never neither or both. On overflow emit an explicit message with the first undelivered
 sequence and a resumable cursor; close or skip according to declared policy. Never remove
-durable events because a subscriber is slow.
+durable events because a subscriber is slow. Replay also observes a historical
+`session.closed`; after `caught_up` a late terminal subscriber emits `closed` and
+unregisters without waiting for live traffic that can never arrive.
 
 ## Consequences
 

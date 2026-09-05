@@ -22,7 +22,13 @@ import {
   type WorkspaceReleaseReport,
   type WorkspaceSpec,
 } from '@relvo-labs/agent-protocol';
-import { createLocalWorkspaceProvider, type WorkspaceLease, type WorkspaceProvider } from '@relvo-labs/agent-workspace';
+import {
+  createLocalWorkspaceProvider,
+  type BorrowedWorkspaceLease,
+  type ManagedWorkspaceLease,
+  type WorkspaceLease,
+  type WorkspaceProvider,
+} from '@relvo-labs/agent-workspace';
 
 export type GitCommand = {
   readonly argv: readonly string[];
@@ -49,95 +55,28 @@ export type GitWorkspaceProviderOptions = {
 /**
  * Commands permitted against a **borrowed** (`existing`) workspace.
  *
- * Read-only by construction. `checkout`, `clean`, `reset`, `stash`, `fetch` and
- * anything else that mutates the caller's tree is absent on purpose, and
- * `assertReadOnly` enforces it rather than trusting the call sites.
+ * Read-only by exact template. Arbitrary options are unsafe because apparently
+ * observational commands accept output paths, external helpers, configuration,
+ * pagers, and lock-taking behavior. Only these complete argv forms pass.
  */
-export const READ_ONLY_GIT_SUBCOMMANDS: readonly string[] = [
-  'rev-parse',
-  'status',
-  'log',
-  'show',
-  'diff',
-  'branch',
-  'remote',
-  'config',
-  'ls-files',
+export const READ_ONLY_GIT_COMMANDS: readonly (readonly string[])[] = [
+  ['status', '--short'],
+  ['rev-parse', '--verify', 'HEAD'],
+  ['ls-files', '--cached', '--'],
 ];
 
+export const READ_ONLY_GIT_SUBCOMMANDS: readonly string[] = READ_ONLY_GIT_COMMANDS.flatMap((argv) => argv.slice(0, 1));
+
 export function assertReadOnly(argv: readonly string[]): void {
-  const subcommand = argv[0];
-  if (subcommand === undefined || !READ_ONLY_GIT_SUBCOMMANDS.includes(subcommand)) {
+  const allowed = READ_ONLY_GIT_COMMANDS.some(
+    (candidate) => candidate.length === argv.length && candidate.every((value, index) => value === argv[index]),
+  );
+  if (!allowed) {
     throw new AgentRuntimeError(
       agentError(
         'workspace_ownership_violation',
         `\`git ${argv.join(' ')}\` is not permitted against a borrowed workspace`,
         { details: { argv: [...argv], allowed: [...READ_ONLY_GIT_SUBCOMMANDS] } },
-      ),
-    );
-  }
-  // `git config --global`/`--system` writes outside the workspace entirely.
-  if (subcommand === 'config' && argv.some((arg) => arg === '--global' || arg === '--system')) {
-    throw new AgentRuntimeError(
-      agentError('workspace_ownership_violation', 'refusing to touch global or system git configuration', {
-        details: { argv: [...argv] },
-      }),
-    );
-  }
-  if (subcommand === 'config') {
-    const readOnlyConfigFlags = new Set([
-      '--get',
-      '--get-all',
-      '--get-regexp',
-      '--list',
-      '--show-origin',
-      '--show-scope',
-      '--null',
-      '-l',
-      '-z',
-    ]);
-    if (argv.slice(1).some((arg) => arg.startsWith('-') && !readOnlyConfigFlags.has(arg))) {
-      throw new AgentRuntimeError(
-        agentError('workspace_ownership_violation', 'only read-only git config flags are permitted', {
-          details: { argv: [...argv] },
-        }),
-      );
-    }
-    const hasReadOperation = argv.slice(1).some((arg) => readOnlyConfigFlags.has(arg));
-    if (!hasReadOperation) {
-      throw new AgentRuntimeError(
-        agentError('workspace_ownership_violation', '`git config` requires an explicit read operation', {
-          details: { argv: [...argv] },
-        }),
-      );
-    }
-  }
-  if (subcommand === 'remote') {
-    const args = argv.slice(1);
-    const readOnlyRemote =
-      args.length === 0 ||
-      (args.length === 1 && (args[0] === '-v' || args[0] === '--verbose')) ||
-      args[0] === 'get-url' ||
-      args[0] === 'show';
-    if (!readOnlyRemote) {
-      throw new AgentRuntimeError(
-        agentError('workspace_ownership_violation', 'only read-only git remote operations are permitted', {
-          details: { argv: [...argv] },
-        }),
-      );
-    }
-  }
-  if (
-    subcommand === 'branch' &&
-    !(argv.length === 1 || (argv.length === 2 && (argv[1] === '--list' || argv[1] === '--show-current')))
-  ) {
-    throw new AgentRuntimeError(
-      agentError(
-        'workspace_ownership_violation',
-        '`git branch` may only be used to list against a borrowed workspace',
-        {
-          details: { argv: [...argv] },
-        },
       ),
     );
   }
@@ -147,7 +86,8 @@ export type GitWorkspaceProvider = WorkspaceProvider & {
   /**
    * Run a git command inside a lease.
    *
-   * Borrowed leases are restricted to {@link READ_ONLY_GIT_SUBCOMMANDS}.
+   * Borrowed leases are restricted to {@link READ_ONLY_GIT_COMMANDS}; Runtime
+   * prepends no-pager and no-optional-lock global flags before execution.
    */
   git(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult>;
 };
@@ -162,7 +102,8 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
 
   async function run(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult> {
     if (lease.ownership === 'borrowed') assertReadOnly(argv);
-    const result = await options.runGit({ argv, cwd: lease.root });
+    const hardenedArgv = lease.ownership === 'borrowed' ? ['--no-pager', '--no-optional-locks', ...argv] : [...argv];
+    const result = await options.runGit({ argv: hardenedArgv, cwd: lease.root });
     if (result.exitCode !== 0) {
       throw new AgentRuntimeError(
         agentError('workspace_unavailable', `git ${argv.join(' ')} failed with exit code ${String(result.exitCode)}`, {
@@ -173,27 +114,32 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
     return result;
   }
 
-  return {
-    async acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
-      const lease = await local.acquire(spec);
+  function acquire(spec: Extract<WorkspaceSpec, { kind: 'existing' }>): Promise<BorrowedWorkspaceLease>;
+  function acquire(spec: Extract<WorkspaceSpec, { kind: 'managed' }>): Promise<ManagedWorkspaceLease>;
+  function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease>;
+  async function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
+    const lease = await local.acquire(spec);
 
-      try {
-        if (spec.kind === 'managed' && spec.source?.kind === 'git') {
-          // Only a managed root is ever populated. `--` terminates option parsing
-          // so a remote that starts with `-` cannot become a git flag.
-          const cloneArgv = ['clone', '--', spec.source.remote, '.'];
-          await run(lease, cloneArgv);
-          if (spec.source.ref !== undefined) {
-            await run(lease, ['checkout', '--detach', spec.source.ref]);
-          }
+    try {
+      if (spec.kind === 'managed' && spec.source?.kind === 'git') {
+        // Only a managed root is ever populated. `--` terminates option parsing
+        // so a remote that starts with `-` cannot become a git flag.
+        const cloneArgv = ['clone', '--', spec.source.remote, '.'];
+        await run(lease, cloneArgv);
+        if (spec.source.ref !== undefined) {
+          await run(lease, ['checkout', '--detach', spec.source.ref]);
         }
-      } catch (error) {
-        await lease.release();
-        throw error;
       }
+    } catch (error) {
+      await lease.release();
+      throw error;
+    }
 
-      return lease;
-    },
+    return lease;
+  }
+
+  return {
+    acquire,
 
     releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
       return local.releaseAll();

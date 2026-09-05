@@ -240,6 +240,26 @@
   "$id": "https://schemas.relvo.dev/agent-runtime/0.4/command-receipt.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "else": {
+    "not": {
+      "required": [
+        "error"
+      ]
+    },
+    "required": [
+      "result"
+    ]
+  },
+  "if": {
+    "properties": {
+      "disposition": {
+        "const": "rejected"
+      }
+    },
+    "required": [
+      "disposition"
+    ]
+  },
   "properties": {
     "acceptedAt": {
       "$ref": "#/$defs/timestamp"
@@ -281,6 +301,16 @@
     "disposition",
     "acceptedAt"
   ],
+  "then": {
+    "not": {
+      "required": [
+        "result"
+      ]
+    },
+    "required": [
+      "error"
+    ]
+  },
   "title": "command-receipt",
   "type": "object",
   "x-wire-version": "0.4"

@@ -56,13 +56,22 @@ Do not use this skill when:
 
 1. **Classify the change before writing code.**
 
-   | Change                                             | Wire class | Allowed pre-1.0                                  |
-   | -------------------------------------------------- | ---------- | ------------------------------------------------ |
-   | add optional field                                 | compatible | yes                                              |
-   | add a new member to a discriminated union          | compatible | yes, readers must tolerate unknown discriminants |
-   | add required field / remove field / narrow an enum | breaking   | yes, with `WIRE_VERSION` minor bump and ADR      |
-   | rename a discriminant value                        | breaking   | yes, with ADR                                    |
-   | change a JSON Schema `$id`                         | breaking   | requires ADR                                     |
+   Strict objects and discriminated unions are closed. Pre-1.0 compatibility is
+   exact by wire minor; old readers do not ignore unknown properties or union
+   variants.
+
+   | Change                                             | Wire class | Required before release         |
+   | -------------------------------------------------- | ---------- | ------------------------------- |
+   | add optional field to a strict object              | breaking   | bump `WIRE_VERSION` minor + ADR |
+   | add a member to a closed discriminated union       | breaking   | bump `WIRE_VERSION` minor + ADR |
+   | add required field / remove field / narrow an enum | breaking   | bump `WIRE_VERSION` minor + ADR |
+   | rename a discriminant value                        | breaking   | bump `WIRE_VERSION` minor + ADR |
+   | change a JSON Schema `$id`                         | breaking   | bump `WIRE_VERSION` minor + ADR |
+   | implementation-only change with identical schemas  | compatible | keep the current wire minor     |
+
+   Before the first publication of a wire line, release-blocker corrections may
+   still refine that candidate line. Once a line is published, its schemas are
+   immutable compatibility fixtures.
 
 2. **Write the failing test first.** Contract invariants live in
    `packages/protocol/test/`. A lifecycle or identity change must first appear as a red
@@ -98,6 +107,11 @@ Do not use this skill when:
 
    An unexplained diff in a file you did not intend to touch means a shared sub-schema
    moved. Stop and re-scope.
+
+8. **Prove Zod / Draft 2020-12 parity.** Safety refinements must either use
+   JSON-Schema-representable Zod constraints or carry equivalent deterministic
+   conditional metadata. Add each invariant to the Ajv parity corpus; a Zod-only
+   `.refine()` without JSON Schema evidence is incomplete.
 
 ## Verification
 

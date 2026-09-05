@@ -1,0 +1,39 @@
+{
+  "wireVersion": "0.4",
+  "nextWireVersion": "0.5",
+  "current": {
+    "eventId": "evt_0000000000000001",
+    "sessionId": "ses_0000000000000001",
+    "sequence": 1,
+    "occurredAt": "2026-01-01T00:00:00.000Z",
+    "wireVersion": "0.4",
+    "payload": {
+      "type": "diagnostic",
+      "level": "info",
+      "message": "known"
+    }
+  },
+  "futureOptionalField": {
+    "eventId": "evt_0000000000000001",
+    "sessionId": "ses_0000000000000001",
+    "sequence": 1,
+    "occurredAt": "2026-01-01T00:00:00.000Z",
+    "wireVersion": "0.5",
+    "traceId": "future-field",
+    "payload": {
+      "type": "diagnostic",
+      "level": "info",
+      "message": "known"
+    }
+  },
+  "futureUnionMember": {
+    "eventId": "evt_0000000000000001",
+    "sessionId": "ses_0000000000000001",
+    "sequence": 1,
+    "occurredAt": "2026-01-01T00:00:00.000Z",
+    "wireVersion": "0.5",
+    "payload": {
+      "type": "run.future_event"
+    }
+  }
+}

@@ -8,6 +8,8 @@
 
 import type {
   Timestamp,
+  ExistingWorkspaceSpec,
+  ManagedWorkspaceSpec,
   WorkspaceLeaseDescriptor,
   WorkspaceLeaseId,
   WorkspaceOwnership,
@@ -35,8 +37,21 @@ export type WorkspaceLease = {
   release(): Promise<WorkspaceReleaseReport>;
 };
 
+export type BorrowedWorkspaceLease = Omit<WorkspaceLease, 'ownership'> & { readonly ownership: 'borrowed' };
+export type ManagedWorkspaceLease = Omit<WorkspaceLease, 'ownership'> & { readonly ownership: 'managed' };
+export type WorkspaceLeaseFor<T extends WorkspaceSpec> = T extends ExistingWorkspaceSpec
+  ? BorrowedWorkspaceLease
+  : T extends ManagedWorkspaceSpec
+    ? ManagedWorkspaceLease
+    : WorkspaceLease;
+
 export type WorkspaceProvider = {
-  /** Ownership is derived from the spec kind, never supplied by the caller. */
+  /**
+   * Ownership is derived from the spec kind. Runtime still validates the
+   * descriptor and cross-checks an out-of-tree implementation before exposure.
+   */
+  acquire(spec: ExistingWorkspaceSpec): Promise<BorrowedWorkspaceLease>;
+  acquire(spec: ManagedWorkspaceSpec): Promise<ManagedWorkspaceLease>;
   acquire(spec: WorkspaceSpec): Promise<WorkspaceLease>;
 
   /** Release everything this provider still holds. Idempotent. */

@@ -24,6 +24,9 @@ for (const directory of readdirSync(join(repoRoot, 'packages')).sort()) {
 }
 
 const workflow = readFileSync(join(repoRoot, '.github/workflows/gate.yml'), 'utf8');
+const changesetConfig = JSON.parse(readFileSync(join(repoRoot, '.changeset/config.json'), 'utf8')) as {
+  baseBranch?: string;
+};
 for (const version of ['22.18.0', '24.20.0', '26.8.1']) {
   if (!workflow.includes(version)) problems.push(`CI matrix must include Node ${version}`);
 }
@@ -34,10 +37,22 @@ if (!workflow.includes('push:\n    branches: [main]\n  pull_request:')) {
   problems.push('CI must run on pushes to main and on pull requests only');
 }
 if (!workflow.includes('timeout-minutes: 30')) problems.push('CI gate must set timeout-minutes: 30');
-if (!workflow.includes(checkout)) problems.push(`CI checkout must use ${checkout}`);
-if (!workflow.includes('persist-credentials: false')) {
-  problems.push('CI checkout must disable persisted credentials');
+const checkoutStep = [
+  `- uses: ${checkout} # v7.0.1`,
+  '        with:',
+  '          persist-credentials: false',
+  '          fetch-depth: 0',
+].join('\n');
+if (!workflow.includes(checkoutStep)) {
+  problems.push('CI checkout must use the pinned action, disable credentials, and fetch complete history');
 }
+const changesetBaseStep = [
+  '- name: Materialize Changesets base ref',
+  '        run: git update-ref refs/heads/main refs/remotes/origin/main',
+].join('\n');
+if (changesetConfig.baseBranch !== 'main') problems.push('Changesets baseBranch must remain main');
+if (!workflow.includes(changesetBaseStep)) problems.push('CI must materialize the configured local main ref');
+if (!workflow.includes('permissions:\n  contents: read')) problems.push('CI permissions must remain contents: read');
 if (!workflow.includes(setup)) problems.push(`CI toolchain must use ${setup}`);
 for (const input of [
   'version: 11.25.0',

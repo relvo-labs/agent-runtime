@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -19,8 +19,21 @@ describe('git workspace boundary', () => {
     expect(() => assertReadOnly(['config', 'user.name', 'Mallory'])).toThrow();
     expect(() => assertReadOnly(['remote', 'add', 'origin', 'https://example.invalid/repo'])).toThrow();
     expect(() => assertReadOnly(['branch', '--delete', 'main'])).toThrow();
+    for (const argv of [
+      ['diff', '--output=/tmp/outside'],
+      ['show', '--output', '/tmp/outside'],
+      ['log', '--ext-diff'],
+      ['diff', '--textconv'],
+      ['-c', 'core.pager=/tmp/evil', 'status'],
+      ['--paginate', 'status'],
+      ['status', '--porcelain=v2'],
+      ['config', '--get', 'user.name'],
+    ]) {
+      expect(() => assertReadOnly(argv), argv.join(' ')).toThrow();
+    }
     expect(() => assertReadOnly(['status', '--short'])).not.toThrow();
-    expect(() => assertReadOnly(['config', '--get', 'user.name'])).not.toThrow();
+    expect(() => assertReadOnly(['rev-parse', '--verify', 'HEAD'])).not.toThrow();
+    expect(() => assertReadOnly(['ls-files', '--cached', '--'])).not.toThrow();
   });
 
   it('uses only the injected runner and leaves borrowed cleanup empty', async () => {
@@ -29,6 +42,8 @@ describe('git workspace boundary', () => {
     const borrowed = join(root, 'borrowed');
     await mkdir(borrowed);
     const commands: GitCommand[] = [];
+    const outside = join(root, 'outside.txt');
+    await writeFile(outside, 'unchanged', 'utf8');
     const provider = createGitWorkspaceProvider({
       baseDirectory: join(root, 'managed'),
       clock: createFixedClock(),
@@ -39,9 +54,13 @@ describe('git workspace boundary', () => {
       },
     });
     const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+    await expect(provider.git(lease, ['diff', `--output=${outside}`])).rejects.toThrow();
+    await expect(provider.git(lease, ['-c', `core.pager=${outside}`, 'status'])).rejects.toThrow();
+    expect(commands).toEqual([]);
+    expect(await readFile(outside, 'utf8')).toBe('unchanged');
     await provider.git(lease, ['status', '--short']);
     const report = await lease.release();
-    expect(commands).toEqual([{ argv: ['status', '--short'], cwd: lease.root }]);
+    expect(commands).toEqual([{ argv: ['--no-pager', '--no-optional-locks', 'status', '--short'], cwd: lease.root }]);
     expect(report.destructiveOperations).toEqual([]);
   });
 

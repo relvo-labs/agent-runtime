@@ -8,7 +8,7 @@ Separately assigning sequence numbers, appending events, and updating projection
 
 ## Decision
 
-One store transaction allocates gapless per-session sequences, stamps and appends envelopes, folds projections, and records receipts at one revision. The in-memory implementation uses copy-on-write and serialized commits; durable stores must provide equivalent atomicity.
+One store transaction allocates gapless per-session sequences, stamps and appends envelopes, folds projections, and records receipts at one revision. The in-memory implementation uses deep copy-on-write and serialized commits. It clones data at every ingress and returns isolated, frozen transaction views, commit values, snapshots, event pages, interaction records, and receipts. Durable stores must provide equivalent atomicity and mutation isolation.
 
 ## Consequences
 

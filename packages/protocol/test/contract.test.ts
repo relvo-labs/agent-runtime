@@ -1,7 +1,9 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
   AgentCommandSchema,
+  EventEnvelopeSchema,
   AgentInteractionSchema,
   AgentRunSchema,
   CommandIdSchema,
@@ -99,6 +101,17 @@ describe('wire contract', () => {
 
   it('keeps wire and package versions conceptually separate', () => {
     expect(WIRE_VERSION).toBe('0.4');
+  });
+
+  it('requires a new wire minor for strict-object fields and closed-union members', () => {
+    const fixture = JSON.parse(
+      readFileSync(new URL('./fixtures/wire-compatibility.json', import.meta.url), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(fixture.wireVersion).toBe(WIRE_VERSION);
+    expect(fixture.nextWireVersion).not.toBe(WIRE_VERSION);
+    expect(EventEnvelopeSchema.safeParse(fixture.current).success).toBe(true);
+    expect(EventEnvelopeSchema.safeParse(fixture.futureOptionalField).success).toBe(false);
+    expect(EventEnvelopeSchema.safeParse(fixture.futureUnionMember).success).toBe(false);
   });
 
   it('validates provider recovery as JSON-safe wire data', () => {

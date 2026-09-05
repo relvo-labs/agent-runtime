@@ -3,8 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
-import { checkRemovable, createLocalWorkspaceProvider } from '../src/index.ts';
+import { WorkspaceLeaseIdSchema, createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
+import {
+  checkRemovable,
+  createLocalWorkspaceProvider,
+  validateWorkspaceLease,
+  type WorkspaceLease,
+} from '../src/index.ts';
 
 const roots: string[] = [];
 
@@ -52,6 +57,75 @@ describe('workspace ownership', () => {
     expect(first.destructiveOperations).toHaveLength(1);
     expect(second.alreadyReleased).toBe(true);
     expect(removed).toEqual([lease.root]);
+  });
+
+  it('performs one destructive operation for concurrent release callers', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-test-'));
+    roots.push(root);
+    let removalCount = 0;
+    let releaseRemoval!: () => void;
+    let removalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      removalEntered = resolve;
+    });
+    const removalHeld = new Promise<void>((resolve) => {
+      releaseRemoval = resolve;
+    });
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async () => {
+        removalCount += 1;
+        removalEntered();
+        await removalHeld;
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed', name: 'concurrent' });
+    const first = lease.release();
+    const second = lease.release();
+    await entered;
+    expect(removalCount).toBe(1);
+    releaseRemoval();
+    const reports = await Promise.all([first, second]);
+    expect(reports.map((report) => report.alreadyReleased)).toEqual([false, true]);
+    expect(removalCount).toBe(1);
+  });
+
+  it('validates and cross-checks third-party lease descriptors', () => {
+    const clock = createFixedClock();
+    const leaseId = WorkspaceLeaseIdSchema.parse(createCounterIdFactory().next('workspaceLease'));
+    const acquiredAt = clock.now();
+    const valid: WorkspaceLease = {
+      leaseId,
+      ownership: 'borrowed',
+      root: '/borrowed',
+      acquiredAt,
+      describe: () => ({
+        leaseId,
+        ownership: 'borrowed',
+        root: '/borrowed',
+        acquiredAt,
+        released: false,
+      }),
+      release: () => Promise.reject(new Error('not called')),
+    };
+    expect(validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, valid)).toMatchObject({
+      ownership: 'borrowed',
+      root: '/borrowed',
+    });
+
+    const mismatched: WorkspaceLease = {
+      ...valid,
+      ownership: 'managed',
+      describe: () => ({ ...valid.describe(), ownership: 'managed' }),
+    };
+    expect(() => validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, mismatched)).toThrow();
+    const malformed: WorkspaceLease = {
+      ...valid,
+      describe: () => ({ ...valid.describe(), root: 42 }) as never,
+    };
+    expect(() => validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, malformed)).toThrow();
   });
 
   it('does not claim a pre-existing named directory as managed', async () => {
