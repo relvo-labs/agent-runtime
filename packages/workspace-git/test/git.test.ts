@@ -1,11 +1,11 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
+import { AgentRuntimeError, createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
 import type { WorkspaceLease } from '@relvo-labs/agent-workspace';
 import {
   READ_ONLY_GIT_COMMANDS,
@@ -57,6 +57,19 @@ afterEach(async () => {
   const { rm } = await import('node:fs/promises');
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+/**
+ * Capture a rejection without letting a resolution pass silently. A partial
+ * sweep must reject, and the shape of that rejection is the contract.
+ */
+async function captureRejection(operation: Promise<unknown>): Promise<unknown> {
+  try {
+    await operation;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected the operation to reject, but it resolved');
+}
 
 describe('git workspace boundary', () => {
   it('rejects mutating commands against borrowed workspaces', () => {
@@ -384,6 +397,124 @@ describe('git workspace boundary', () => {
 
     await expect(provider.releaseAll()).resolves.toEqual([]);
     expect(removals).toBe(2);
+  });
+
+  it('sweeps every issued authority despite failures and aggregates them truthfully', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-sweep-isolation-test-'));
+    roots.push(root);
+    const attempts: string[] = [];
+    const failing = new Set(['first', 'third']);
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+      removeDirectory: async (path) => {
+        const name = basename(path);
+        attempts.push(name);
+        if (failing.has(name)) throw new Error(`${name} removal failed`);
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const leases = [];
+    for (const name of ['first', 'second', 'third', 'fourth'] as const) {
+      leases.push(await provider.acquire({ kind: 'managed', name }));
+    }
+
+    const failure = await captureRejection(provider.releaseAll());
+
+    // One unreleasable authority must not starve every later authority.
+    expect(attempts).toEqual(['first', 'second', 'third', 'fourth']);
+    expect(leases.map((lease) => lease.describe().released)).toEqual([false, true, false, true]);
+
+    expect(failure).toBeInstanceOf(AgentRuntimeError);
+    const runtimeError = failure as AgentRuntimeError;
+    expect(runtimeError.error.code).toBe('workspace_unavailable');
+    expect(runtimeError.error.details).toMatchObject({
+      attempted: 4,
+      released: 2,
+      failed: [leases[0]?.leaseId, leases[2]?.leaseId],
+    });
+    expect(runtimeError.cause).toBeInstanceOf(AggregateError);
+    expect((runtimeError.cause as AggregateError).errors.map((error: unknown) => (error as Error).message)).toEqual([
+      'first removal failed',
+      'third removal failed',
+    ]);
+
+    // Authority tracks the outcome exactly: failed leases are usable again,
+    // released ones stay fenced.
+    await expect(provider.git(leases[0]!, ['status', '--short'])).resolves.toMatchObject({ exitCode: 0 });
+    await expect(provider.git(leases[1]!, ['status', '--short'])).rejects.toThrow();
+
+    failing.clear();
+    const retried = await provider.releaseAll();
+    expect(attempts).toEqual(['first', 'second', 'third', 'fourth', 'first', 'third']);
+    expect(retried.map((report) => report.leaseId)).toEqual([leases[0]?.leaseId, leases[2]?.leaseId]);
+    expect(retried.map((report) => report.alreadyReleased)).toEqual([false, false]);
+    await expect(provider.git(leases[0]!, ['status', '--short'])).rejects.toThrow();
+
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(attempts).toHaveLength(6);
+  });
+
+  it('coalesces an in-flight Git release during a failing sweep without widening authority', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-sweep-overlap-test-'));
+    roots.push(root);
+    const attempts: string[] = [];
+    const commands: GitCommand[] = [];
+    let heldRemovals = 0;
+    const entered = deferred<undefined>();
+    const releaseGate = deferred<undefined>();
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+      removeDirectory: async (path) => {
+        const name = basename(path);
+        attempts.push(name);
+        if (name === 'broken') throw new Error('broken removal failed');
+        heldRemovals += 1;
+        entered.resolve(undefined);
+        await releaseGate.promise;
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    // `broken` is swept first, so the failure is met before the authority whose
+    // direct release is already in flight.
+    const broken = await provider.acquire({ kind: 'managed', name: 'broken' });
+    const held = await provider.acquire({ kind: 'managed', name: 'held' });
+
+    const direct = held.release();
+    await entered.promise;
+    await expect(provider.git(held, ['status', '--short'])).rejects.toThrow();
+    const sweeping = captureRejection(provider.releaseAll());
+    releaseGate.resolve(undefined);
+    const [directReport, failure] = await Promise.all([direct, sweeping]);
+
+    expect(directReport.alreadyReleased).toBe(false);
+    expect(heldRemovals).toBe(1);
+    expect(attempts).toEqual(['held', 'broken']);
+    expect(failure).toBeInstanceOf(AgentRuntimeError);
+    const runtimeError = failure as AgentRuntimeError;
+    expect(runtimeError.error.code).toBe('workspace_unavailable');
+    expect(runtimeError.error.details).toMatchObject({ attempted: 2, released: 1, failed: [broken.leaseId] });
+
+    // A failed sweep must not grant authority over a released lease, and must
+    // not revoke it from the lease whose cleanup is still outstanding.
+    await expect(provider.git(held, ['status', '--short'])).rejects.toThrow();
+    await expect(provider.git(broken, ['status', '--short'])).resolves.toMatchObject({ exitCode: 0 });
+    expect(commands).toHaveLength(1);
+
+    const second = await captureRejection(provider.releaseAll());
+    expect(second).toBeInstanceOf(AgentRuntimeError);
+    expect(attempts).toEqual(['held', 'broken', 'broken']);
+    expect(heldRemovals).toBe(1);
   });
 
   // Scope note: this proves the Git layer itself holds nothing after a

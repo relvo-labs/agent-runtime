@@ -1,11 +1,16 @@
 import { mkdir, mkdtemp, stat, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { WorkspaceLeaseIdSchema, createCounterIdFactory, createFixedClock } from '@relvo-labs/agent-protocol';
+import {
+  AgentRuntimeError,
+  WorkspaceLeaseIdSchema,
+  createCounterIdFactory,
+  createFixedClock,
+} from '@relvo-labs/agent-protocol';
 import {
   checkRemovable,
   createLocalWorkspaceProvider,
@@ -43,6 +48,22 @@ async function collectGarbage(): Promise<void> {
     await new Promise<void>((resolve) => setImmediate(resolve));
     (gc as () => void)();
   }
+}
+
+/**
+ * Capture a rejection without letting a resolution pass silently.
+ *
+ * `releaseAll()` must reject after a partial sweep, and the *shape* of that
+ * rejection is the contract under test, so the test needs the thrown value
+ * itself rather than only the fact that it threw.
+ */
+async function captureRejection(operation: Promise<unknown>): Promise<unknown> {
+  try {
+    await operation;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected the operation to reject, but it resolved');
 }
 
 async function fixture() {
@@ -226,6 +247,114 @@ describe('workspace ownership', () => {
 
     await expect(provider.releaseAll()).resolves.toEqual([]);
     expect(removalCount).toBe(2);
+  });
+
+  it('sweeps every tracked lease despite failures and aggregates them truthfully', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-sweep-isolation-test-'));
+    roots.push(root);
+    const attempts: string[] = [];
+    const failing = new Set(['first', 'third']);
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async (path) => {
+        const name = basename(path);
+        attempts.push(name);
+        if (failing.has(name)) throw new Error(`${name} removal failed`);
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const names = ['first', 'second', 'third', 'fourth'] as const;
+    const leases = [];
+    for (const name of names) leases.push(await provider.acquire({ kind: 'managed', name }));
+
+    const failure = await captureRejection(provider.releaseAll());
+
+    // One unreleasable lease must not starve the cleanup of every later lease.
+    expect(attempts).toEqual(['first', 'second', 'third', 'fourth']);
+    expect(leases.map((lease) => lease.describe().released)).toEqual([false, true, false, true]);
+
+    expect(failure).toBeInstanceOf(AgentRuntimeError);
+    const runtimeError = failure as AgentRuntimeError;
+    expect(runtimeError.error.code).toBe('workspace_unavailable');
+    expect(runtimeError.error.details).toMatchObject({
+      attempted: 4,
+      released: 2,
+      failed: [leases[0]?.leaseId, leases[2]?.leaseId],
+    });
+    expect(runtimeError.cause).toBeInstanceOf(AggregateError);
+    expect((runtimeError.cause as AggregateError).errors.map((error: unknown) => (error as Error).message)).toEqual([
+      'first removal failed',
+      'third removal failed',
+    ]);
+
+    // Successful leases are forgotten; failed ones stay tracked and retryable.
+    failing.clear();
+    const retried = await provider.releaseAll();
+    expect(attempts).toEqual(['first', 'second', 'third', 'fourth', 'first', 'third']);
+    expect(retried.map((report) => report.leaseId)).toEqual([leases[0]?.leaseId, leases[2]?.leaseId]);
+    expect(retried.map((report) => report.alreadyReleased)).toEqual([false, false]);
+
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(attempts).toHaveLength(6);
+  });
+
+  it('coalesces an in-flight release during a failing sweep without duplicating cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-sweep-overlap-test-'));
+    roots.push(root);
+    const attempts: string[] = [];
+    let heldRemovals = 0;
+    let releaseRemoval!: () => void;
+    let removalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      removalEntered = resolve;
+    });
+    const removalHeld = new Promise<void>((resolve) => {
+      releaseRemoval = resolve;
+    });
+    const provider = createLocalWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      removeDirectory: async (path) => {
+        const name = basename(path);
+        attempts.push(name);
+        if (name === 'broken') throw new Error('broken removal failed');
+        heldRemovals += 1;
+        removalEntered();
+        await removalHeld;
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    // `broken` is acquired first so the sweep meets the failure *before* it
+    // reaches the lease whose direct release is already in flight.
+    const broken = await provider.acquire({ kind: 'managed', name: 'broken' });
+    const held = await provider.acquire({ kind: 'managed', name: 'held' });
+
+    const direct = held.release();
+    await entered;
+    const sweeping = captureRejection(provider.releaseAll());
+    releaseRemoval();
+    const [directReport, failure] = await Promise.all([direct, sweeping]);
+
+    expect(directReport.alreadyReleased).toBe(false);
+    expect(heldRemovals).toBe(1);
+    expect(attempts).toEqual(['held', 'broken']);
+    expect(failure).toBeInstanceOf(AgentRuntimeError);
+    const runtimeError = failure as AgentRuntimeError;
+    expect(runtimeError.error.code).toBe('workspace_unavailable');
+    expect(runtimeError.error.details).toMatchObject({ attempted: 2, released: 1, failed: [broken.leaseId] });
+    expect(held.describe().released).toBe(true);
+    expect(broken.describe().released).toBe(false);
+
+    // The coalesced lease is forgotten; only the failure is swept again.
+    const second = await captureRejection(provider.releaseAll());
+    expect(second).toBeInstanceOf(AgentRuntimeError);
+    expect(attempts).toEqual(['held', 'broken', 'broken']);
+    expect(heldRemovals).toBe(1);
   });
 
   it('coalesces a direct release with releaseAll without releasing twice', async () => {

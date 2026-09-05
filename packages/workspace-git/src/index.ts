@@ -135,6 +135,36 @@ type GitLeaseAuthority = {
   releaseReport?: WorkspaceReleaseReport;
 };
 
+type ReleaseFailure = {
+  readonly leaseId: string;
+  readonly cause: unknown;
+};
+
+/**
+ * The truthful outcome of a partially failed sweep. A sweep must not resolve as
+ * a success when authorities remain outstanding, and must not reduce several
+ * independent causes to whichever one happened to be attempted first.
+ */
+function releaseAllFailure(
+  attempted: number,
+  released: number,
+  failures: readonly ReleaseFailure[],
+): AgentRuntimeError {
+  return new AgentRuntimeError(
+    agentError(
+      'workspace_unavailable',
+      `releaseAll could not release ${String(failures.length)} of ${String(attempted)} workspace lease(s)`,
+      { details: { attempted, released, failed: failures.map((failure) => failure.leaseId) } },
+    ),
+    {
+      cause: new AggregateError(
+        failures.map((failure) => failure.cause),
+        'workspace releaseAll failed',
+      ),
+    },
+  );
+}
+
 export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions): GitWorkspaceProvider {
   const local = createLocalWorkspaceProvider({
     baseDirectory: options.baseDirectory,
@@ -269,11 +299,22 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
 
     async releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
       const reports: WorkspaceReleaseReport[] = [];
+      const failures: ReleaseFailure[] = [];
       // Snapshot the live set. Successful releases delete themselves from the
       // source set; releases already in flight are coalesced by authority state.
-      for (const authority of [...issuedAuthorities]) {
-        reports.push(await releaseAuthority(authority));
+      const snapshot = [...issuedAuthorities];
+      // Attempt every authority even when an earlier one rejects: a single
+      // unreleasable workspace must not starve the cleanup of the rest. A
+      // failed attempt restores its own `active` state and tracking, so it
+      // remains retryable by a later sweep.
+      for (const authority of snapshot) {
+        try {
+          reports.push(await releaseAuthority(authority));
+        } catch (error) {
+          failures.push({ leaseId: authority.lease.leaseId, cause: error });
+        }
       }
+      if (failures.length > 0) throw releaseAllFailure(snapshot.length, reports.length, failures);
       return reports;
     },
 

@@ -236,6 +236,38 @@ export async function validateWorkspaceLease(
   return Object.freeze(descriptor);
 }
 
+type ReleaseFailure = {
+  readonly leaseId: WorkspaceLeaseId;
+  readonly cause: unknown;
+};
+
+/**
+ * The truthful outcome of a partially failed sweep.
+ *
+ * A sweep that attempted several independent cleanup duties cannot report a
+ * single cause as if it were the whole story, and it must never resolve as a
+ * success: the failed leases are still outstanding and still retryable.
+ */
+function releaseAllFailure(
+  attempted: number,
+  released: number,
+  failures: readonly ReleaseFailure[],
+): AgentRuntimeError {
+  return new AgentRuntimeError(
+    agentError(
+      'workspace_unavailable',
+      `releaseAll could not release ${String(failures.length)} of ${String(attempted)} workspace lease(s)`,
+      { details: { attempted, released, failed: failures.map((failure) => failure.leaseId) } },
+    ),
+    {
+      cause: new AggregateError(
+        failures.map((failure) => failure.cause),
+        'workspace releaseAll failed',
+      ),
+    },
+  );
+}
+
 export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOptions): WorkspaceProvider {
   const baseDirectory = resolve(options.baseDirectory);
   const removeDirectory = options.removeDirectory ?? ((path: string) => rm(path, { recursive: true, force: true }));
@@ -349,9 +381,22 @@ export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOpti
 
     async releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
       const reports: WorkspaceReleaseReport[] = [];
+      const failures: ReleaseFailure[] = [];
       // Snapshot the live set: a successful release removes its own entry, and
       // a release already in flight is coalesced by the lease itself.
-      for (const lease of [...outstanding]) reports.push(await lease.release());
+      const snapshot = [...outstanding];
+      // Every lease in the snapshot is attempted even when an earlier one
+      // rejects. These cleanup duties are independent, so a lease that cannot
+      // be released must not starve the cleanup of every later lease; failed
+      // leases stay tracked and retryable by construction.
+      for (const lease of snapshot) {
+        try {
+          reports.push(await lease.release());
+        } catch (error) {
+          failures.push({ leaseId: lease.leaseId, cause: error });
+        }
+      }
+      if (failures.length > 0) throw releaseAllFailure(snapshot.length, reports.length, failures);
       return reports;
     },
   };
