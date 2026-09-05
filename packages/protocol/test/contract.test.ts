@@ -18,6 +18,7 @@ import {
   WIRE_VERSION,
   type QuestionRequest,
   checkResponseAgainstRequest,
+  canonicalCommandFingerprint,
   isJsonValue,
 } from '../src/index.ts';
 
@@ -80,6 +81,31 @@ describe('wire contract', () => {
       expect(JsonValueSchema.safeParse(hostile).success).toBe(isJsonValue(hostile));
       expect(isJsonValue(hostile)).toBe(false);
     }
+  });
+
+  it('preserves an own enumerable __proto__ JSON key and fingerprints it distinctly', () => {
+    const value = JSON.parse('{"__proto__":{"variant":1},"safe":true}') as unknown;
+    expect(isJsonValue(value)).toBe(true);
+    const parsed = JsonValueSchema.safeParse(value);
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(Object.prototype.hasOwnProperty.call(parsed.data, '__proto__')).toBe(true);
+    expect(JSON.stringify(parsed.data)).toBe('{"__proto__":{"variant":1},"safe":true}');
+
+    const base = {
+      commandId: 'proto-fingerprint',
+      type: 'open_session',
+      providerId: 'scripted',
+      workspace: { kind: 'managed' },
+    } as const;
+    const first = AgentCommandSchema.parse({ ...base, providerOptions: value });
+    const second = AgentCommandSchema.parse({
+      ...base,
+      providerOptions: JSON.parse('{"__proto__":{"variant":2},"safe":true}'),
+    });
+    const absent = AgentCommandSchema.parse({ ...base, providerOptions: { safe: true } });
+    expect(canonicalCommandFingerprint(first)).not.toBe(canonicalCommandFingerprint(second));
+    expect(canonicalCommandFingerprint(first)).not.toBe(canonicalCommandFingerprint(absent));
   });
 
   it('rejects cyclic JavaScript graphs in authoritative JSON-value schemas', () => {

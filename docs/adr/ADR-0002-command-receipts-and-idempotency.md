@@ -26,8 +26,10 @@ claim before invoking the effect. For `submit_turn`, `respond_to_interaction`, a
 `interrupt_run`, a successful provider call followed by transient commit failure retains
 the parsed command, original acceptance time, generated identities, and provider
 handle/result needed to finish the same logical operation. Exact retry commits it without
-calling the provider again. This is bounded by outstanding commands/sessions and is not
-crash durability.
+calling the provider again. If provider completion races a retained interaction response,
+Runtime commits the already-delivered response settlement before validating completion; the
+completion cannot rewrite that effect into an `interaction_already_settled` rejection. This
+is bounded by outstanding commands/sessions and is not crash durability.
 
 Within one Runtime instance, an active command-ID coordinator makes the receipt check and
 effect one critical section. A separate per-session coordinator serializes state-changing

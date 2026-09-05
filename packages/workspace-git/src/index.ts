@@ -124,6 +124,17 @@ export type GitWorkspaceProvider = WorkspaceProvider & {
   git(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult>;
 };
 
+const GIT_LEASE_PROTOTYPE = Object.freeze({});
+
+type GitLeaseAuthority = {
+  readonly lease: WorkspaceLease;
+  readonly ownership: 'borrowed' | 'managed';
+  readonly root: string;
+  state: 'active' | 'releasing' | 'released';
+  releasePromise?: Promise<WorkspaceReleaseReport>;
+  releaseReport?: WorkspaceReleaseReport;
+};
+
 export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions): GitWorkspaceProvider {
   const local = createLocalWorkspaceProvider({
     baseDirectory: options.baseDirectory,
@@ -131,16 +142,63 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
     idFactory: options.idFactory,
     ...(options.removeDirectory === undefined ? {} : { removeDirectory: options.removeDirectory }),
   });
-  const authorities = new WeakMap<
-    WorkspaceLease,
-    { readonly ownership: 'borrowed' | 'managed'; readonly root: string }
-  >();
+  const authorities = new WeakMap<WorkspaceLease, GitLeaseAuthority>();
+  const issuedAuthorities = new Set<GitLeaseAuthority>();
+
+  function releaseAuthority(authority: GitLeaseAuthority): Promise<WorkspaceReleaseReport> {
+    if (authority.state === 'released') {
+      if (authority.releaseReport === undefined) {
+        return Promise.reject(new Error('released Git lease has no release report'));
+      }
+      return Promise.resolve(structuredClone({ ...authority.releaseReport, alreadyReleased: true }));
+    }
+    if (authority.state === 'releasing') {
+      if (authority.releasePromise === undefined) {
+        return Promise.reject(new Error('releasing Git lease has no release operation'));
+      }
+      return authority.releasePromise.then((report) => structuredClone({ ...report, alreadyReleased: true }));
+    }
+
+    // Revoke Git admission before the destructive operation can yield. The
+    // authority stays tracked so releaseAll can coalesce with this attempt.
+    authority.state = 'releasing';
+    let underlying: Promise<WorkspaceReleaseReport>;
+    try {
+      underlying = authority.lease.release();
+    } catch (error) {
+      authority.state = 'active';
+      return Promise.reject(
+        error instanceof Error ? error : new Error('workspace release threw a non-Error value', { cause: error }),
+      );
+    }
+    const operation = underlying.then(
+      (report) => {
+        authority.releaseReport = structuredClone(report);
+        authority.state = 'released';
+        delete authority.releasePromise;
+        issuedAuthorities.delete(authority);
+        return structuredClone(report);
+      },
+      (error: unknown) => {
+        authority.state = 'active';
+        delete authority.releasePromise;
+        // A failed release did not consume the lease or its cleanup duty.
+        issuedAuthorities.add(authority);
+        throw error;
+      },
+    );
+    authority.releasePromise = operation;
+    return operation;
+  }
 
   async function run(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult> {
     const authority = authorities.get(lease);
-    if (authority === undefined) {
+    if (authority?.state !== 'active') {
       throw new AgentRuntimeError(
-        agentError('workspace_ownership_violation', 'workspace lease was not issued by this Git provider'),
+        agentError(
+          'workspace_ownership_violation',
+          'workspace lease is not an active lease issued by this Git provider',
+        ),
       );
     }
     const validatedArgv = authority.ownership === 'borrowed' ? validateReadOnly(argv) : [...argv];
@@ -163,33 +221,60 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
   async function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
     const lease = await local.acquire(spec);
     const descriptor = lease.describe();
-    const authority = Object.freeze({ ownership: descriptor.ownership, root: descriptor.root });
-    authorities.set(lease, authority);
+    const authority: GitLeaseAuthority = {
+      lease,
+      ownership: descriptor.ownership,
+      root: descriptor.root,
+      state: 'active',
+    };
+    const issued = Object.create(GIT_LEASE_PROTOTYPE) as WorkspaceLease;
+    Object.defineProperties(issued, {
+      leaseId: { value: descriptor.leaseId, enumerable: true },
+      ownership: { value: descriptor.ownership, enumerable: true },
+      root: { value: descriptor.root, enumerable: true },
+      acquiredAt: { value: descriptor.acquiredAt, enumerable: true },
+      describe: {
+        value: () => ({ ...descriptor, released: authority.state === 'released' }),
+      },
+      release: {
+        value: () => releaseAuthority(authority),
+      },
+    });
+    Object.freeze(issued);
+    authorities.set(issued, authority);
+    issuedAuthorities.add(authority);
 
     try {
       if (spec.kind === 'managed' && spec.source?.kind === 'git') {
         // Only a managed root is ever populated. `--` terminates option parsing
         // so a remote that starts with `-` cannot become a git flag.
         const cloneArgv = ['clone', '--', spec.source.remote, '.'];
-        await run(lease, cloneArgv);
+        await run(issued, cloneArgv);
         if (spec.source.ref !== undefined) {
-          await run(lease, ['checkout', '--detach', spec.source.ref]);
+          await run(issued, ['checkout', '--detach', spec.source.ref]);
         }
       }
     } catch (error) {
-      await lease.release();
-      authorities.delete(lease);
+      await issued.release();
+      authorities.delete(issued);
+      issuedAuthorities.delete(authority);
       throw error;
     }
 
-    return lease;
+    return issued;
   }
 
   return {
     acquire,
 
-    releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
-      return local.releaseAll();
+    async releaseAll(): Promise<readonly WorkspaceReleaseReport[]> {
+      const reports: WorkspaceReleaseReport[] = [];
+      // Snapshot the live set. Successful releases delete themselves from the
+      // source set; releases already in flight are coalesced by authority state.
+      for (const authority of [...issuedAuthorities]) {
+        reports.push(await releaseAuthority(authority));
+      }
+      return reports;
     },
 
     git: run,

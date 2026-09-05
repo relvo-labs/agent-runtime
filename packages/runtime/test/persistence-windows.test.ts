@@ -242,6 +242,45 @@ describe('provider side-effect persistence windows', () => {
     expect(value.counts().responses).toBe(1);
   });
 
+  it('finalizes a retained delivered response before racing provider completion', async () => {
+    const value = await fixture();
+    await start(value);
+    const interactionId = await interaction(value);
+    const command = {
+      commandId: value.next(),
+      type: 'respond_to_interaction' as const,
+      sessionId: value.sessionId,
+      interactionId,
+      response: { kind: 'question' as const, answer: 'yes' },
+    };
+
+    value.failNextCommit();
+    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    expect(value.counts().responses).toBe(1);
+
+    value.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+
+    await expect(
+      value.runtime.respondToInteraction({ ...command, response: { kind: 'question', answer: 'changed' } }),
+    ).resolves.toMatchObject({ disposition: 'rejected', error: { code: 'command_id_conflict' } });
+    await expect(value.runtime.respondToInteraction(command)).resolves.toMatchObject({
+      disposition: 'applied',
+      result: { type: 'interaction_settled', interactionId },
+    });
+
+    const snapshot = await value.runtime.getSession(value.sessionId);
+    expect(snapshot?.interactions[0]).toMatchObject({
+      status: 'settled',
+      settlement: { outcome: 'responded', response: command.response },
+    });
+    expect(snapshot?.runs[0]).toMatchObject({ state: 'succeeded', pendingInteractionIds: [] });
+    expect(value.counts().responses).toBe(1);
+
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(value.counts()).toMatchObject({ responses: 1, interrupts: 0, disposes: 1 });
+  });
+
   it('does not redeliver a rejected interaction response when receipt persistence retries', async () => {
     const value = await fixture({ rejectResponse: true });
     await start(value);

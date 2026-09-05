@@ -37,14 +37,5 @@ reserve safely inspected command IDs, and an interrupt fence rejects concurrent 
 interactions. Hostile completion/accessor inputs normalize without throwing. Workspace
 acquisition runtime-validates specs, binds borrowed roots to the requested realpath, and Git
 operations require nominal provider-issued leases. Generated schemas now describe accepted
-Zod input, including default-filled omissions. `validateWorkspaceLease` is now asynchronous
-to perform canonical path validation.
-
-Transient persistence failures after submit, response, or interrupt retain one in-memory
-logical effect for exact retry without repeating the provider call; validation rejections
-reserve safely inspected command IDs, and an interrupt fence rejects concurrent late
-interactions. Hostile completion/accessor inputs normalize without throwing. Workspace
-acquisition runtime-validates specs, binds borrowed roots to the requested realpath, and Git
-operations require nominal provider-issued leases. Generated schemas now describe accepted
-Zod input, including default-filled omissions. `validateWorkspaceLease` is now asynchronous
-to perform canonical path validation.
+Zod input, including conditional behavior after default-filled omissions.
+`validateWorkspaceLease` is now asynchronous to perform canonical path validation.

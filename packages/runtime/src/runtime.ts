@@ -166,6 +166,7 @@ type PendingResponse = {
   readonly acceptedAt: Timestamp;
   readonly interaction: NonNullable<Awaited<ReturnType<RuntimeStore['readInteraction']>>>;
   readonly runId: RunId;
+  readonly settledAt: Timestamp;
 };
 
 type PendingRejection = {
@@ -199,6 +200,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const pendingSubmits = new Map<CommandId, PendingSubmit>();
   const pendingInterrupts = new Map<CommandId, PendingInterrupt>();
   const pendingResponses = new Map<CommandId, PendingResponse>();
+  const pendingResponsesByInteraction = new Map<InteractionId, PendingResponse>();
   const pendingRejections = new Map<CommandId, PendingRejection>();
   let lifecycle: 'accepting' | 'shutting_down' | 'shut_down' = 'accepting';
   let shutdownPromise: Promise<void> | undefined;
@@ -780,9 +782,43 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         try {
           await commitAndPublish((tx) => {
             if (!tx.hasSession(sessionId)) return;
-            const run = tx.session(sessionId).runs.get(runId);
+            let run = tx.session(sessionId).runs.get(runId);
             // Exactly one terminal outcome: if the run is already terminal, the
             // second completion is dropped rather than double-counted.
+            if (!run || run.termination !== undefined) return;
+
+            // A response that already reached the provider is logically ahead
+            // of a completion even when its first persistence attempt failed.
+            // Materialize that retained settlement before judging whether the
+            // provider's terminal outcome is legal. Other pending interactions
+            // remain pending and therefore still make success impossible.
+            for (const interactionId of run.pendingInteractionIds) {
+              const retained = pendingResponsesByInteraction.get(interactionId);
+              const interaction = tx.session(sessionId).interactions.get(interactionId);
+              if (
+                retained?.command.sessionId !== sessionId ||
+                retained.runId !== runId ||
+                interaction === undefined ||
+                interaction.status === 'settled'
+              ) {
+                continue;
+              }
+              tx.emit({
+                sessionId,
+                runId,
+                payload: {
+                  type: 'interaction.settled',
+                  interactionId,
+                  turnId: retained.interaction.turnId,
+                  settlement: {
+                    outcome: 'responded',
+                    settledAt: retained.settledAt,
+                    response: retained.command.response,
+                  },
+                },
+              });
+            }
+            run = tx.session(sessionId).runs.get(runId);
             if (!run || run.termination !== undefined) return;
 
             // Validate against the state in which the provider completed. The
@@ -897,12 +933,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       leaseSafeToRelease = command.workspace.kind === 'managed' && lease.ownership === 'managed';
       const leaseDescriptor = await validateWorkspaceLease(command.workspace, lease);
       leaseSafeToRelease = true;
-      const workspaceCapability = canAcceptWorkspace(descriptor, lease.ownership);
+      const workspaceCapability = canAcceptWorkspace(descriptor, leaseDescriptor.ownership);
       if (!workspaceCapability.ok) throw new AgentRuntimeError(workspaceCapability.error);
 
       providerSession = await provider.createSession({
         options: command.providerOptions ?? {},
-        workspace: { root: lease.root, ownership: lease.ownership },
+        workspace: { root: leaseDescriptor.root, ownership: leaseDescriptor.ownership },
         sink: sessionEvents.sink,
       });
 
@@ -1125,10 +1161,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   async function finishPendingResponse(pendingResponse: PendingResponse): Promise<CommandReceipt> {
-    const { command, acceptedAt, interaction, runId } = pendingResponse;
+    const { command, acceptedAt, interaction, runId, settledAt } = pendingResponse;
     const value = await commitAndPublish((tx) => {
       const current = tx.session(command.sessionId).interactions.get(command.interactionId);
-      if (current === undefined || current.status === 'settled') {
+      const retainedSettlementAlreadyCommitted =
+        current?.status === 'settled' &&
+        current.settlement?.outcome === 'responded' &&
+        JSON.stringify(current.settlement.response) === JSON.stringify(command.response);
+      if (current === undefined || (current.status === 'settled' && !retainedSettlementAlreadyCommitted)) {
         const rejected = receipt(
           command,
           'rejected',
@@ -1138,16 +1178,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: rejected });
         return rejected;
       }
-      tx.emit({
-        sessionId: command.sessionId,
-        runId,
-        payload: {
-          type: 'interaction.settled',
-          interactionId: command.interactionId,
-          turnId: interaction.turnId,
-          settlement: { outcome: 'responded', settledAt: clock.now(), response: command.response },
-        },
-      });
+      if (!retainedSettlementAlreadyCommitted) {
+        tx.emit({
+          sessionId: command.sessionId,
+          runId,
+          payload: {
+            type: 'interaction.settled',
+            interactionId: command.interactionId,
+            turnId: interaction.turnId,
+            settlement: { outcome: 'responded', settledAt, response: command.response },
+          },
+        });
+      }
       const produced = receipt(
         command,
         'applied',
@@ -1161,6 +1203,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       return produced;
     });
     pendingResponses.delete(command.commandId);
+    if (pendingResponsesByInteraction.get(command.interactionId) === pendingResponse) {
+      pendingResponsesByInteraction.delete(command.interactionId);
+    }
     commandAttempts.delete(command.commandId);
     return value;
   }
@@ -1228,6 +1273,19 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     if (pendingRejection !== undefined) return await finishPendingRejection(pendingRejection);
     const pendingResponse = pendingResponses.get(command.commandId);
     if (pendingResponse !== undefined) return await finishPendingResponse(pendingResponse);
+
+    const retainedForInteraction = pendingResponsesByInteraction.get(command.interactionId);
+    if (retainedForInteraction !== undefined) {
+      return await rejectAndRecord(
+        command,
+        receipt(
+          command,
+          'rejected',
+          { error: agentError('interaction_already_settled', `interaction \`${command.interactionId}\` is settled`) },
+          acceptedAt,
+        ),
+      );
+    }
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'respond_to_interaction', acceptedAt);
@@ -1319,8 +1377,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       pendingRejections.set(command.commandId, retained);
       return await finishPendingRejection(retained);
     }
-    const retained = { command, acceptedAt, interaction, runId } satisfies PendingResponse;
+    const retained = { command, acceptedAt, interaction, runId, settledAt: clock.now() } satisfies PendingResponse;
     pendingResponses.set(command.commandId, retained);
+    pendingResponsesByInteraction.set(command.interactionId, retained);
     return await finishPendingResponse(retained);
   }
 
@@ -1339,6 +1398,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     for (const [commandId, pendingResponse] of pendingResponses) {
       if (pendingResponse.command.sessionId !== sessionId) continue;
       pendingResponses.delete(commandId);
+      if (pendingResponsesByInteraction.get(pendingResponse.command.interactionId) === pendingResponse) {
+        pendingResponsesByInteraction.delete(pendingResponse.command.interactionId);
+      }
       commandAttempts.delete(commandId);
     }
     for (const [commandId, pendingRejection] of pendingRejections) {

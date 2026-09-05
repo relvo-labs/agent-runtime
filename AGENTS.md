@@ -16,17 +16,18 @@ expected location from outside version control — never the reverse, and never 
 
 Before mutating any area of this repository, read the skill that owns it.
 
-| If you are about to change…                              | Read first                     |
-| -------------------------------------------------------- | ------------------------------ |
-| protocol schemas, wire DTOs, JSON Schema, state machines | `runtime-contract-evolution`   |
-| a provider SPI implementation or capability descriptor   | `provider-adapter-development` |
-| workspace acquisition, leases, cleanup                   | `workspace-lifecycle`          |
-| package boundaries, the dependency DAG, tsconfig graph   | `package-architecture`         |
-| anything exported from a package entry point             | `public-api-evolution`         |
-| `exports` maps, build output, tarball contents           | `package-artifact-validation`  |
-| dependencies, the lockfile, install scripts              | `pnpm-supply-chain`            |
-| version intent for a published package                   | `changesets-release`           |
-| CI workflows or the local gate                           | `local-ci-parity`              |
+| If you are about to change…                              | Read first                       |
+| -------------------------------------------------------- | -------------------------------- |
+| protocol schemas, wire DTOs, JSON Schema, state machines | `runtime-contract-evolution`     |
+| a provider SPI implementation or capability descriptor   | `provider-adapter-development`   |
+| workspace acquisition, leases, cleanup                   | `workspace-lifecycle`            |
+| runtime commands, side effects, cleanup, subscriptions   | `runtime-lifecycle-coordination` |
+| package boundaries, the dependency DAG, tsconfig graph   | `package-architecture`           |
+| anything exported from a package entry point             | `public-api-evolution`           |
+| `exports` maps, build output, tarball contents           | `package-artifact-validation`    |
+| dependencies, the lockfile, install scripts              | `pnpm-supply-chain`              |
+| version intent for a published package                   | `changesets-release`             |
+| CI workflows or the local gate                           | `local-ci-parity`                |
 
 `.agents/skills/INDEX.md` is generated. Run `pnpm skills:index` after adding or editing a
 skill; `pnpm skills:check` verifies it is not stale.

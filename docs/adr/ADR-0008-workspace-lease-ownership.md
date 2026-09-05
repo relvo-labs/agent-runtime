@@ -25,6 +25,10 @@ Callers cannot promote borrowed paths to managed. Local acquisition runtime-pars
 workspace spec before filesystem effects and checks a managed root's resolved containment
 after creation. Git operations accept only lease object identities issued by that Git
 provider and consult private captured ownership/root, so forged structural leases or
-prototype changes cannot widen borrowed authority. Provisioners must clean newly owned roots
-when setup fails. Out-of-tree workspace providers remain trusted in-process code, but
+prototype changes cannot widen borrowed authority. The Git provider returns its own frozen
+lease view and revokes nominal operational authority synchronously when release begins. A
+failed release restores active, tracked authority for retry; success removes the authority
+from live provider tracking, and concurrent per-lease/provider-wide release shares one
+destructive operation without reopening Git admission. Provisioners must clean newly owned
+roots when setup fails. Out-of-tree workspace providers remain trusted in-process code, but
 malformed ownership claims fail before an agent provider receives the path.

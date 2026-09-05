@@ -133,7 +133,13 @@ export const AgentRunSchema = z
       },
       {
         if: { properties: { state: { const: 'awaiting_interaction' } }, required: ['state'] },
-        then: { properties: { pendingInteractionIds: { type: 'array', minItems: 1 } } },
+        // In input mode Zod omits defaulted properties from `required`, then
+        // applies the [] default before refinements. Requiring the field here
+        // is the JSON Schema equivalent of the post-default non-empty check.
+        then: {
+          required: ['pendingInteractionIds'],
+          properties: { pendingInteractionIds: { type: 'array', minItems: 1 } },
+        },
       },
     ],
   });

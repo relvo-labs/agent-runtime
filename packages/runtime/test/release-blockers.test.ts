@@ -49,6 +49,7 @@ type ProviderControl = {
   created: number;
   disposed: number;
   responses: number;
+  readonly workspaces: ProviderSessionInit['workspace'][];
 };
 
 function controlledProvider(
@@ -67,6 +68,7 @@ function controlledProvider(
     created: 0,
     disposed: 0,
     responses: 0,
+    workspaces: [],
   };
   const descriptor = defineProviderDescriptor({
     providerId: 'controlled',
@@ -82,8 +84,9 @@ function controlledProvider(
   });
   const provider: AgentProvider = {
     describe: () => descriptor,
-    createSession(_init: ProviderSessionInit): Promise<ProviderSession> {
+    createSession(init: ProviderSessionInit): Promise<ProviderSession> {
       control.created += 1;
+      control.workspaces.push(init.workspace);
       return Promise.resolve({
         async startRun(request: ProviderRunRequest): Promise<ProviderRun> {
           if (options.emitInteraction) {
@@ -418,6 +421,55 @@ describe('shutdown boundary', () => {
 });
 
 describe('workspace provider boundary', () => {
+  it('passes the validated lease descriptor snapshot to the provider without re-reading getters', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-getter-test-'));
+    roots.push(root);
+    const requested = join(root, 'requested');
+    const redirected = join(root, 'redirected');
+    await Promise.all([mkdir(requested), mkdir(redirected)]);
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const { provider, control } = controlledProvider();
+    const leaseId = WorkspaceLeaseIdSchema.parse(idFactory.next('workspaceLease'));
+    const acquiredAt = clock.now();
+    let rootReads = 0;
+    const lease: WorkspaceLease = {
+      leaseId,
+      ownership: 'borrowed',
+      get root() {
+        rootReads += 1;
+        return rootReads === 1 ? requested : redirected;
+      },
+      acquiredAt,
+      describe: () => ({ leaseId, ownership: 'borrowed', root: requested, acquiredAt, released: false }),
+      release: () =>
+        Promise.resolve({
+          leaseId,
+          ownership: 'borrowed',
+          alreadyReleased: false,
+          destructiveOperations: [],
+          releasedAt: clock.now(),
+        }),
+    };
+    const workspaces: WorkspaceProvider = {
+      acquire: (() => Promise.resolve(lease)) as WorkspaceProvider['acquire'],
+      releaseAll: () => Promise.resolve([]),
+    };
+    const runtime = createAgentRuntime({ providers: [provider], workspaces, clock, idFactory });
+    runtimes.push(runtime);
+
+    await expect(
+      runtime.openSession({
+        commandId: CommandIdSchema.parse('stateful-workspace-getter'),
+        type: 'open_session',
+        providerId: 'controlled',
+        workspace: { kind: 'existing', path: requested },
+      }),
+    ).resolves.toMatchObject({ disposition: 'applied' });
+    expect(control.workspaces).toEqual([{ root: requested, ownership: 'borrowed' }]);
+    expect(rootReads).toBe(1);
+  });
+
   it('never releases a lease that promotes an existing workspace to managed ownership', async () => {
     const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-boundary-test-'));
     roots.push(root);

@@ -253,4 +253,44 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
     expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
   });
+
+  it.each([
+    {
+      schema: 'agent-run' as const,
+      value: {
+        runId: runBase.runId,
+        sessionId: runBase.sessionId,
+        turnId: runBase.turnId,
+        attempt: 1,
+        state: 'awaiting_interaction',
+        startedAt: timestamp,
+      },
+    },
+    {
+      schema: 'session-snapshot' as const,
+      value: {
+        session: { ...agentSessionBase, wireVersion: '0.4' },
+        turns: [],
+        runs: [
+          {
+            runId: runBase.runId,
+            sessionId: runBase.sessionId,
+            turnId: runBase.turnId,
+            attempt: 1,
+            state: 'awaiting_interaction',
+            startedAt: timestamp,
+          },
+        ],
+        interactions: [],
+        revision: 1,
+      },
+    },
+  ])('rejects an omitted default that violates the post-default $schema invariant', ({ schema, value }) => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS[schema]);
+    expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
+    expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
+  });
 });

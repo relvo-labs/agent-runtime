@@ -26,6 +26,7 @@ const INVALID_JSON_VALUE = Symbol('invalid JSON value');
 function captureJsonValue(
   value: unknown,
   ancestors: ReadonlySet<object> = new Set(),
+  encodeKeys = false,
 ): JsonValue | typeof INVALID_JSON_VALUE {
   try {
     if (value === null) return null;
@@ -51,7 +52,7 @@ function captureJsonValue(
         if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
           return INVALID_JSON_VALUE;
         }
-        const child = captureJsonValue(descriptor.value, next);
+        const child = captureJsonValue(descriptor.value, next, encodeKeys);
         if (child === INVALID_JSON_VALUE) return INVALID_JSON_VALUE;
         output.push(child);
       }
@@ -60,16 +61,19 @@ function captureJsonValue(
 
     const prototype: unknown = Object.getPrototypeOf(object);
     if (prototype !== Object.prototype && prototype !== null) return INVALID_JSON_VALUE;
-    const output: Record<string, JsonValue> = {};
+    // A null prototype makes every JSON key data. In particular, assigning an
+    // own `__proto__` key must not invoke Object.prototype's legacy setter and
+    // silently erase data before validation or canonical fingerprinting.
+    const output = Object.create(null) as Record<string, JsonValue>;
     for (const key of Reflect.ownKeys(object)) {
       if (typeof key !== 'string') return INVALID_JSON_VALUE;
       const descriptor = Object.getOwnPropertyDescriptor(object, key);
       if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
         return INVALID_JSON_VALUE;
       }
-      const child = captureJsonValue(descriptor.value, next);
+      const child = captureJsonValue(descriptor.value, next, encodeKeys);
       if (child === INVALID_JSON_VALUE) return INVALID_JSON_VALUE;
-      output[key] = child;
+      output[encodeKeys ? `:${key}` : key] = child;
     }
     return output;
   } catch {
@@ -77,20 +81,45 @@ function captureJsonValue(
   }
 }
 
+function decodeJsonKeys<T extends JsonValue>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((child: JsonValue) => decodeJsonKeys(child)) as unknown as T;
+  }
+  if (value === null || typeof value !== 'object') return value;
+  const output = Object.create(null) as Record<string, JsonValue>;
+  for (const [encodedKey, child] of Object.entries(value)) {
+    const key = encodedKey.slice(1);
+    Object.defineProperty(output, key, {
+      value: decodeJsonKeys(child),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return output as T;
+}
+
 /**
  * The preprocess capture is an in-process JavaScript graph guard and snapshot.
  * JSON text and the JSON Schema instance model contain trees, not object
  * identity or cycles, so generated JSON Schema retains the structural shape.
  */
-export const JsonValueSchema: z.ZodType<JsonValue> = z.preprocess(
-  (value) => captureJsonValue(value),
-  z.lazy(() => z.union([JsonPrimitiveSchema, z.array(JsonValueSchema), z.record(z.string(), JsonValueSchema)])),
-);
+export const JsonValueSchema: z.ZodType<JsonValue> = z
+  .preprocess(
+    // Zod's record parser assigns into an ordinary object, where `__proto__`
+    // would invoke the legacy inherited setter. Prefix every key during each
+    // recursive parse and remove one prefix at each transform layer.
+    (value) => captureJsonValue(value, new Set(), true),
+    z.lazy(() => z.union([JsonPrimitiveSchema, z.array(JsonValueSchema), z.record(z.string(), JsonValueSchema)])),
+  )
+  .overwrite(decodeJsonKeys);
 
-export const JsonObjectSchema: z.ZodType<JsonObject> = z.preprocess(
-  (value) => captureJsonValue(value),
-  z.lazy(() => z.record(z.string(), JsonValueSchema)),
-);
+export const JsonObjectSchema: z.ZodType<JsonObject> = z
+  .preprocess(
+    (value) => captureJsonValue(value, new Set(), true),
+    z.lazy(() => z.record(z.string(), JsonValueSchema)),
+  )
+  .overwrite(decodeJsonKeys);
 
 /**
  * Structural guard used by the runtime before a provider-supplied payload is

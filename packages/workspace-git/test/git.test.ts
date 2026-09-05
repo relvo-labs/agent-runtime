@@ -14,6 +14,19 @@ import {
 
 const roots: string[] = [];
 
+type Deferred<T> = {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 afterEach(async () => {
   const { rm } = await import('node:fs/promises');
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -160,6 +173,160 @@ describe('git workspace boundary', () => {
     };
     await expect(provider.git(forged, ['status', '--short'])).rejects.toThrow();
     expect(commands).toEqual([]);
+  });
+
+  it('revokes Git authority after concurrent release while active leases remain usable', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-release-authority-test-'));
+    roots.push(root);
+    const borrowed = join(root, 'borrowed');
+    await mkdir(borrowed);
+    const commands: GitCommand[] = [];
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+    });
+    const borrowedLease = await provider.acquire({ kind: 'existing', path: borrowed });
+    const managedLease = await provider.acquire({ kind: 'managed' });
+
+    await provider.git(borrowedLease, ['status', '--short']);
+    await provider.git(managedLease, ['status', '--short']);
+    const [first, concurrent] = await Promise.all([borrowedLease.release(), borrowedLease.release()]);
+    expect([first.alreadyReleased, concurrent.alreadyReleased].sort()).toEqual([false, true]);
+    await expect(provider.git(borrowedLease, ['status', '--short'])).rejects.toThrow();
+    expect(commands).toHaveLength(2);
+
+    await provider.git(managedLease, ['status', '--short']);
+    await managedLease.release();
+    await expect(provider.git(managedLease, ['status', '--short'])).rejects.toThrow();
+    expect(commands).toHaveLength(3);
+  });
+
+  it('rejects Git while managed release is in flight', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-releasing-authority-test-'));
+    roots.push(root);
+    const releaseGate = deferred<undefined>();
+    const commands: GitCommand[] = [];
+    let removals = 0;
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+      removeDirectory: async (path) => {
+        removals += 1;
+        await releaseGate.promise;
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed' });
+
+    const releasing = lease.release();
+    const gitDuringRelease = provider.git(lease, ['status', '--short']);
+    releaseGate.resolve(undefined);
+    await expect(gitDuringRelease).rejects.toThrow();
+    await expect(releasing).resolves.toMatchObject({ alreadyReleased: false });
+    expect(commands).toEqual([]);
+    expect(removals).toBe(1);
+  });
+
+  it('restores Git admission and tracking after failed release so a later attempt can succeed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-release-retry-test-'));
+    roots.push(root);
+    const commands: GitCommand[] = [];
+    let removals = 0;
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+      removeDirectory: async (path) => {
+        removals += 1;
+        if (removals === 1) throw new Error('transient removal failure');
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed' });
+
+    await expect(lease.release()).rejects.toThrow('transient removal failure');
+    expect(lease.describe().released).toBe(false);
+    await expect(provider.git(lease, ['status', '--short'])).resolves.toMatchObject({ exitCode: 0 });
+    await expect(lease.release()).resolves.toMatchObject({ alreadyReleased: false });
+    await expect(provider.git(lease, ['status', '--short'])).rejects.toThrow();
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+    expect(removals).toBe(2);
+    expect(commands).toHaveLength(1);
+  });
+
+  it('releaseAll visits only currently live authorities and forgets successful history', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-live-authorities-test-'));
+    roots.push(root);
+    const firstRoot = join(root, 'first');
+    const secondRoot = join(root, 'second');
+    await Promise.all([mkdir(firstRoot), mkdir(secondRoot)]);
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: () => Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+    });
+    const released = await provider.acquire({ kind: 'existing', path: firstRoot });
+    const live = await provider.acquire({ kind: 'existing', path: secondRoot });
+
+    await released.release();
+    const reports = await provider.releaseAll();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.leaseId).toBe(live.leaseId);
+    await expect(provider.releaseAll()).resolves.toEqual([]);
+  });
+
+  it('coalesces direct release with releaseAll without double destruction or re-granting authority', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-release-all-race-test-'));
+    roots.push(root);
+    const releaseGate = deferred<undefined>();
+    let removals = 0;
+    const commands: GitCommand[] = [];
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+      removeDirectory: async (path) => {
+        removals += 1;
+        await releaseGate.promise;
+        const { rm } = await import('node:fs/promises');
+        await rm(path, { recursive: true, force: true });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'managed' });
+
+    const direct = lease.release();
+    const sweeping = provider.releaseAll();
+    await expect(provider.git(lease, ['status', '--short'])).rejects.toThrow();
+    releaseGate.resolve(undefined);
+    const [directReport, sweepReports] = await Promise.all([direct, sweeping]);
+    expect(directReport.alreadyReleased).toBe(false);
+    expect(sweepReports).toHaveLength(1);
+    expect(sweepReports[0]).toMatchObject({ leaseId: lease.leaseId, alreadyReleased: true });
+    expect(removals).toBe(1);
+    expect(commands).toEqual([]);
+    await expect(provider.git(lease, ['status', '--short'])).rejects.toThrow();
+    await expect(provider.releaseAll()).resolves.toEqual([]);
   });
 
   it('cleans an owned root when clone setup fails', async () => {
