@@ -43,8 +43,6 @@
       "required": [
         "leaseId",
         "ownership",
-        "alreadyReleased",
-        "destructiveOperations",
         "releasedAt"
       ],
       "type": "object"

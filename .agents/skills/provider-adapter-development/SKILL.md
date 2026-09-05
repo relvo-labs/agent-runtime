@@ -38,7 +38,7 @@ Do not use this skill when:
 ## Does not own
 
 - `packages/protocol/src` — owned by `runtime-contract-evolution`
-- `packages/runtime/src` — owned by `package-architecture`
+- `packages/runtime/src` — owned by `runtime-lifecycle-coordination`
 - `packages/workspace/src` — owned by `workspace-lifecycle`
 
 ## Relationships
@@ -46,6 +46,7 @@ Do not use this skill when:
 - `boundary-with` → `runtime-contract-evolution` — that skill defines what a provider may emit; this skill defines how an adapter produces it. A provider may only emit payloads the protocol already defines.
 - `boundary-with` → `package-architecture` — this skill owns the SPI contract; that skill owns who is allowed to import it.
 - `boundary-with` → `workspace-lifecycle` — an adapter _consumes_ a lease root; it never acquires or releases the lease.
+- `boundary-with` → `runtime-lifecycle-coordination` — adapters provide effects and callbacks; runtime coordination owns activation and settlement ordering.
 - `escalates-to` → `public-api-evolution` — widening the SPI is a public break for every out-of-tree adapter.
 
 ## Procedure

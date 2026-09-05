@@ -31,8 +31,7 @@
       },
       "required": [
         "code",
-        "message",
-        "retryable"
+        "message"
       ],
       "type": "object"
     },
@@ -102,8 +101,7 @@
       "required": [
         "kind",
         "subject",
-        "allowedModes",
-        "riskHint"
+        "allowedModes"
       ],
       "type": "object"
     },
@@ -298,8 +296,7 @@
       },
       "required": [
         "kind",
-        "prompt",
-        "multiSelect"
+        "prompt"
       ],
       "type": "object"
     },

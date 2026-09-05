@@ -31,8 +31,7 @@
       },
       "required": [
         "code",
-        "message",
-        "retryable"
+        "message"
       ],
       "type": "object"
     },
@@ -102,8 +101,7 @@
       "required": [
         "kind",
         "subject",
-        "allowedModes",
-        "riskHint"
+        "allowedModes"
       ],
       "type": "object"
     },
@@ -674,8 +672,7 @@
       },
       "required": [
         "kind",
-        "prompt",
-        "multiSelect"
+        "prompt"
       ],
       "type": "object"
     },
@@ -905,8 +902,7 @@
         "leaseId",
         "ownership",
         "root",
-        "acquiredAt",
-        "released"
+        "acquiredAt"
       ],
       "type": "object"
     },
@@ -948,8 +944,6 @@
       "required": [
         "leaseId",
         "ownership",
-        "alreadyReleased",
-        "destructiveOperations",
         "releasedAt"
       ],
       "type": "object"

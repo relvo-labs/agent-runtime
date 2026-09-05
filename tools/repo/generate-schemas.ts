@@ -46,9 +46,9 @@ function buildSchemas(): Record<string, unknown> {
     const schema = PUBLISHED_SCHEMAS[name];
     const generated = z.toJSONSchema(schema, {
       target: 'draft-2020-12',
-      // Wire DTOs are what a consumer *receives*, so defaults must be applied
-      // and branded strings must appear as plain strings.
-      io: 'output',
+      // Published validators describe accepted wire input. Zod defaults are
+      // therefore optional in JSON Schema exactly as they are to safeParse.
+      io: 'input',
       // A schema we cannot represent is a contract defect, not something to
       // paper over with `{}`.
       unrepresentable: 'throw',

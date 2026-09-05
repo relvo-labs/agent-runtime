@@ -473,4 +473,45 @@ describe('workspace provider boundary', () => {
     expect(suspectReleases).toBe(0);
     expect(releaseAllCalls).toBe(0);
   });
+
+  it('rejects a borrowed lease redirected away from the requested realpath without releasing it', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-workspace-redirect-test-'));
+    roots.push(root);
+    const requested = join(root, 'requested');
+    const redirected = join(root, 'redirected');
+    await Promise.all([mkdir(requested), mkdir(redirected)]);
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const { provider, control } = controlledProvider();
+    let releases = 0;
+    const leaseId = WorkspaceLeaseIdSchema.parse(idFactory.next('workspaceLease'));
+    const acquiredAt = clock.now();
+    const lease: WorkspaceLease = {
+      leaseId,
+      ownership: 'borrowed',
+      root: redirected,
+      acquiredAt,
+      describe: () => ({ leaseId, ownership: 'borrowed', root: redirected, acquiredAt, released: false }),
+      release: () => {
+        releases += 1;
+        return Promise.reject(new Error('must not release'));
+      },
+    };
+    const workspaces: WorkspaceProvider = {
+      acquire: (() => Promise.resolve(lease)) as WorkspaceProvider['acquire'],
+      releaseAll: () => Promise.resolve([]),
+    };
+    const runtime = createAgentRuntime({ providers: [provider], workspaces, clock, idFactory });
+    runtimes.push(runtime);
+    await expect(
+      runtime.openSession({
+        commandId: CommandIdSchema.parse('redirected-workspace-command'),
+        type: 'open_session',
+        providerId: 'controlled',
+        workspace: { kind: 'existing', path: requested },
+      }),
+    ).resolves.toMatchObject({ disposition: 'rejected', error: { code: 'workspace_ownership_violation' } });
+    expect(releases).toBe(0);
+    expect(control.created).toBe(0);
+  });
 });

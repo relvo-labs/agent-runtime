@@ -21,20 +21,76 @@ export const JsonPrimitiveSchema = z.union([
   z.null(),
 ]);
 
-const JSON_GRAPH_ERROR = 'JSON values must be acyclic plain data';
+const INVALID_JSON_VALUE = Symbol('invalid JSON value');
+
+function captureJsonValue(
+  value: unknown,
+  ancestors: ReadonlySet<object> = new Set(),
+): JsonValue | typeof INVALID_JSON_VALUE {
+  try {
+    if (value === null) return null;
+    const type = typeof value;
+    if (type === 'string' || type === 'boolean') return value as string | boolean;
+    if (type === 'number') return Number.isFinite(value) ? (value as number) : INVALID_JSON_VALUE;
+    if (type !== 'object') return INVALID_JSON_VALUE;
+
+    const object = value as object;
+    if (ancestors.has(object)) return INVALID_JSON_VALUE;
+    const next = new Set(ancestors).add(object);
+
+    if (Array.isArray(object)) {
+      if (Object.getPrototypeOf(object) !== Array.prototype) return INVALID_JSON_VALUE;
+      const length = object.length;
+      const keys = Reflect.ownKeys(object);
+      if (!Number.isSafeInteger(length) || keys.length !== length + 1 || !keys.includes('length')) {
+        return INVALID_JSON_VALUE;
+      }
+      const output: JsonValue[] = [];
+      for (let index = 0; index < length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(object, String(index));
+        if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+          return INVALID_JSON_VALUE;
+        }
+        const child = captureJsonValue(descriptor.value, next);
+        if (child === INVALID_JSON_VALUE) return INVALID_JSON_VALUE;
+        output.push(child);
+      }
+      return output;
+    }
+
+    const prototype: unknown = Object.getPrototypeOf(object);
+    if (prototype !== Object.prototype && prototype !== null) return INVALID_JSON_VALUE;
+    const output: Record<string, JsonValue> = {};
+    for (const key of Reflect.ownKeys(object)) {
+      if (typeof key !== 'string') return INVALID_JSON_VALUE;
+      const descriptor = Object.getOwnPropertyDescriptor(object, key);
+      if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) {
+        return INVALID_JSON_VALUE;
+      }
+      const child = captureJsonValue(descriptor.value, next);
+      if (child === INVALID_JSON_VALUE) return INVALID_JSON_VALUE;
+      output[key] = child;
+    }
+    return output;
+  } catch {
+    return INVALID_JSON_VALUE;
+  }
+}
 
 /**
- * The refinement is an in-process JavaScript graph guard. JSON text and the
- * JSON Schema instance model contain trees, not object identity or cycles, so
- * generated JSON Schema truthfully retains the structural JSON-value shape.
+ * The preprocess capture is an in-process JavaScript graph guard and snapshot.
+ * JSON text and the JSON Schema instance model contain trees, not object
+ * identity or cycles, so generated JSON Schema retains the structural shape.
  */
-export const JsonValueSchema: z.ZodType<JsonValue> = z
-  .lazy(() => z.union([JsonPrimitiveSchema, z.array(JsonValueSchema), z.record(z.string(), JsonValueSchema)]))
-  .refine(isJsonValue, JSON_GRAPH_ERROR);
+export const JsonValueSchema: z.ZodType<JsonValue> = z.preprocess(
+  (value) => captureJsonValue(value),
+  z.lazy(() => z.union([JsonPrimitiveSchema, z.array(JsonValueSchema), z.record(z.string(), JsonValueSchema)])),
+);
 
-export const JsonObjectSchema: z.ZodType<JsonObject> = z
-  .lazy(() => z.record(z.string(), JsonValueSchema))
-  .refine(isJsonValue, JSON_GRAPH_ERROR);
+export const JsonObjectSchema: z.ZodType<JsonObject> = z.preprocess(
+  (value) => captureJsonValue(value),
+  z.lazy(() => z.record(z.string(), JsonValueSchema)),
+);
 
 /**
  * Structural guard used by the runtime before a provider-supplied payload is
@@ -44,56 +100,5 @@ export const JsonObjectSchema: z.ZodType<JsonObject> = z
  * diagnostic.
  */
 export function isJsonValue(value: unknown, seen: ReadonlySet<object> = new Set()): boolean {
-  try {
-    if (value === null) return true;
-    const type = typeof value;
-    if (type === 'string' || type === 'boolean') return true;
-    if (type === 'number') return Number.isFinite(value);
-    if (type !== 'object') return false;
-
-    const object = value as object;
-    if (seen.has(object)) return false; // a cycle is not JSON-safe
-    const nextSeen = new Set(seen).add(object);
-
-    if (Array.isArray(object)) {
-      if (Object.getPrototypeOf(object) !== Array.prototype) return false;
-      const length = object.length;
-      const keys = Reflect.ownKeys(object);
-      if (keys.length !== length + 1 || !keys.includes('length')) return false;
-      for (let index = 0; index < length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(object, String(index));
-        if (
-          descriptor === undefined ||
-          !('value' in descriptor) ||
-          descriptor.enumerable !== true ||
-          !isJsonValue(descriptor.value, nextSeen)
-        ) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Reject anything with a non-plain prototype: Date, Map, Set, Error, class
-    // instances. They serialise lossily and would silently change shape on replay.
-    const prototype: unknown = Object.getPrototypeOf(object);
-    if (prototype !== Object.prototype && prototype !== null) return false;
-
-    for (const key of Reflect.ownKeys(object)) {
-      if (typeof key !== 'string') return false;
-      const descriptor = Object.getOwnPropertyDescriptor(object, key);
-      if (
-        descriptor === undefined ||
-        !('value' in descriptor) ||
-        descriptor.enumerable !== true ||
-        !isJsonValue(descriptor.value, nextSeen)
-      ) {
-        return false;
-      }
-    }
-    return true;
-  } catch {
-    // Reflection or property access can throw for hostile accessors/proxies.
-    return false;
-  }
+  return captureJsonValue(value, seen) !== INVALID_JSON_VALUE;
 }

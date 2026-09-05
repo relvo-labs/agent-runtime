@@ -42,13 +42,14 @@ Do not use this skill when:
 
 - `packages/provider/src` — owned by `provider-adapter-development`
 - `packages/workspace/src` — owned by `workspace-lifecycle`
-- `packages/runtime/src` — owned by `package-architecture`
+- `packages/runtime/src` — owned by `runtime-lifecycle-coordination`
 - `packages/*/package.json#exports` — owned by `package-artifact-validation`
 
 ## Relationships
 
 - `boundary-with` → `public-api-evolution` — every schema change is also a public API change; this skill decides wire compatibility, that skill decides the TypeScript surface and the consumer example.
 - `boundary-with` → `provider-adapter-development` — this skill defines what a provider may emit; that skill defines how a provider produces it.
+- `boundary-with` → `runtime-lifecycle-coordination` — this skill defines legal wire transitions; runtime coordination applies them atomically.
 - `delegates-to` → `changesets-release` — semver classification of an accepted change.
 - `depends-on` → `local-ci-parity` — the drift check must run in the canonical gate.
 

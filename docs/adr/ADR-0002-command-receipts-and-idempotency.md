@@ -11,14 +11,23 @@ Callers retry mutations after transport uncertainty. Retrying an unkeyed mutatio
 Every mutation carries a caller-generated command ID. Store the canonical payload
 fingerprint and first receipt. Same ID plus same payload returns `duplicate` with the
 original result and time. Same ID plus another payload returns `command_id_conflict`.
-Persist rejections as well as success.
+Persist rejections as well as success. Validation rejection participates in the same rule
+when the submitted value has a safely inspectable, schema-valid primitive command ID.
+Runtime fingerprints the original raw input without invoking accessors and persists the
+rejection; correcting the payload under that ID is therefore a conflict. Inputs whose
+identity cannot be inspected safely cannot reserve an untrusted identity.
 
 An external effect that fails before a receipt can be committed retains its first
 fingerprint and acceptance time. Only the exact command may retry that effect or its
 cleanup; the same ID with changed payload returns `command_id_conflict`. Successful
 completion replaces the attempt reservation with the canonical receipt. In-memory
 reservations last for the Runtime instance; a durable implementation must persist the
-claim before invoking the effect.
+claim before invoking the effect. For `submit_turn`, `respond_to_interaction`, and
+`interrupt_run`, a successful provider call followed by transient commit failure retains
+the parsed command, original acceptance time, generated identities, and provider
+handle/result needed to finish the same logical operation. Exact retry commits it without
+calling the provider again. This is bounded by outstanding commands/sessions and is not
+crash durability.
 
 Within one Runtime instance, an active command-ID coordinator makes the receipt check and
 effect one critical section. A separate per-session coordinator serializes state-changing

@@ -131,12 +131,22 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
     idFactory: options.idFactory,
     ...(options.removeDirectory === undefined ? {} : { removeDirectory: options.removeDirectory }),
   });
+  const authorities = new WeakMap<
+    WorkspaceLease,
+    { readonly ownership: 'borrowed' | 'managed'; readonly root: string }
+  >();
 
   async function run(lease: WorkspaceLease, argv: readonly string[]): Promise<GitResult> {
-    const validatedArgv = lease.ownership === 'borrowed' ? validateReadOnly(argv) : argv;
+    const authority = authorities.get(lease);
+    if (authority === undefined) {
+      throw new AgentRuntimeError(
+        agentError('workspace_ownership_violation', 'workspace lease was not issued by this Git provider'),
+      );
+    }
+    const validatedArgv = authority.ownership === 'borrowed' ? validateReadOnly(argv) : [...argv];
     const hardenedArgv =
-      lease.ownership === 'borrowed' ? ['--no-pager', '--no-optional-locks', ...validatedArgv] : [...validatedArgv];
-    const result = await options.runGit({ argv: hardenedArgv, cwd: lease.root });
+      authority.ownership === 'borrowed' ? ['--no-pager', '--no-optional-locks', ...validatedArgv] : [...validatedArgv];
+    const result = await options.runGit({ argv: hardenedArgv, cwd: authority.root });
     if (result.exitCode !== 0) {
       throw new AgentRuntimeError(
         agentError('workspace_unavailable', `git command failed with exit code ${String(result.exitCode)}`, {
@@ -152,6 +162,9 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
   function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease>;
   async function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
     const lease = await local.acquire(spec);
+    const descriptor = lease.describe();
+    const authority = Object.freeze({ ownership: descriptor.ownership, root: descriptor.root });
+    authorities.set(lease, authority);
 
     try {
       if (spec.kind === 'managed' && spec.source?.kind === 'git') {
@@ -165,6 +178,7 @@ export function createGitWorkspaceProvider(options: GitWorkspaceProviderOptions)
       }
     } catch (error) {
       await lease.release();
+      authorities.delete(lease);
       throw error;
     }
 

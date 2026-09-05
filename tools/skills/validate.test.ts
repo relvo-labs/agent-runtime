@@ -185,6 +185,14 @@ describe('relation rules', () => {
 });
 
 describe('ownership rules', () => {
+  it('routes runtime lifecycle source to its single-purpose canonical skill', () => {
+    const scan = scanSkillRoot(repoRoot, '.agents/skills');
+    const owners = scan.skills
+      .filter((skill) => skill.owns.some((entry) => entry.token === 'packages/runtime/src'))
+      .map((skill) => skill.name);
+    expect(owners).toEqual(['runtime-lifecycle-coordination']);
+  });
+
   it('rejects the same surface owned by two skills', () => {
     const root = fixture((r) =>
       edit(r, 'beta-skill', (s) => s.replace('- `fixture/beta` — the beta surface', '- `fixture/alpha` — also mine')),
@@ -285,7 +293,7 @@ describe('required canonical set', () => {
   it('reports every missing production skill when the canonical set is required', () => {
     const findings = validateSkills({ repoRoot: fixture(), skillRoot: 'skills', checkCompetingRoots: false });
     const missing = findings.filter((f) => f.code === 'REQUIRED_SKILL_MISSING');
-    expect(missing).toHaveLength(9);
+    expect(missing).toHaveLength(10);
   });
 });
 

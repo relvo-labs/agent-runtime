@@ -79,6 +79,58 @@ const sharedDetail = { value: 'shared' };
 
 const corpus: readonly ParityCase[] = [
   {
+    schema: 'agent-command',
+    value: { commandId: 'close-default', type: 'close_session', sessionId: 'ses_0000000000000001' },
+  },
+  { schema: 'subscription-request', value: { sessionId: 'ses_0000000000000001' } },
+  { schema: 'agent-error', value: { code: 'invalid_request', message: 'default retryable' } },
+  { schema: 'interaction-request', value: { kind: 'question', prompt: 'Default multi-select' } },
+  { schema: 'interaction-request', value: { kind: 'approval', prompt: 'Default risk' } },
+  { schema: 'agent-run', value: { ...runBase, state: 'running', pendingInteractionIds: undefined } },
+  {
+    schema: 'agent-turn',
+    value: {
+      turnId: 'trn_0000000000000001',
+      sessionId: 'ses_0000000000000001',
+      state: 'accepted',
+      input: { parts: [{ type: 'text', text: 'defaults' }] },
+      acceptedAt: timestamp,
+    },
+  },
+  {
+    schema: 'workspace-lease-descriptor',
+    value: { leaseId: 'wsl_0000000000000001', ownership: 'borrowed', root: '/workspace', acquiredAt: timestamp },
+  },
+  {
+    schema: 'workspace-release-report',
+    value: { leaseId: 'wsl_0000000000000001', ownership: 'borrowed', releasedAt: timestamp },
+  },
+  {
+    schema: 'agent-session',
+    value: {
+      sessionId: 'ses_0000000000000001',
+      state: 'ready',
+      providerId: 'fixture',
+      wireVersion: '0.4',
+      workspace: { leaseId: 'wsl_0000000000000001', ownership: 'borrowed', root: '/workspace', acquiredAt: timestamp },
+      createdAt: timestamp,
+      sequence: 0,
+    },
+  },
+  {
+    schema: 'provider-descriptor',
+    value: {
+      providerId: 'minimal',
+      providerVersion: '0.1.0',
+      wireVersion: '0.4',
+      displayName: 'Minimal',
+      run: { interrupt: { mode: 'unsupported' }, streaming: {} },
+      interaction: { approval: {}, question: {} },
+      workspace: { requires: 'directory' },
+      recovery: {},
+    },
+  },
+  {
     schema: 'provider-event-input',
     value: {
       payload: {

@@ -37,11 +37,13 @@ Do not use this skill when:
 
 - `packages/protocol/src` — owned by `runtime-contract-evolution`
 - `packages/provider/src` — owned by `provider-adapter-development`
+- `packages/runtime/src` — owned by `runtime-lifecycle-coordination`
 
 ## Relationships
 
 - `depends-on` → `runtime-contract-evolution` — workspace DTOs are protocol types.
 - `boundary-with` → `provider-adapter-development` — a provider _consumes_ a lease root; it never acquires or releases the lease itself.
+- `boundary-with` → `runtime-lifecycle-coordination` — this skill owns lease safety; runtime coordination owns acquisition and cleanup timing.
 
 ## Procedure
 

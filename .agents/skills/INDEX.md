@@ -14,6 +14,8 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `.github/workflows` | `local-ci-parity` |
 | `.npmrc` | `pnpm-supply-chain` |
 | `.nvmrc` | `local-ci-parity` |
+| `docs/adr/ADR-0002-command-receipts-and-idempotency.md` | `runtime-lifecycle-coordination` |
+| `docs/adr/ADR-0005-run-cancel-close-dispose.md` | `runtime-lifecycle-coordination` |
 | `docs/adr/ADR-0006-provider-handle-and-recovery-record.md` | `provider-adapter-development` |
 | `docs/adr/ADR-0007-module-format-and-exports.md` | `package-artifact-validation` |
 | `docs/adr/ADR-0008-workspace-lease-ownership.md` | `workspace-lifecycle` |
@@ -22,6 +24,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `docs/adr/ADR-0011-public-api-and-versioning.md` | `public-api-evolution` |
 | `docs/adr/ADR-0013-supply-chain-policy.md` | `pnpm-supply-chain` |
 | `docs/adr/ADR-0014-ci-and-gate-parity.md` | `local-ci-parity` |
+| `docs/adr/ADR-0016-provider-event-activation.md` | `runtime-lifecycle-coordination` |
 | `docs/architecture/foundation-v0.4.md` | `runtime-contract-evolution` |
 | `examples/consumer-smoke` | `public-api-evolution` |
 | `package.json#packageManager` | `pnpm-supply-chain` |
@@ -32,7 +35,8 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `packages/protocol/schemas` | `runtime-contract-evolution` |
 | `packages/protocol/src` | `runtime-contract-evolution` |
 | `packages/provider/src` | `provider-adapter-development` |
-| `packages/runtime/src` | `package-architecture` |
+| `packages/runtime/src` | `runtime-lifecycle-coordination` |
+| `packages/runtime/test` | `runtime-lifecycle-coordination` |
 | `packages/workspace-git/src` | `workspace-lifecycle` |
 | `packages/workspace/src` | `workspace-lifecycle` |
 | `pnpm-lock.yaml` | `pnpm-supply-chain` |
@@ -78,8 +82,8 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Path:** `.agents/skills/package-architecture/SKILL.md`
 - **Description:** Add or restructure workspace packages, wire the TypeScript project graph and keep the dependency DAG acyclic with the runtime free of concrete provider adapters.
 - **Tags:** `dag`, `layering`, `monorepo`, `pnpm-workspace`, `tsconfig`
-- **Owns:** `docs/adr/ADR-0010-package-dag-and-layering.md`, `packages/runtime/src`, `pnpm-workspace.yaml#packages`, `tools/repo/check-dag.ts`, `tools/repo/check-static.ts`, `tsconfig.base.json`, `tsconfig.json`
-- **Relationships:** `boundary-with` → `package-artifact-validation`, `boundary-with` → `pnpm-supply-chain`, `boundary-with` → `provider-adapter-development`, `delegates-to` → `public-api-evolution`
+- **Owns:** `docs/adr/ADR-0010-package-dag-and-layering.md`, `pnpm-workspace.yaml#packages`, `tools/repo/check-dag.ts`, `tools/repo/check-static.ts`, `tsconfig.base.json`, `tsconfig.json`
+- **Relationships:** `boundary-with` → `package-artifact-validation`, `boundary-with` → `pnpm-supply-chain`, `boundary-with` → `provider-adapter-development`, `boundary-with` → `runtime-lifecycle-coordination`, `delegates-to` → `public-api-evolution`
 
 ### `package-artifact-validation`
 
@@ -106,7 +110,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Description:** Implement or change an AgentProvider against the neutral SPI, including capability descriptors, run handles, interaction settlement and the in-process trust boundary.
 - **Tags:** `capabilities`, `provider`, `spi`, `trust-boundary`
 - **Owns:** `docs/adr/ADR-0006-provider-handle-and-recovery-record.md`, `docs/adr/ADR-0009-provider-trust-boundary.md`, `packages/provider/src`
-- **Relationships:** `boundary-with` → `package-architecture`, `boundary-with` → `runtime-contract-evolution`, `boundary-with` → `workspace-lifecycle`, `escalates-to` → `public-api-evolution`
+- **Relationships:** `boundary-with` → `package-architecture`, `boundary-with` → `runtime-contract-evolution`, `boundary-with` → `runtime-lifecycle-coordination`, `boundary-with` → `workspace-lifecycle`, `escalates-to` → `public-api-evolution`
 
 ### `public-api-evolution`
 
@@ -124,7 +128,16 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Description:** Change Session/Turn/Run/Interaction schemas, events, commands or JSON Schema output in @relvo-labs/agent-protocol without breaking the wire contract.
 - **Tags:** `json-schema`, `protocol`, `state-machine`, `wire-version`, `zod`
 - **Owns:** `docs/architecture/foundation-v0.4.md`, `packages/protocol/schemas`, `packages/protocol/src`, `tools/repo/generate-schemas.ts`, `tools/repo/schema-defs.ts`
-- **Relationships:** `boundary-with` → `provider-adapter-development`, `boundary-with` → `public-api-evolution`, `delegates-to` → `changesets-release`, `depends-on` → `local-ci-parity`
+- **Relationships:** `boundary-with` → `provider-adapter-development`, `boundary-with` → `public-api-evolution`, `boundary-with` → `runtime-lifecycle-coordination`, `delegates-to` → `changesets-release`, `depends-on` → `local-ci-parity`
+
+### `runtime-lifecycle-coordination`
+
+- **Version:** 1.0.0 (stable)
+- **Path:** `.agents/skills/runtime-lifecycle-coordination/SKILL.md`
+- **Description:** Coordinate in-process command idempotency, provider side effects, run supervision, session cleanup, shutdown, and replay-live lifecycle boundaries.
+- **Tags:** `cleanup`, `concurrency`, `idempotency`, `lifecycle`, `runtime`
+- **Owns:** `docs/adr/ADR-0002-command-receipts-and-idempotency.md`, `docs/adr/ADR-0005-run-cancel-close-dispose.md`, `docs/adr/ADR-0016-provider-event-activation.md`, `packages/runtime/src`, `packages/runtime/test`
+- **Relationships:** `boundary-with` → `package-architecture`, `boundary-with` → `provider-adapter-development`, `boundary-with` → `runtime-contract-evolution`, `boundary-with` → `workspace-lifecycle`, `depends-on` → `local-ci-parity`, `escalates-to` → `public-api-evolution`
 
 ### `workspace-lifecycle`
 
@@ -133,4 +146,4 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 - **Description:** Acquire, lease and release agent workspaces so that borrowed directories are never destructively mutated and managed cleanup stays ownership-bound and idempotent.
 - **Tags:** `cleanup`, `filesystem-safety`, `lease`, `workspace`
 - **Owns:** `docs/adr/ADR-0008-workspace-lease-ownership.md`, `packages/workspace-git/src`, `packages/workspace/src`
-- **Relationships:** `boundary-with` → `provider-adapter-development`, `depends-on` → `runtime-contract-evolution`
+- **Relationships:** `boundary-with` → `provider-adapter-development`, `boundary-with` → `runtime-lifecycle-coordination`, `depends-on` → `runtime-contract-evolution`

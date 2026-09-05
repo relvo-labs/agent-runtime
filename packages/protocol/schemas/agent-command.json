@@ -403,8 +403,7 @@
       "required": [
         "commandId",
         "type",
-        "sessionId",
-        "ifRunActive"
+        "sessionId"
       ],
       "type": "object"
     }

@@ -128,6 +128,40 @@ describe('git workspace boundary', () => {
     expect(commands).toEqual([]);
   });
 
+  it('accepts only leases nominally issued by this provider and ignores prototype tampering', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'relvo-git-authority-test-'));
+    roots.push(root);
+    const borrowed = join(root, 'borrowed');
+    const callerData = join(root, 'caller-data');
+    await Promise.all([mkdir(borrowed), mkdir(callerData)]);
+    const commands: GitCommand[] = [];
+    const provider = createGitWorkspaceProvider({
+      baseDirectory: join(root, 'managed'),
+      clock: createFixedClock(),
+      idFactory: createCounterIdFactory(),
+      runGit: (command) => {
+        commands.push(command);
+        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+      },
+    });
+    const lease = await provider.acquire({ kind: 'existing', path: borrowed });
+    const prototype = Object.getPrototypeOf(lease) as object;
+    expect(Object.isFrozen(prototype)).toBe(true);
+    expect(Reflect.defineProperty(prototype, 'ownership', { get: () => 'managed' })).toBe(false);
+    expect(Reflect.defineProperty(prototype, 'root', { get: () => callerData })).toBe(false);
+    await expect(provider.git(lease, ['diff', '--output=/tmp/outside'])).rejects.toThrow();
+    const forged = {
+      leaseId: lease.leaseId,
+      ownership: 'borrowed' as const,
+      root: borrowed,
+      acquiredAt: lease.acquiredAt,
+      describe: () => lease.describe(),
+      release: () => lease.release(),
+    };
+    await expect(provider.git(forged, ['status', '--short'])).rejects.toThrow();
+    expect(commands).toEqual([]);
+  });
+
   it('cleans an owned root when clone setup fails', async () => {
     const root = await mkdtemp(join(tmpdir(), 'relvo-git-test-'));
     roots.push(root);

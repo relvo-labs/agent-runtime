@@ -19,11 +19,6 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "supported",
-        "modes",
-        "blocking"
-      ],
       "type": "object"
     },
     "approval-mode": {
@@ -59,8 +54,7 @@
       },
       "required": [
         "approval",
-        "question",
-        "settlementTimeoutMs"
+        "question"
       ],
       "type": "object"
     },
@@ -86,9 +80,7 @@
             }
           },
           "required": [
-            "mode",
-            "deliversPartialOutput",
-            "sessionRemainsUsable"
+            "mode"
           ],
           "type": "object"
         },
@@ -111,9 +103,7 @@
             }
           },
           "required": [
-            "mode",
-            "deliversPartialOutput",
-            "sessionRemainsUsable"
+            "mode"
           ],
           "type": "object"
         }
@@ -162,11 +152,6 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "supported",
-        "choices",
-        "multiSelect"
-      ],
       "type": "object"
     },
     "recovery-capability": {
@@ -185,10 +170,6 @@
               "type": "boolean"
             }
           },
-          "required": [
-            "exportsRecoveryRecord",
-            "resumesFromRecoveryRecord"
-          ],
           "type": "object"
         },
         {
@@ -204,8 +185,7 @@
             }
           },
           "required": [
-            "exportsRecoveryRecord",
-            "resumesFromRecoveryRecord"
+            "exportsRecoveryRecord"
           ],
           "type": "object"
         }
@@ -229,8 +209,7 @@
       },
       "required": [
         "interrupt",
-        "streaming",
-        "maxConcurrentRunsPerSession"
+        "streaming"
       ],
       "type": "object"
     },
@@ -250,11 +229,6 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "messageDeltas",
-        "toolActivity",
-        "incrementalUsage"
-      ],
       "type": "object"
     },
     "workspace-capability": {
@@ -287,9 +261,7 @@
         }
       },
       "required": [
-        "requires",
-        "acceptsOwnership",
-        "writes"
+        "requires"
       ],
       "type": "object"
     }
@@ -307,7 +279,6 @@
       "additionalProperties": {
         "$ref": "#/$defs/json-value"
       },
-      "default": {},
       "propertyNames": {
         "type": "string"
       },
@@ -350,8 +321,7 @@
     "run",
     "interaction",
     "workspace",
-    "recovery",
-    "extensions"
+    "recovery"
   ],
   "title": "provider-descriptor",
   "type": "object",

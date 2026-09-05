@@ -20,6 +20,7 @@ export const REQUIRED_SKILLS: readonly string[] = [
   'provider-adapter-development',
   'public-api-evolution',
   'runtime-contract-evolution',
+  'runtime-lifecycle-coordination',
   'workspace-lifecycle',
 ];
 

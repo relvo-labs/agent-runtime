@@ -23,6 +23,7 @@ import {
   canTransition,
   isCommandAdmissible,
   isJsonValue,
+  JsonValueSchema,
   SubscriptionRequestSchema,
   toAgentError,
   WIRE_VERSION,
@@ -128,12 +129,48 @@ type LiveSession = {
   turnAttempts: Map<TurnId, number>;
   startingRun: boolean;
   closing: boolean;
+  /** Synchronous fence set before awaiting a provider interrupt. */
+  readonly interruptingRuns: Set<RunId>;
 };
 
 type CommandAttempt = {
   readonly fingerprint: string;
   readonly acceptedAt: Timestamp;
+  readonly command?: AgentCommand;
+};
+
+type StagedProviderSink = {
+  readonly sink: { emit(input: ProviderEventInput): void };
+  activate(): Promise<void>;
+  discard(): void;
+};
+
+type PendingSubmit = {
+  readonly command: Extract<AgentCommand, { type: 'submit_turn' }>;
+  readonly acceptedAt: Timestamp;
+  readonly turnId: TurnId;
+  readonly runId: RunId;
+  readonly attempt: number;
+  readonly providerRun: ProviderRun;
+  readonly runEvents: StagedProviderSink;
+};
+
+type PendingInterrupt = {
+  readonly command: Extract<AgentCommand, { type: 'interrupt_run' }>;
+  readonly acceptedAt: Timestamp;
+  readonly delivered: boolean;
+};
+
+type PendingResponse = {
+  readonly command: Extract<AgentCommand, { type: 'respond_to_interaction' }>;
+  readonly acceptedAt: Timestamp;
+  readonly interaction: NonNullable<Awaited<ReturnType<RuntimeStore['readInteraction']>>>;
+  readonly runId: RunId;
+};
+
+type PendingRejection = {
   readonly command: AgentCommand;
+  readonly receipt: CommandReceipt;
 };
 
 type OpenRollback = {
@@ -159,6 +196,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const sessionQueues = new Map<string, Promise<void>>();
   const commandAttempts = new Map<CommandId, CommandAttempt>();
   const openRollbacks = new Map<CommandId, OpenRollback>();
+  const pendingSubmits = new Map<CommandId, PendingSubmit>();
+  const pendingInterrupts = new Map<CommandId, PendingInterrupt>();
+  const pendingResponses = new Map<CommandId, PendingResponse>();
+  const pendingRejections = new Map<CommandId, PendingRejection>();
   let lifecycle: 'accepting' | 'shutting_down' | 'shut_down' = 'accepting';
   let shutdownPromise: Promise<void> | undefined;
 
@@ -176,15 +217,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   function coordinateCommand<T>(input: unknown, operation: () => Promise<T>): Promise<T> {
-    const candidate =
-      typeof input === 'object' && input !== null ? (input as { commandId?: unknown; sessionId?: unknown }) : {};
+    const commandId = ownDataString(input, 'commandId');
+    const sessionId = ownDataString(input, 'sessionId');
     const withinSession = (): Promise<T> =>
-      typeof candidate.sessionId === 'string'
-        ? serializeByKey(sessionQueues, candidate.sessionId, operation)
-        : operation();
-    return typeof candidate.commandId === 'string'
-      ? serializeByKey(commandQueues, candidate.commandId, withinSession)
-      : withinSession();
+      sessionId !== undefined ? serializeByKey(sessionQueues, sessionId, operation) : operation();
+    return commandId !== undefined ? serializeByKey(commandQueues, commandId, withinSession) : withinSession();
   }
 
   function coordinateMutation<T>(input: unknown, operation: () => Promise<T>): Promise<T> {
@@ -358,29 +395,137 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     ): { success: true; data: T } | { success: false; error: { issues: readonly { message: string }[] } };
   };
 
+  function ownDataString(value: unknown, key: string): string | undefined {
+    try {
+      if (typeof value !== 'object' || value === null) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string'
+        ? descriptor.value
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function invalidFingerprint(raw: unknown): string {
+    try {
+      const parsed = JsonValueSchema.safeParse(raw);
+      if (!parsed.success) return 'invalid:unsafe-input';
+      const canonicalize = (value: typeof parsed.data): typeof parsed.data => {
+        if (Array.isArray(value)) return value.map(canonicalize);
+        if (value === null || typeof value !== 'object') return value;
+        return Object.fromEntries(
+          Object.entries(value)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, child]) => [key, canonicalize(child)]),
+        );
+      };
+      return `invalid:${JSON.stringify(canonicalize(parsed.data))}`;
+    } catch {
+      return 'invalid:unsafe-input';
+    }
+  }
+
+  type InvalidCommand = {
+    readonly commandId: CommandId;
+    readonly commandType: AgentCommand['type'];
+    readonly acceptedAt: Timestamp;
+    readonly fingerprint: string;
+    readonly receipt: CommandReceipt;
+  };
+  const pendingInvalids = new Map<CommandId, InvalidCommand>();
+
   function parseCommand<T extends AgentCommand>(
     schema: SafeParser<T>,
     raw: unknown,
     commandType: T['type'],
-  ): { ok: true; command: T } | { ok: false; receipt: CommandReceipt } {
-    const parsed = schema.safeParse(raw);
+  ): { ok: true; command: T } | { ok: false; invalid: InvalidCommand } {
+    let parsed: ReturnType<SafeParser<T>['safeParse']>;
+    try {
+      parsed = schema.safeParse(raw);
+    } catch {
+      parsed = { success: false, error: { issues: [{ message: 'command could not be inspected safely' }] } };
+    }
     if (parsed.success) return { ok: true, command: parsed.data };
 
-    const partial = (raw ?? {}) as { commandId?: unknown };
-    const commandId = CommandIdSchema.safeParse(partial.commandId);
+    const commandId = CommandIdSchema.safeParse(ownDataString(raw, 'commandId'));
     if (!commandId.success) {
       throw new AgentRuntimeError(agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'));
     }
+    const acceptedAt = clock.now();
     return {
       ok: false,
-      receipt: CommandReceiptSchema.parse({
+      invalid: {
         commandId: commandId.data,
         commandType,
-        disposition: 'rejected',
-        error: agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'),
-        acceptedAt: clock.now(),
-      }),
+        acceptedAt,
+        fingerprint: invalidFingerprint(raw),
+        receipt: CommandReceiptSchema.parse({
+          commandId: commandId.data,
+          commandType,
+          disposition: 'rejected',
+          error: agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'),
+          acceptedAt,
+        }),
+      },
     };
+  }
+
+  async function invalidCommandOutcome(invalid: InvalidCommand): Promise<CommandReceipt> {
+    const existing = await store.findReceipt(invalid.commandId);
+    if (existing !== undefined) {
+      if (existing.fingerprint === invalid.fingerprint) return existing.receipt;
+      return CommandReceiptSchema.parse({
+        commandId: invalid.commandId,
+        commandType: invalid.commandType,
+        disposition: 'rejected',
+        error: agentError(
+          'command_id_conflict',
+          `command id \`${invalid.commandId}\` was already used with a different payload`,
+        ),
+        acceptedAt: existing.receipt.acceptedAt,
+      });
+    }
+    const retained = pendingInvalids.get(invalid.commandId);
+    if (retained !== undefined && retained.fingerprint !== invalid.fingerprint) {
+      return CommandReceiptSchema.parse({
+        commandId: invalid.commandId,
+        commandType: invalid.commandType,
+        disposition: 'rejected',
+        error: agentError(
+          'command_id_conflict',
+          `command id \`${invalid.commandId}\` was already used with a different payload`,
+        ),
+        acceptedAt: retained.acceptedAt,
+      });
+    }
+    const canonical = retained ?? invalid;
+    const attempt = commandAttempts.get(canonical.commandId);
+    if (attempt !== undefined && attempt.fingerprint !== invalid.fingerprint) {
+      return CommandReceiptSchema.parse({
+        commandId: invalid.commandId,
+        commandType: invalid.commandType,
+        disposition: 'rejected',
+        error: agentError(
+          'command_id_conflict',
+          `command id \`${invalid.commandId}\` was already used with a different payload`,
+        ),
+        acceptedAt: attempt.acceptedAt,
+      });
+    }
+    if (attempt === undefined) {
+      commandAttempts.set(canonical.commandId, {
+        fingerprint: canonical.fingerprint,
+        acceptedAt: canonical.acceptedAt,
+      });
+      pendingInvalids.set(canonical.commandId, canonical);
+    }
+    await store.commit((tx) => {
+      tx.recordReceipt(canonical.commandId, { fingerprint: canonical.fingerprint, receipt: canonical.receipt });
+    });
+    commandAttempts.delete(canonical.commandId);
+    pendingInvalids.delete(canonical.commandId);
+    return canonical.receipt;
   }
 
   async function commitAndPublish<T>(
@@ -478,6 +623,19 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         const session = live.get(sessionId);
         const run = tx.session(sessionId).runs.get(runId);
         if (!session || !run) return;
+        if (session.interruptingRuns.has(runId)) {
+          tx.emit({
+            sessionId,
+            runId,
+            payload: {
+              type: 'diagnostic',
+              level: 'warning',
+              message: 'provider contract violation: emitted `interaction.requested` after interruption was requested',
+              detail: { code: 'provider_contract_violation' },
+            },
+          });
+          return;
+        }
         if (run.state !== 'running' && run.state !== 'awaiting_interaction') {
           tx.emit({
             sessionId,
@@ -595,7 +753,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
     const settle = async (completion: unknown, rejected: boolean): Promise<void> => {
       await serializeByKey(sessionQueues, sessionId, async () => {
-        const parsed = rejected ? undefined : ProviderRunTerminationSchema.safeParse(completion);
+        let parsed: ReturnType<typeof ProviderRunTerminationSchema.safeParse> | undefined;
+        let inspectionFailed = false;
+        if (!rejected) {
+          try {
+            parsed = ProviderRunTerminationSchema.safeParse(completion);
+          } catch {
+            inspectionFailed = true;
+          }
+        }
         const stamped =
           parsed?.success === true
             ? { ...parsed.data, at: clock.now() }
@@ -606,7 +772,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
                   'provider_contract_violation',
                   rejected
                     ? 'provider completion promise rejected instead of returning a terminal outcome'
-                    : `provider returned an invalid completion: ${parsed?.error.issues[0]?.message ?? 'schema mismatch'}`,
+                    : inspectionFailed
+                      ? 'provider completion could not be inspected safely'
+                      : `provider returned an invalid completion: ${parsed?.error.issues[0]?.message ?? 'schema mismatch'}`,
                 ),
               };
         try {
@@ -673,6 +841,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           const session = live.get(sessionId);
           if (session) {
             session.runs.delete(runId);
+            session.interruptingRuns.delete(runId);
             for (const [interactionId, interactionRunId] of session.interactionRuns) {
               if (interactionRunId !== runId) continue;
               const providerRef = session.interactionRefs.get(interactionId);
@@ -702,7 +871,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
   async function openSession(input: OpenSessionCommandInput): Promise<CommandReceipt> {
     const parsed = parseCommand(OpenSessionCommandSchema, input, 'open_session');
-    if (!parsed.ok) return parsed.receipt;
+    if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
 
     const existing = await existingCommandOutcome(command);
@@ -726,7 +895,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       const descriptor = registry.descriptor(command.providerId);
       lease = await options.workspaces.acquire(command.workspace);
       leaseSafeToRelease = command.workspace.kind === 'managed' && lease.ownership === 'managed';
-      const leaseDescriptor = validateWorkspaceLease(command.workspace, lease);
+      const leaseDescriptor = await validateWorkspaceLease(command.workspace, lease);
       leaseSafeToRelease = true;
       const workspaceCapability = canAcceptWorkspace(descriptor, lease.ownership);
       if (!workspaceCapability.ok) throw new AgentRuntimeError(workspaceCapability.error);
@@ -761,6 +930,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         turnAttempts: new Map(),
         startingRun: false,
         closing: false,
+        interruptingRuns: new Set(),
       });
 
       const result: CommandResult = { type: 'session_opened', sessionId };
@@ -816,14 +986,55 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     return session;
   }
 
+  async function finishPendingSubmit(pendingSubmit: PendingSubmit): Promise<CommandReceipt> {
+    const { command, acceptedAt, turnId, runId, attempt, providerRun, runEvents } = pendingSubmit;
+    const produced = await commitAndPublish((tx) => {
+      tx.emit({ sessionId: command.sessionId, payload: { type: 'turn.started', turnId, input: command.input } });
+      tx.emit({ sessionId: command.sessionId, runId, payload: { type: 'run.started', turnId, attempt } });
+      const value = receipt(
+        command,
+        'applied',
+        {
+          result: { type: 'turn_accepted', sessionId: command.sessionId, turnId, runId },
+          sequence: tx.session(command.sessionId).session.sequence,
+        },
+        acceptedAt,
+      );
+      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
+      return value;
+    });
+    pendingSubmits.delete(command.commandId);
+    commandAttempts.delete(command.commandId);
+    await runEvents.activate();
+    superviseRun(command.sessionId, turnId, runId, providerRun);
+    return produced;
+  }
+
+  async function finishPendingRejection(pendingRejection: PendingRejection): Promise<CommandReceipt> {
+    const { command, receipt: rejected } = pendingRejection;
+    await store.commit((tx) => {
+      tx.recordReceipt(command.commandId, {
+        fingerprint: canonicalCommandFingerprint(command),
+        receipt: rejected,
+      });
+    });
+    pendingRejections.delete(command.commandId);
+    commandAttempts.delete(command.commandId);
+    return rejected;
+  }
+
   async function submitTurn(input: SubmitTurnCommandInput): Promise<CommandReceipt> {
     const parsed = parseCommand(SubmitTurnCommandSchema, input, 'submit_turn');
-    if (!parsed.ok) return parsed.receipt;
+    if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
 
-    const acceptedAt = clock.now();
+    const acceptedAt = commandAttempts.get(command.commandId)?.acceptedAt ?? clock.now();
     const existing = await existingCommandOutcome(command);
     if (existing !== undefined) return existing;
+    const pendingRejection = pendingRejections.get(command.commandId);
+    if (pendingRejection !== undefined) return await finishPendingRejection(pendingRejection);
+    const pendingSubmit = pendingSubmits.get(command.commandId);
+    if (pendingSubmit !== undefined) return await finishPendingSubmit(pendingSubmit);
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'submit_turn', acceptedAt);
@@ -855,6 +1066,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
     let providerRun: ProviderRun;
     const runEvents = stagedSinkFor(command.sessionId, runId, 'run');
+    reserveCommandAttempt(command, acceptedAt);
     session.startingRun = true;
     try {
       providerRun = await session.providerSession.startRun({
@@ -864,50 +1076,107 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       });
     } catch (error) {
       runEvents.discard();
-      return await rejectAndRecord(
+      const rejected = receipt(
         command,
-        receipt(
-          command,
-          'rejected',
-          { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
-          acceptedAt,
-        ),
+        'rejected',
+        { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
+        acceptedAt,
       );
+      const retained = { command, receipt: rejected } satisfies PendingRejection;
+      pendingRejections.set(command.commandId, retained);
+      return await finishPendingRejection(retained);
     } finally {
       session.startingRun = false;
     }
 
     session.runs.set(runId, providerRun);
+    const retained = { command, acceptedAt, turnId, runId, attempt, providerRun, runEvents } satisfies PendingSubmit;
+    pendingSubmits.set(command.commandId, retained);
+    return await finishPendingSubmit(retained);
+  }
 
-    const produced = await commitAndPublish((tx) => {
-      tx.emit({ sessionId: command.sessionId, payload: { type: 'turn.started', turnId, input: command.input } });
-      tx.emit({ sessionId: command.sessionId, runId, payload: { type: 'run.started', turnId, attempt } });
-      const value = receipt(
+  async function finishPendingInterrupt(pendingInterrupt: PendingInterrupt): Promise<CommandReceipt> {
+    const { command, acceptedAt, delivered } = pendingInterrupt;
+    const value = await commitAndPublish((tx) => {
+      const run = tx.session(command.sessionId).runs.get(command.runId);
+      if (run && run.termination === undefined && run.state !== 'interrupting') {
+        tx.emit({
+          sessionId: command.sessionId,
+          runId: command.runId,
+          payload: { type: 'run.state_changed', from: run.state, to: 'interrupting' },
+        });
+      }
+      const produced = receipt(
         command,
         'applied',
         {
-          result: { type: 'turn_accepted', sessionId: command.sessionId, turnId, runId },
+          result: { type: 'run_interrupt_requested', sessionId: command.sessionId, runId: command.runId, delivered },
           sequence: tx.session(command.sessionId).session.sequence,
         },
         acceptedAt,
       );
-      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
-      return value;
+      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: produced });
+      return produced;
     });
+    pendingInterrupts.delete(command.commandId);
+    commandAttempts.delete(command.commandId);
+    live.get(command.sessionId)?.interruptingRuns.delete(command.runId);
+    return value;
+  }
 
-    await runEvents.activate();
-    superviseRun(command.sessionId, turnId, runId, providerRun);
-    return produced;
+  async function finishPendingResponse(pendingResponse: PendingResponse): Promise<CommandReceipt> {
+    const { command, acceptedAt, interaction, runId } = pendingResponse;
+    const value = await commitAndPublish((tx) => {
+      const current = tx.session(command.sessionId).interactions.get(command.interactionId);
+      if (current === undefined || current.status === 'settled') {
+        const rejected = receipt(
+          command,
+          'rejected',
+          { error: agentError('interaction_already_settled', `interaction \`${command.interactionId}\` is settled`) },
+          acceptedAt,
+        );
+        tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: rejected });
+        return rejected;
+      }
+      tx.emit({
+        sessionId: command.sessionId,
+        runId,
+        payload: {
+          type: 'interaction.settled',
+          interactionId: command.interactionId,
+          turnId: interaction.turnId,
+          settlement: { outcome: 'responded', settledAt: clock.now(), response: command.response },
+        },
+      });
+      const produced = receipt(
+        command,
+        'applied',
+        {
+          result: { type: 'interaction_settled', sessionId: command.sessionId, interactionId: command.interactionId },
+          sequence: tx.session(command.sessionId).session.sequence,
+        },
+        acceptedAt,
+      );
+      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: produced });
+      return produced;
+    });
+    pendingResponses.delete(command.commandId);
+    commandAttempts.delete(command.commandId);
+    return value;
   }
 
   async function interruptRun(input: InterruptRunCommandInput): Promise<CommandReceipt> {
     const parsed = parseCommand(InterruptRunCommandSchema, input, 'interrupt_run');
-    if (!parsed.ok) return parsed.receipt;
+    if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
 
-    const acceptedAt = clock.now();
+    const acceptedAt = commandAttempts.get(command.commandId)?.acceptedAt ?? clock.now();
     const existing = await existingCommandOutcome(command);
     if (existing !== undefined) return existing;
+    const pendingRejection = pendingRejections.get(command.commandId);
+    if (pendingRejection !== undefined) return await finishPendingRejection(pendingRejection);
+    const pendingInterrupt = pendingInterrupts.get(command.commandId);
+    if (pendingInterrupt !== undefined) return await finishPendingInterrupt(pendingInterrupt);
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'interrupt_run', acceptedAt);
@@ -923,54 +1192,42 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     // An already-terminal run is not an error: the caller's intent ("this run
     // must not continue") is satisfied. `delivered` reports what happened.
     let delivered = false;
+    reserveCommandAttempt(command, acceptedAt);
     if (providerRun) {
+      session.interruptingRuns.add(command.runId);
       try {
         await providerRun.interrupt(command.reason);
         delivered = true;
       } catch (error) {
-        return await rejectAndRecord(
+        session.interruptingRuns.delete(command.runId);
+        const rejected = receipt(
           command,
-          receipt(
-            command,
-            'rejected',
-            { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
-            acceptedAt,
-          ),
+          'rejected',
+          { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
+          acceptedAt,
         );
+        const retained = { command, receipt: rejected } satisfies PendingRejection;
+        pendingRejections.set(command.commandId, retained);
+        return await finishPendingRejection(retained);
       }
     }
-
-    return await commitAndPublish((tx) => {
-      const run = tx.session(command.sessionId).runs.get(command.runId);
-      if (run && run.termination === undefined && run.state !== 'interrupting') {
-        tx.emit({
-          sessionId: command.sessionId,
-          runId: command.runId,
-          payload: { type: 'run.state_changed', from: run.state, to: 'interrupting' },
-        });
-      }
-      const value = receipt(
-        command,
-        'applied',
-        {
-          result: { type: 'run_interrupt_requested', sessionId: command.sessionId, runId: command.runId, delivered },
-          sequence: tx.session(command.sessionId).session.sequence,
-        },
-        acceptedAt,
-      );
-      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
-      return value;
-    });
+    const retained = { command, acceptedAt, delivered } satisfies PendingInterrupt;
+    pendingInterrupts.set(command.commandId, retained);
+    return await finishPendingInterrupt(retained);
   }
 
   async function respondToInteraction(input: RespondToInteractionCommandInput): Promise<CommandReceipt> {
     const parsed = parseCommand(RespondToInteractionCommandSchema, input, 'respond_to_interaction');
-    if (!parsed.ok) return parsed.receipt;
+    if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
 
-    const acceptedAt = clock.now();
+    const acceptedAt = commandAttempts.get(command.commandId)?.acceptedAt ?? clock.now();
     const existing = await existingCommandOutcome(command);
     if (existing !== undefined) return existing;
+    const pendingRejection = pendingRejections.get(command.commandId);
+    if (pendingRejection !== undefined) return await finishPendingRejection(pendingRejection);
+    const pendingResponse = pendingResponses.get(command.commandId);
+    if (pendingResponse !== undefined) return await finishPendingResponse(pendingResponse);
 
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'respond_to_interaction', acceptedAt);
@@ -1048,59 +1305,52 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       );
     }
 
+    reserveCommandAttempt(command, acceptedAt);
     try {
       await session.providerSession.respondToInteraction(providerRef, command.response);
     } catch (error) {
-      return await rejectAndRecord(
+      const rejected = receipt(
         command,
-        receipt(
-          command,
-          'rejected',
-          { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
-          acceptedAt,
-        ),
-      );
-    }
-
-    return await commitAndPublish((tx) => {
-      const current = tx.session(command.sessionId).interactions.get(command.interactionId);
-      if (current === undefined || current.status === 'settled') {
-        const value = receipt(
-          command,
-          'rejected',
-          { error: agentError('interaction_already_settled', `interaction \`${command.interactionId}\` is settled`) },
-          acceptedAt,
-        );
-        tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
-        return value;
-      }
-      tx.emit({
-        sessionId: command.sessionId,
-        runId,
-        payload: {
-          type: 'interaction.settled',
-          interactionId: command.interactionId,
-          turnId: interaction.turnId,
-          settlement: { outcome: 'responded', settledAt: clock.now(), response: command.response },
-        },
-      });
-      const value = receipt(
-        command,
-        'applied',
-        {
-          result: { type: 'interaction_settled', sessionId: command.sessionId, interactionId: command.interactionId },
-          sequence: tx.session(command.sessionId).session.sequence,
-        },
+        'rejected',
+        { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
         acceptedAt,
       );
-      tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
-      return value;
-    });
+      const retained = { command, receipt: rejected } satisfies PendingRejection;
+      pendingRejections.set(command.commandId, retained);
+      return await finishPendingRejection(retained);
+    }
+    const retained = { command, acceptedAt, interaction, runId } satisfies PendingResponse;
+    pendingResponses.set(command.commandId, retained);
+    return await finishPendingResponse(retained);
+  }
+
+  function clearRetainedSessionCommands(sessionId: SessionId): void {
+    for (const [commandId, pendingSubmit] of pendingSubmits) {
+      if (pendingSubmit.command.sessionId !== sessionId) continue;
+      pendingSubmit.runEvents.discard();
+      pendingSubmits.delete(commandId);
+      commandAttempts.delete(commandId);
+    }
+    for (const [commandId, pendingInterrupt] of pendingInterrupts) {
+      if (pendingInterrupt.command.sessionId !== sessionId) continue;
+      pendingInterrupts.delete(commandId);
+      commandAttempts.delete(commandId);
+    }
+    for (const [commandId, pendingResponse] of pendingResponses) {
+      if (pendingResponse.command.sessionId !== sessionId) continue;
+      pendingResponses.delete(commandId);
+      commandAttempts.delete(commandId);
+    }
+    for (const [commandId, pendingRejection] of pendingRejections) {
+      if (!('sessionId' in pendingRejection.command) || pendingRejection.command.sessionId !== sessionId) continue;
+      pendingRejections.delete(commandId);
+      commandAttempts.delete(commandId);
+    }
   }
 
   async function closeSession(input: CloseSessionCommandInput, internal = false): Promise<CommandReceipt> {
     const parsed = parseCommand(CloseSessionCommandSchema, input, 'close_session');
-    if (!parsed.ok) return parsed.receipt;
+    if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
 
     let acceptedAt: Timestamp;
@@ -1172,7 +1422,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     // terminal event.
     let interruptedActiveRun = false;
     const interruptFailures: CleanupFailure[] = [];
-    for (const [, providerRun] of activeRuns) {
+    for (const [runId, providerRun] of activeRuns) {
+      if (session.interruptingRuns.has(runId)) {
+        // A retained interrupt already reached the provider; cleanup must not
+        // redeliver it merely because receipt persistence failed.
+        interruptedActiveRun = true;
+        continue;
+      }
       try {
         await providerRun.interrupt('session closing');
         interruptedActiveRun = true;
@@ -1288,9 +1544,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       return value;
     });
     live.delete(command.sessionId);
+    clearRetainedSessionCommands(command.sessionId);
     if (internal) {
       for (const [commandId, attempt] of commandAttempts) {
-        if ('sessionId' in attempt.command && attempt.command.sessionId === command.sessionId) {
+        if (attempt.command && 'sessionId' in attempt.command && attempt.command.sessionId === command.sessionId) {
           commandAttempts.delete(commandId);
         }
       }
@@ -1375,6 +1632,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         receipt: rejection,
       });
     });
+    commandAttempts.delete(command.commandId);
     return rejection;
   }
 
@@ -1387,6 +1645,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     await store.commit((tx) => {
       tx.recordReceipt(command.commandId, { fingerprint: canonicalCommandFingerprint(command), receipt: value });
     });
+    commandAttempts.delete(command.commandId);
     return value;
   }
 
@@ -1410,7 +1669,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     closeSession: (command) => coordinateMutation(command, () => closeSession(command)),
 
     dispatch(rawCommand: AgentCommandInput): Promise<CommandReceipt> {
-      const commandType = (rawCommand as { readonly type?: unknown }).type;
+      const commandType = ownDataString(rawCommand, 'type');
       switch (commandType) {
         case 'open_session':
           return coordinateMutation(rawCommand, () => openSession(rawCommand as OpenSessionCommandInput));

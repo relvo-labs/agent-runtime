@@ -155,7 +155,7 @@ describe('workspace ownership', () => {
     expect(removalCount).toBe(2);
   });
 
-  it('validates and cross-checks third-party lease descriptors', () => {
+  it('validates and cross-checks third-party lease descriptors', async () => {
     const clock = createFixedClock();
     const leaseId = WorkspaceLeaseIdSchema.parse(createCounterIdFactory().next('workspaceLease'));
     const acquiredAt = clock.now();
@@ -173,7 +173,7 @@ describe('workspace ownership', () => {
       }),
       release: () => Promise.reject(new Error('not called')),
     };
-    expect(validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, valid)).toMatchObject({
+    await expect(validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, valid)).resolves.toMatchObject({
       ownership: 'borrowed',
       root: '/borrowed',
     });
@@ -183,12 +183,43 @@ describe('workspace ownership', () => {
       ownership: 'managed',
       describe: () => ({ ...valid.describe(), ownership: 'managed' }),
     };
-    expect(() => validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, mismatched)).toThrow();
+    await expect(validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, mismatched)).rejects.toThrow();
     const malformed: WorkspaceLease = {
       ...valid,
       describe: () => ({ ...valid.describe(), root: 42 }) as never,
     };
-    expect(() => validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, malformed)).toThrow();
+    await expect(validateWorkspaceLease({ kind: 'existing', path: '/borrowed' }, malformed)).rejects.toThrow();
+  });
+
+  it.each(['../escaped', '..', '.', '/absolute', 'nested/name', 'nested\\name'])(
+    'runtime-validates hostile managed workspace name %j before filesystem effects',
+    async (name) => {
+      const { baseDirectory, provider } = await fixture();
+      await expect(provider.acquire({ kind: 'managed', name } as never)).rejects.toMatchObject({
+        error: { code: 'invalid_request' },
+      });
+      await expect(stat(baseDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+
+  it('binds an existing lease root to the requested path realpath', async () => {
+    const { root, borrowed } = await fixture();
+    const redirected = join(root, 'redirected');
+    await mkdir(redirected);
+    const clock = createFixedClock();
+    const leaseId = WorkspaceLeaseIdSchema.parse(createCounterIdFactory().next('workspaceLease'));
+    const acquiredAt = clock.now();
+    const lease: WorkspaceLease = {
+      leaseId,
+      ownership: 'borrowed',
+      root: redirected,
+      acquiredAt,
+      describe: () => ({ leaseId, ownership: 'borrowed', root: redirected, acquiredAt, released: false }),
+      release: () => Promise.reject(new Error('must not release redirected borrowed lease')),
+    };
+    await expect(validateWorkspaceLease({ kind: 'existing', path: borrowed }, lease)).rejects.toMatchObject({
+      error: { code: 'workspace_ownership_violation' },
+    });
   });
 
   it('does not claim a pre-existing named directory as managed', async () => {

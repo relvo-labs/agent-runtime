@@ -30,3 +30,21 @@ private authority state, while borrowed-Git validates primitive argv and execute
 copy immune to serialization/prototype tricks. Line-bound wire documents enforce exact v0.4 in
 Zod and JSON Schema. Zod/JSON Schema safety refinements have executable parity evidence. No
 package publication or live provider integration is included.
+
+Transient persistence failures after submit, response, or interrupt retain one in-memory
+logical effect for exact retry without repeating the provider call; validation rejections
+reserve safely inspected command IDs, and an interrupt fence rejects concurrent late
+interactions. Hostile completion/accessor inputs normalize without throwing. Workspace
+acquisition runtime-validates specs, binds borrowed roots to the requested realpath, and Git
+operations require nominal provider-issued leases. Generated schemas now describe accepted
+Zod input, including default-filled omissions. `validateWorkspaceLease` is now asynchronous
+to perform canonical path validation.
+
+Transient persistence failures after submit, response, or interrupt retain one in-memory
+logical effect for exact retry without repeating the provider call; validation rejections
+reserve safely inspected command IDs, and an interrupt fence rejects concurrent late
+interactions. Hostile completion/accessor inputs normalize without throwing. Workspace
+acquisition runtime-validates specs, binds borrowed roots to the requested realpath, and Git
+operations require nominal provider-issued leases. Generated schemas now describe accepted
+Zod input, including default-filled omissions. `validateWorkspaceLease` is now asynchronous
+to perform canonical path validation.

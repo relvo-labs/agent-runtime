@@ -31,8 +31,7 @@
       },
       "required": [
         "code",
-        "message",
-        "retryable"
+        "message"
       ],
       "type": "object"
     },
@@ -144,8 +143,7 @@
         "leaseId",
         "ownership",
         "root",
-        "acquiredAt",
-        "released"
+        "acquiredAt"
       ],
       "type": "object"
     },
@@ -206,8 +204,7 @@
     "wireVersion",
     "workspace",
     "createdAt",
-    "sequence",
-    "turnIds"
+    "sequence"
   ],
   "title": "agent-session",
   "type": "object",

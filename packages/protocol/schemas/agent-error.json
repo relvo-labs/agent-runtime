@@ -31,8 +31,7 @@
       },
       "required": [
         "code",
-        "message",
-        "retryable"
+        "message"
       ],
       "type": "object"
     },

@@ -34,7 +34,6 @@ Do not use this skill when:
 - `tsconfig.base.json` — shared compiler options
 - `tsconfig.json` — the workspace typecheck project and its `paths` map
 - `pnpm-workspace.yaml#packages` — workspace globs
-- `packages/runtime/src` — the composition root, provider registry and store seam
 - `docs/adr/ADR-0010-package-dag-and-layering.md` — the layering decision record
 
 ## Does not own
@@ -44,12 +43,14 @@ Do not use this skill when:
 - `packages/protocol/src` — owned by `runtime-contract-evolution`
 - `packages/provider/src` — owned by `provider-adapter-development`
 - `packages/workspace/src` — owned by `workspace-lifecycle`
+- `packages/runtime/src` — owned by `runtime-lifecycle-coordination`
 
 ## Relationships
 
 - `boundary-with` → `pnpm-supply-chain` — this skill governs _workspace_ edges; that skill governs _third-party_ edges. Both write `package.json`; neither writes the other's dependency class.
 - `boundary-with` → `package-artifact-validation` — this skill decides that a package exists and what it may depend on; that skill decides how it is built and packed.
 - `boundary-with` → `provider-adapter-development` — that skill owns the SPI contract; this skill owns which packages may import it.
+- `boundary-with` → `runtime-lifecycle-coordination` — this skill owns dependency direction; that skill owns runtime behavior inside the package.
 - `delegates-to` → `public-api-evolution` — a new package entry point is a public surface.
 
 ## Procedure

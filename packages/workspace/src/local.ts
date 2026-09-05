@@ -12,6 +12,7 @@ import {
   AgentRuntimeError,
   agentError,
   ownershipFor,
+  WorkspaceSpecSchema,
   WorkspaceLeaseDescriptorSchema,
   type Clock,
   type IdFactory,
@@ -23,7 +24,7 @@ import {
   type WorkspaceSpec,
 } from '@relvo-labs/agent-protocol';
 
-import { assertRemovable, resolveRealPath } from './safety.ts';
+import { assertRemovable, isStrictlyInside, resolveRealPath } from './safety.ts';
 import type { BorrowedWorkspaceLease, ManagedWorkspaceLease, WorkspaceLease, WorkspaceProvider } from './spi.ts';
 
 export type LocalWorkspaceProviderOptions = {
@@ -134,8 +135,29 @@ class LocalLease<O extends WorkspaceOwnership> implements WorkspaceLease {
   }
 }
 
+// The instance is frozen, and the shared accessor/method surface must be too:
+// mutating a prototype is otherwise an indirect mutation of every lease view.
+Object.freeze(LocalLease.prototype);
+
 /** Validate an out-of-tree provider's lease before Runtime exposes it. */
-export function validateWorkspaceLease(spec: WorkspaceSpec, lease: WorkspaceLease): WorkspaceLeaseDescriptor {
+export async function validateWorkspaceLease(
+  spec: WorkspaceSpec,
+  lease: WorkspaceLease,
+): Promise<WorkspaceLeaseDescriptor> {
+  let parsedSpec;
+  try {
+    parsedSpec = WorkspaceSpecSchema.safeParse(spec);
+  } catch (error) {
+    throw new AgentRuntimeError(agentError('invalid_request', 'workspace spec could not be inspected safely'), {
+      cause: error,
+    });
+  }
+  if (!parsedSpec.success) {
+    throw new AgentRuntimeError(
+      agentError('invalid_request', parsedSpec.error.issues[0]?.message ?? 'invalid workspace spec'),
+    );
+  }
+  const validatedSpec = parsedSpec.data;
   let raw: unknown;
   try {
     raw = lease.describe();
@@ -145,7 +167,15 @@ export function validateWorkspaceLease(spec: WorkspaceSpec, lease: WorkspaceLeas
       { cause: error },
     );
   }
-  const parsed = WorkspaceLeaseDescriptorSchema.safeParse(raw);
+  let parsed;
+  try {
+    parsed = WorkspaceLeaseDescriptorSchema.safeParse(raw);
+  } catch (error) {
+    throw new AgentRuntimeError(
+      agentError('workspace_ownership_violation', 'workspace lease descriptor could not be inspected safely'),
+      { cause: error },
+    );
+  }
   if (!parsed.success) {
     throw new AgentRuntimeError(
       agentError(
@@ -155,21 +185,39 @@ export function validateWorkspaceLease(spec: WorkspaceSpec, lease: WorkspaceLeas
     );
   }
   const descriptor = parsed.data;
-  const expectedOwnership = ownershipFor(spec);
+  const expectedOwnership = ownershipFor(validatedSpec);
+  const expectedRoot = validatedSpec.kind === 'existing' ? await resolveRealPath(validatedSpec.path) : undefined;
+  let handleOwnership: WorkspaceOwnership;
+  let handleLeaseId: WorkspaceLeaseId;
+  let handleRoot: string;
+  let handleAcquiredAt: Timestamp;
+  try {
+    handleOwnership = lease.ownership;
+    handleLeaseId = lease.leaseId;
+    handleRoot = lease.root;
+    handleAcquiredAt = lease.acquiredAt;
+  } catch (error) {
+    throw new AgentRuntimeError(
+      agentError('workspace_ownership_violation', 'workspace lease fields threw during acquisition'),
+      { cause: error },
+    );
+  }
   if (
-    lease.ownership !== expectedOwnership ||
+    handleOwnership !== expectedOwnership ||
     descriptor.ownership !== expectedOwnership ||
-    descriptor.leaseId !== lease.leaseId ||
-    descriptor.root !== lease.root ||
-    descriptor.acquiredAt !== lease.acquiredAt ||
+    descriptor.leaseId !== handleLeaseId ||
+    descriptor.root !== handleRoot ||
+    descriptor.acquiredAt !== handleAcquiredAt ||
+    (expectedRoot !== undefined &&
+      (descriptor.root !== expectedRoot || (await resolveRealPath(handleRoot)) !== expectedRoot)) ||
     descriptor.released
   ) {
     throw new AgentRuntimeError(
       agentError('workspace_ownership_violation', 'workspace lease does not match the requested spec or live handle', {
         details: {
-          specKind: spec.kind,
+          specKind: validatedSpec.kind,
           expectedOwnership,
-          handleOwnership: lease.ownership,
+          handleOwnership,
           descriptorOwnership: descriptor.ownership,
         },
       }),
@@ -211,15 +259,21 @@ export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOpti
 
   async function acquireManaged(name: string | undefined): Promise<LocalLease<'managed'>> {
     await mkdir(baseDirectory, { recursive: true });
+    const realBase = await resolveRealPath(baseDirectory);
     // A caller-supplied name is already constrained to one safe segment by the
     // schema; `mkdtemp` covers the unnamed case without a collision risk.
-    const created = name === undefined ? await mkdtemp(join(baseDirectory, 'ws-')) : join(baseDirectory, name);
+    const created = name === undefined ? await mkdtemp(join(realBase, 'ws-')) : join(realBase, name);
     // A named managed directory must be newly created by this provider. Reusing
     // an existing path would falsely claim ownership and later delete data that
     // predates the lease.
     if (name !== undefined) await mkdir(created, { recursive: false });
 
     const root = await resolveRealPath(created);
+    if (!isStrictlyInside(realBase, root)) {
+      throw new AgentRuntimeError(
+        agentError('workspace_ownership_violation', 'managed workspace resolved outside its configured base'),
+      );
+    }
     return new LocalLease(
       options.idFactory.next('workspaceLease') as WorkspaceLeaseId,
       'managed',
@@ -233,14 +287,29 @@ export function createLocalWorkspaceProvider(options: LocalWorkspaceProviderOpti
   function acquire(spec: Extract<WorkspaceSpec, { kind: 'managed' }>): Promise<ManagedWorkspaceLease>;
   function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease>;
   async function acquire(spec: WorkspaceSpec): Promise<WorkspaceLease> {
-    const lease = spec.kind === 'existing' ? await acquireExisting(spec.path) : await acquireManaged(spec.name);
+    let parsed;
+    try {
+      parsed = WorkspaceSpecSchema.safeParse(spec);
+    } catch (error) {
+      throw new AgentRuntimeError(agentError('invalid_request', 'workspace spec could not be inspected safely'), {
+        cause: error,
+      });
+    }
+    if (!parsed.success) {
+      throw new AgentRuntimeError(
+        agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid workspace spec'),
+      );
+    }
+    const validated = parsed.data;
+    const lease =
+      validated.kind === 'existing' ? await acquireExisting(validated.path) : await acquireManaged(validated.name);
 
     // Cross-check the derived ownership against the spec so a future edit
     // cannot quietly make an `existing` workspace managed.
-    if (lease.ownership !== ownershipFor(spec)) {
+    if (lease.ownership !== ownershipFor(validated)) {
       throw new AgentRuntimeError(
         agentError('workspace_ownership_violation', 'derived lease ownership does not match the spec kind', {
-          details: { specKind: spec.kind, ownership: lease.ownership },
+          details: { specKind: validated.kind, ownership: lease.ownership },
         }),
       );
     }

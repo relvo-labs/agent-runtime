@@ -43,10 +43,7 @@
     }
   },
   "required": [
-    "sessionId",
-    "fromSequence",
-    "bufferSize",
-    "overflowPolicy"
+    "sessionId"
   ],
   "title": "subscription-request",
   "type": "object",

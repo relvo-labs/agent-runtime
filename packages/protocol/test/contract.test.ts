@@ -65,6 +65,23 @@ describe('wire contract', () => {
     expect(isJsonValue({ ok: ['yes', 1, false, null] })).toBe(true);
   });
 
+  it('keeps JSON schema parsing non-throwing and aligned for accessors and exotic arrays', () => {
+    const accessor = {};
+    Object.defineProperty(accessor, 'value', {
+      enumerable: true,
+      get(): never {
+        throw new Error('getter must never escape');
+      },
+    });
+    const array = ['valid'];
+    Object.defineProperty(array, 'extra', { enumerable: true, value: 'not represented by JSON arrays' });
+    for (const hostile of [accessor, array]) {
+      expect(() => JsonValueSchema.safeParse(hostile)).not.toThrow();
+      expect(JsonValueSchema.safeParse(hostile).success).toBe(isJsonValue(hostile));
+      expect(isJsonValue(hostile)).toBe(false);
+    }
+  });
+
   it('rejects cyclic JavaScript graphs in authoritative JSON-value schemas', () => {
     const objectCycle: Record<string, unknown> = {};
     objectCycle.self = objectCycle;

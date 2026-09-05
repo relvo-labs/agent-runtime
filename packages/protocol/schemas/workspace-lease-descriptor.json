@@ -30,8 +30,7 @@
         "leaseId",
         "ownership",
         "root",
-        "acquiredAt",
-        "released"
+        "acquiredAt"
       ],
       "type": "object"
     },

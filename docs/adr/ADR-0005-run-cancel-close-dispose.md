@@ -14,6 +14,11 @@ workspace release before the Session becomes terminal. `ProviderSession.dispose(
 idempotent cleanup, not the ordinary run-cancellation API. A provider unable to interrupt
 independently declares that limitation.
 
+Runtime installs an in-memory interrupt fence before awaiting `ProviderRun.interrupt()`.
+A concurrent interaction request becomes a provider-contract diagnostic rather than
+reversing the run. If interrupt rejects, the fence rolls back; if interrupt succeeds but
+persistence fails, the fence and logical command remain until exact retry or session cleanup.
+
 A close attempt invokes provider disposal and lease release once each, even if the first
 operation rejects. Either failure rejects as a retryable `AgentRuntimeError` with an
 ordered, phase-tagged failure list. Runtime does not emit `session.closed`, persist the

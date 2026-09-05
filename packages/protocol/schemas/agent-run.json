@@ -31,8 +31,7 @@
       },
       "required": [
         "code",
-        "message",
-        "retryable"
+        "message"
       ],
       "type": "object"
     },
@@ -341,8 +340,7 @@
     "turnId",
     "attempt",
     "state",
-    "startedAt",
-    "pendingInteractionIds"
+    "startedAt"
   ],
   "title": "agent-run",
   "type": "object",
