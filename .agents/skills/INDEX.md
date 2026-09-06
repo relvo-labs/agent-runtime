@@ -105,7 +105,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `provider-adapter-development`
 
-- **Version:** 1.0.0 (stable)
+- **Version:** 1.1.0 (stable)
 - **Path:** `.agents/skills/provider-adapter-development/SKILL.md`
 - **Description:** Implement or change an AgentProvider against the neutral SPI, including capability descriptors, run handles, interaction settlement and the in-process trust boundary.
 - **Tags:** `capabilities`, `provider`, `spi`, `trust-boundary`
