@@ -23,7 +23,29 @@ for (const directory of readdirSync(join(repoRoot, 'packages')).sort()) {
   if (manifest.engines?.node !== expected) problems.push(`packages/${directory} engines.node must be ${expected}`);
 }
 
-const workflow = readFileSync(join(repoRoot, '.github/workflows/gate.yml'), 'utf8');
+// Trigger policy is repository-wide, not per file. Enumerate the workflow directory so a
+// second workflow — a deploy job on push, a scheduled run, a workflow_run listener or an
+// unrestricted reusable caller — cannot bypass the policy below by simply not being
+// gate.yml. This inventory is the reviewed set; fail closed until a new entry is
+// explicitly classified and checked here.
+const reviewedWorkflows = ['gate.yml'];
+const workflowDirectory = join(repoRoot, '.github/workflows');
+const workflowEntries = readdirSync(workflowDirectory, { withFileTypes: true });
+const workflowFiles = workflowEntries
+  .filter((entry) => entry.isFile() && /\.ya?ml$/u.test(entry.name))
+  .map((entry) => entry.name)
+  .sort();
+for (const entry of workflowEntries) {
+  if (entry.isFile() && /\.ya?ml$/u.test(entry.name)) continue;
+  problems.push(`.github/workflows contains an unclassified entry: ${entry.name}`);
+}
+if (workflowFiles.join(',') !== [...reviewedWorkflows].sort().join(',')) {
+  problems.push(
+    `.github/workflows must contain exactly [${reviewedWorkflows.join(', ')}], found: [${workflowFiles.join(', ')}] — classify and check any new workflow here before adding it`,
+  );
+}
+
+const workflow = readFileSync(join(workflowDirectory, 'gate.yml'), 'utf8');
 const changesetConfig = JSON.parse(readFileSync(join(repoRoot, '.changeset/config.json'), 'utf8')) as {
   baseBranch?: string;
 };
@@ -33,8 +55,380 @@ for (const version of ['22.18.0', '24.20.0', '26.8.1']) {
 if (/node-version:\s*['"]?20(?:\.|['"\s])/u.test(workflow) || /\bNode 20\b/u.test(workflow)) {
   problems.push('Node 20 must not be configured or claimed');
 }
-if (!workflow.includes('push:\n    branches: [main]\n  pull_request:')) {
-  problems.push('CI must run on pushes to main and on pull requests only');
+// The workflow trigger map is policy, not formatting: this repository has exactly one
+// validation workflow, which may only be started manually or when a pull request is
+// marked ready for review. Parse the `on:` block structurally so a new event or a widened
+// pull_request activity list fails here rather than in a hosted run.
+//
+// The grammar below is deliberately narrow. YAML admits many policy-equivalent
+// serializations of the same trigger map (`'on':`, `"on":`, `on: [a, b]`, quoted list
+// scalars), and a hand-written parser that tried to accept them all would be a permissive
+// pseudo-YAML parser — exactly the failure mode this check exists to prevent. Only one
+// canonical spelling is accepted; every other spelling is rejected rather than normalized.
+// In particular there is no generic quote stripping anywhere here: a malformed scalar such
+// as `ready_for_review"` must never be silently normalized into an allowed value.
+const allowedEvents = ['pull_request', 'workflow_dispatch'];
+const allowedPullRequestTypes = ['ready_for_review'];
+
+// Complete decision table: every row is evaluated against the parsed trigger map.
+const triggerExpectations: { event: string; activity?: string; runs: boolean }[] = [
+  { event: 'workflow_dispatch', runs: true },
+  { event: 'pull_request', activity: 'ready_for_review', runs: true },
+  { event: 'pull_request', activity: 'opened', runs: false },
+  { event: 'pull_request', activity: 'synchronize', runs: false },
+  { event: 'pull_request', activity: 'reopened', runs: false },
+  { event: 'pull_request', activity: 'converted_to_draft', runs: false },
+  { event: 'pull_request', activity: 'closed', runs: false },
+  { event: 'push', runs: false },
+  { event: 'schedule', runs: false },
+  { event: 'workflow_run', runs: false },
+];
+
+function evaluateTriggerPolicy(source: string): string[] {
+  const found: string[] = [];
+  const triggerEvents: string[] = [];
+  const pullRequestTypes: string[] = [];
+  const lines = source.split('\n');
+
+  // Scan the whole top-level mapping, not just the first canonical hit, so a second or
+  // alternately quoted `on` key cannot smuggle an extra hosted entrance past this check.
+  const onKeys: { index: number; text: string; spelling: string; canonical: boolean }[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (line.trim() === '' || /^\s/u.test(line)) continue;
+    const key = /^(on|'on'|"on")\s*:(.*)$/u.exec(line);
+    if (key?.[1] === undefined) continue;
+    onKeys.push({
+      index,
+      text: line.trim(),
+      spelling: key[1],
+      canonical: key[1] === 'on' && (key[2] ?? '').trim() === '',
+    });
+  }
+
+  const [onKey] = onKeys;
+  if (onKey === undefined) {
+    found.push('CI must declare a top-level on: block');
+  } else if (onKeys.length > 1) {
+    found.push(
+      `CI must declare exactly one top-level on key, found ${onKeys.length}: ${onKeys.map((key) => key.spelling).join(', ')}`,
+    );
+  } else if (!onKey.canonical) {
+    found.push(`CI top-level trigger key must be the canonical unquoted on: block mapping, found: ${onKey.text}`);
+  } else {
+    let currentEvent = '';
+    for (const line of lines.slice(onKey.index + 1)) {
+      // Blank and comment-only lines are not mapping entries and do not close the `on`
+      // mapping, at any column. They must be consumed as non-semantic *before* the
+      // indentation boundary below decides the mapping ended, otherwise a comment at
+      // column 0 would terminate the scan and hide every trigger entry after it.
+      if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+      if (!line.startsWith('  ')) break;
+      const event = /^ {2}([a-z_]+):\s*$/u.exec(line);
+      if (event?.[1] !== undefined) {
+        currentEvent = event[1];
+        triggerEvents.push(currentEvent);
+        continue;
+      }
+      const types = /^ {4}types:\s*\[([^\]]*)\]\s*$/u.exec(line);
+      if (types?.[1] !== undefined && currentEvent === 'pull_request') {
+        for (const entry of types[1].split(',').map((type) => type.trim())) {
+          // Accept only bare canonical scalars. Anything quoted, empty or otherwise
+          // malformed is reported and dropped — never unquoted into an allowed value.
+          if (/^[a-z_]+$/u.test(entry)) {
+            pullRequestTypes.push(entry);
+            continue;
+          }
+          found.push(`CI pull_request types entry is malformed or quoted: ${entry === '' ? '<empty>' : entry}`);
+        }
+        continue;
+      }
+      found.push(`CI trigger block has an unsupported entry: ${line.trim()}`);
+    }
+  }
+
+  if ([...triggerEvents].sort().join(',') !== allowedEvents.join(',')) {
+    found.push(
+      `CI triggers must be exactly ${allowedEvents.join(' + ')}, found: ${triggerEvents.join(', ') || '<none>'}`,
+    );
+  }
+  if (pullRequestTypes.join(',') !== allowedPullRequestTypes.join(',')) {
+    found.push(
+      `CI pull_request types must be exactly [${allowedPullRequestTypes.join(', ')}], found: [${pullRequestTypes.join(', ')}]`,
+    );
+  }
+  for (const { event, activity, runs } of triggerExpectations) {
+    const actual = triggerEvents.includes(event) && (activity === undefined || pullRequestTypes.includes(activity));
+    if (actual !== runs) {
+      const label = activity === undefined ? event : `${event}/${activity}`;
+      found.push(`CI must ${runs ? 'run' : 'not run'} on ${label}`);
+    }
+  }
+  return found;
+}
+
+problems.push(...evaluateTriggerPolicy(workflow));
+
+// Deterministic in-file acceptance fixtures. These are self-checks of the validator
+// itself, not of the repository tree: each negative fixture must fail closed for its
+// stated policy reason, and the canonical fixture must produce no finding at all. They
+// run on every `pnpm engines:check`, so a future loosening of the grammar cannot pass
+// silently.
+const canonicalTriggerFixture = `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`;
+const canonicalFindings = evaluateTriggerPolicy(canonicalTriggerFixture);
+if (canonicalFindings.length > 0) {
+  problems.push(`canonical trigger fixture must be accepted, got: [${canonicalFindings.join(' | ')}]`);
+}
+
+const negativeTriggerFixtures: { name: string; reason: RegExp; source: string }[] = [
+  {
+    name: 'quoted duplicate top-level on keys',
+    reason: /exactly one top-level on key/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+
+"on":
+  push:
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'duplicate canonical on keys',
+    reason: /exactly one top-level on key/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+
+on:
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'alternate quoted on as the only top-level key',
+    reason: /canonical unquoted on: block mapping/u,
+    source: `name: gate
+
+'on':
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'alternate inline flow-sequence on form',
+    reason: /canonical unquoted on: block mapping/u,
+    source: `name: gate
+
+on: [workflow_dispatch, pull_request]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'quoted pull_request types list entries',
+    reason: /malformed or quoted: "ready_for_review"/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: ["ready_for_review"]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'stray quote in a pull_request types entry',
+    reason: /malformed or quoted: ready_for_review"/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review"]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'pull_request types as a non-list scalar',
+    reason: /unsupported entry: types: ready_for_review/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: ready_for_review
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'unsupported extra filter key under pull_request',
+    reason: /unsupported entry: branches: \[main\]/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'forbidden push trigger',
+    reason: /triggers must be exactly/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    // Regression: a comment at column 0 is not a mapping terminator. Before this was
+    // fixed the scan broke at the comment and accepted the push trigger below it.
+    name: 'forbidden push trigger after a column-0 comment',
+    reason: /must not run on push/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+# additional event
+  push:
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    // Regression: same terminator bug, reached through an unsupported filter key
+    // rather than a new event.
+    name: 'unsupported branches filter after a column-0 comment',
+    reason: /unsupported entry: branches: \[main\]/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+# additional filter
+    branches: [main]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'forbidden schedule and workflow_run triggers',
+    reason: /triggers must be exactly/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  schedule:
+  workflow_run:
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'missing workflow_dispatch',
+    reason: /triggers must be exactly/u,
+    source: `name: gate
+
+on:
+  pull_request:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'generic pull_request without an activity filter',
+    reason: /pull_request types must be exactly/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'widened pull_request activity list',
+    reason: /must not run on pull_request\/opened/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review, opened]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    name: 'missing top-level on block',
+    reason: /must declare a top-level on: block/u,
+    source: `name: gate
+
+permissions:
+  contents: read
+`,
+  },
+];
+for (const fixture of negativeTriggerFixtures) {
+  const findings = evaluateTriggerPolicy(fixture.source);
+  if (!findings.some((finding) => fixture.reason.test(finding))) {
+    problems.push(
+      `trigger fixture "${fixture.name}" must be rejected by ${fixture.reason.source}, got: [${findings.join(' | ') || '<accepted>'}]`,
+    );
+  }
 }
 if (!workflow.includes('timeout-minutes: 30')) problems.push('CI gate must set timeout-minutes: 30');
 const checkoutStep = [
@@ -79,4 +473,6 @@ if (problems.length > 0) {
   for (const problem of problems) process.stderr.write(`engines: ${problem}\n`);
   process.exit(1);
 }
-process.stdout.write('engines: OK — Node 22/24/26 bounded support, immutable CI bootstrap, no Node 20/27 claim\n');
+process.stdout.write(
+  'engines: OK — Node 22/24/26 bounded support, immutable CI bootstrap, manual + ready_for_review triggers only\n',
+);
