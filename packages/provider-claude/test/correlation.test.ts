@@ -32,8 +32,8 @@ function textInput(text: string): TurnInput {
   return { parts: [{ type: 'text', text }] };
 }
 
-async function session(fake: FakeQuery) {
-  const provider = createClaudeProvider({ query: fake.query });
+async function session(fake: FakeQuery, correlation?: 'required' | 'legacy-unstamped') {
+  const provider = createClaudeProvider({ query: fake.query, ...(correlation === undefined ? {} : { correlation }) });
   const sessionEvents = recordingSink();
   const providerSession = await provider.createSession({
     options: {},
@@ -181,12 +181,12 @@ describe('claude turn correlation', () => {
     ]);
   });
 
-  it('still works against a producer that never stamps a client uuid', async () => {
+  it('still works against a producer the host declared never stamps a client uuid', async () => {
     // Older CLIs omit the correlation fields entirely. Requiring a stamp that
-    // can never arrive would hang every run, so the adapter stays in the
-    // legacy single-turn mode until it observes the producer stamping.
+    // can never arrive would hang every run, so the host may declare that
+    // producer explicitly and get attribution by position back.
     const fake = createFakeQuery();
-    const { providerSession } = await session(fake);
+    const { providerSession } = await session(fake, 'legacy-unstamped');
     const recorder = recordingSink();
     const run = await providerSession.startRun({ input: textInput('legacy'), sink: recorder.sink, runRef: 'run-1' });
     await flush();
@@ -198,6 +198,37 @@ describe('claude turn correlation', () => {
     expect(recorder.events.map((event) => event.payload)).toEqual([
       { type: 'run.message_delta', text: 'legacy reply' },
     ]);
+  });
+
+  it('stops trusting position once a declared-legacy producer proves it stamps', async () => {
+    // The declaration is a fallback, not a permanent waiver: the moment a stamp
+    // appears the producer has proven it correlates, and an unstamped frame is
+    // once again another turn's, not this run's.
+    const fake = createFakeQuery();
+    const { providerSession } = await session(fake, 'legacy-unstamped');
+    const recorder = recordingSink();
+    const run = await providerSession.startRun({ input: textInput('mine'), sink: recorder.sink, runRef: 'run-1' });
+    await flush();
+    const uuid = submittedUuid(fake, 0);
+
+    fake.push({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'mine' }] },
+      user_message_uuid: uuid,
+    });
+    fake.push({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'foreign' }] },
+      user_message_uuid: '11111111-1111-4111-8111-111111111111',
+    });
+    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    await flush();
+
+    expect(await settled(run)).toBe(false);
+    expect(recorder.events.map((event) => event.payload)).toEqual([{ type: 'run.message_delta', text: 'mine' }]);
+
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: uuid });
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
   });
 });
 

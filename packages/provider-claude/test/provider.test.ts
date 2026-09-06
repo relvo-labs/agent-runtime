@@ -100,8 +100,15 @@ describe('claude text run', () => {
     expect(fake.calls[0]?.options.permissionPrompts).toBe('none');
     expect(fake.prompts.map((prompt) => prompt.message.content)).toEqual(['Summarise\n\nthis repo']);
 
+    // The SDK stamps the turn's first reply frame and its result; the frames in
+    // between carry no stamp and follow that binding.
+    const uuid = submittedUuid(fake, 0);
     fake.push({ type: 'system', subtype: 'init', session_id: 'native-session-1' });
-    fake.push({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'working' }] } });
+    fake.push({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'working' }] },
+      user_message_uuid: uuid,
+    });
     fake.push({
       type: 'assistant',
       message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: {} }] },
@@ -114,6 +121,7 @@ describe('claude text run', () => {
       is_error: false,
       usage: { input_tokens: 5, output_tokens: 2 },
       session_id: 'native-session-1',
+      user_message_uuid: uuid,
     });
 
     await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
@@ -148,7 +156,7 @@ describe('claude text run', () => {
 
     const run = await session.startRun({ input: textInput('hello'), sink: recordingSink().sink, runRef: 'run-2' });
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
     await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
   });
 
@@ -165,12 +173,12 @@ describe('claude text run', () => {
     const fake = createFakeQuery();
     const { session, run } = await startedRun(fake);
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
     await run.completion;
 
     const next = await session.startRun({ input: textInput('and again'), sink: recordingSink().sink, runRef: 'run-2' });
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 1) });
     await expect(next.completion).resolves.toEqual({ outcome: 'succeeded' });
 
     expect(fake.calls).toHaveLength(1);
@@ -181,7 +189,13 @@ describe('claude text run', () => {
     const fake = createFakeQuery();
     const { run } = await startedRun(fake);
     await flush();
-    fake.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['model unavailable'] });
+    fake.push({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: ['model unavailable'],
+      user_message_uuid: submittedUuid(fake, 0),
+    });
 
     const termination = await run.completion;
     expect(termination.outcome).toBe('failed');
@@ -240,7 +254,12 @@ describe('claude run interrupt', () => {
     const recorder = recordingSink();
     const run = await session.startRun({ input: textInput('long job'), sink: recorder.sink, runRef: 'run-1' });
     await flush();
-    fake.push({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'partial' }] } });
+    const uuid = submittedUuid(fake, 0);
+    fake.push({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'partial' }] },
+      user_message_uuid: uuid,
+    });
     await flush();
 
     await run.interrupt('user asked to stop');
@@ -248,7 +267,13 @@ describe('claude run interrupt', () => {
     expect(fake.interruptCalls).toBe(1);
     expect(fake.returnCalls).toBe(0);
 
-    fake.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['interrupted'] });
+    fake.push({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: ['interrupted'],
+      user_message_uuid: uuid,
+    });
     await expect(run.completion).resolves.toEqual({ outcome: 'interrupted', reason: 'user asked to stop' });
     // Partial output produced before the interrupt is still delivered.
     expect(recorder.events.map((event) => event.payload)).toContainEqual({
@@ -258,7 +283,7 @@ describe('claude run interrupt', () => {
 
     const next = await session.startRun({ input: textInput('next'), sink: recordingSink().sink, runRef: 'run-2' });
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 1) });
     await expect(next.completion).resolves.toEqual({ outcome: 'succeeded' });
     expect(fake.calls).toHaveLength(1);
   });
@@ -268,7 +293,7 @@ describe('claude run interrupt', () => {
     const { session } = await openSession(fake);
     const run = await session.startRun({ input: textInput('hi'), sink: recordingSink().sink, runRef: 'run-1' });
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false });
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
     await run.completion;
 
     await expect(run.interrupt('too late')).resolves.toBeUndefined();
@@ -288,7 +313,13 @@ describe('claude run interrupt', () => {
     const release = fake.holdNextInterrupt();
     const interrupted = run.interrupt('user asked to stop');
     await flush();
-    fake.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['aborted'] });
+    fake.push({
+      type: 'result',
+      subtype: 'error_during_execution',
+      is_error: true,
+      errors: ['aborted'],
+      user_message_uuid: submittedUuid(fake, 0),
+    });
     await flush();
     release();
     await interrupted;

@@ -189,10 +189,22 @@ type ActiveRun = {
   settle(termination: ProviderRunTermination): void;
   terminated: boolean;
   /**
+   * The turn's own terminal frame has arrived. The run is closed to further
+   * output from that moment, but it is not yet settled while an interrupt
+   * round-trip is still deciding how the outcome must be classified.
+   */
+  concluded: boolean;
+  /** The termination the turn itself reported, held for that reconciliation. */
+  observed: ProviderRunTermination | undefined;
+  /**
    * Set synchronously before the interrupt round-trip starts. A terminal result
    * can beat the acknowledgement — the pinned SDK writes a crashed turn's error
    * result on a direct path that may precede the receipt — so intent, not
    * acknowledgement, is what classifies the outcome.
+   *
+   * Intent is *provisional* until the round-trip settles: an interrupt that is
+   * then refused, or that reports the input as still queued, did not stop
+   * anything and must not relabel a result the turn already produced.
    */
   interruptRequested: boolean;
   interruptReason: string | undefined;
@@ -239,20 +251,63 @@ function createSessionFor(
    */
   let boundRun: ActiveRun | undefined;
   /**
-   * Whether this producer stamps client uuids at all. Older CLIs do not, and
-   * demanding a stamp that can never arrive would hang every run, so binding
-   * stays permissive until the producer proves it stamps.
+   * Whether this producer has ever stamped a client uuid. It only ever retires
+   * the host's `legacy-unstamped` declaration: once a stamp has been seen, the
+   * producer has proven it correlates, and position stops being evidence again.
    */
   let sawCorrelationStamp = false;
   let announcedUnattributedTurn = false;
+  /**
+   * The host's declaration that this producer cannot stamp at all — an older
+   * CLI, where demanding a stamp that can never arrive would hang every run.
+   * Absence of a stamp is never taken as that declaration on its own: a
+   * background or synthetic turn is unstamped for exactly the same reason.
+   */
+  const legacyUnstamped = defaults.correlation === 'legacy-unstamped';
 
+  function finalize(run: ActiveRun, termination: ProviderRunTermination): void {
+    if (run.terminated) return;
+    run.terminated = true;
+    run.concluded = true;
+    if (active === run) active = undefined;
+    if (boundRun === run) boundRun = undefined;
+    run.settle(termination);
+  }
+
+  /** Apply interrupt intent that is still standing to an observed outcome. */
+  function classified(run: ActiveRun, observed: ProviderRunTermination): ProviderRunTermination {
+    if (!run.interruptRequested) return observed;
+    return {
+      outcome: 'interrupted',
+      ...(run.interruptReason === undefined ? {} : { reason: run.interruptReason }),
+    };
+  }
+
+  /**
+   * Settle whatever run is active because the session, not the turn, ended it:
+   * the stream closed or failed, or the session was disposed. A turn that had
+   * already reported its own outcome keeps it.
+   */
   function settle(termination: ProviderRunTermination): void {
     const run = active;
     if (run === undefined || run.terminated) return;
-    run.terminated = true;
-    active = undefined;
-    boundRun = undefined;
-    run.settle(termination);
+    const observed = run.observed;
+    finalize(run, observed === undefined ? termination : classified(run, observed));
+  }
+
+  /**
+   * The turn reported its own outcome.
+   *
+   * While an interrupt round-trip is in flight the classification is not yet
+   * decidable — a refused or unapplied stop leaves this result standing — so
+   * the run is closed to further output and settled once that request answers.
+   */
+  function conclude(run: ActiveRun, observed: ProviderRunTermination): void {
+    if (run.terminated || run.concluded) return;
+    run.concluded = true;
+    run.observed = observed;
+    if (run.interruptAttempt !== undefined) return;
+    finalize(run, classified(run, observed));
   }
 
   function noteUnattributedTurn(): void {
@@ -280,8 +335,20 @@ function createSessionFor(
       const owner = active !== undefined && stamps.includes(active.uuid) ? active : undefined;
       boundRun = owner;
       if (owner === undefined) noteUnattributedTurn();
+      return owner;
     }
-    return sawCorrelationStamp ? boundRun : active;
+    // Later frames of a turn carry no stamp, so they follow whatever the last
+    // stamped frame bound — including a binding to no run at all.
+    if (boundRun !== undefined) return boundRun;
+    // Nothing is bound and nothing has been correlated yet. An absent stamp is
+    // not evidence of a legacy producer: a background, scheduled or synthetic
+    // turn is unstamped for the same reason, and the two are indistinguishable
+    // on the wire. Attributing it would publish another turn's output and
+    // complete this run with another turn's result, so it is only attributed
+    // when the host has declared that this producer never stamps at all.
+    if (legacyUnstamped && !sawCorrelationStamp) return active;
+    if (active !== undefined) noteUnattributedTurn();
+    return undefined;
   }
 
   function pump(): void {
@@ -291,20 +358,14 @@ function createSessionFor(
       try {
         for await (const message of handle) {
           const run = routeTo(message);
-          // A frame belonging to no active run is observed for binding and
-          // then dropped: it must not emit into, or complete, another run.
-          if (run === undefined) continue;
+          // A frame belonging to no active run — or to a run whose own terminal
+          // frame has already arrived — is observed for binding and then
+          // dropped: it must not emit into, or complete, another run.
+          if (run === undefined || run.concluded) continue;
           const translation = run.translator.translate(message);
           for (const event of translation.events) run.request.sink.emit(event);
           if (translation.termination === undefined) continue;
-          settle(
-            run.interruptRequested
-              ? {
-                  outcome: 'interrupted',
-                  ...(run.interruptReason === undefined ? {} : { reason: run.interruptReason }),
-                }
-              : translation.termination,
-          );
+          conclude(run, translation.termination);
         }
         streamClosed = true;
         // Disposal owns the outcome of a run still in flight, but the run must
@@ -374,6 +435,8 @@ function createSessionFor(
       request,
       settle: settleCompletion,
       terminated: false,
+      concluded: false,
+      observed: undefined,
       interruptRequested: false,
       interruptReason: undefined,
       interruptAttempt: undefined,
@@ -389,6 +452,12 @@ function createSessionFor(
         await attemptInterrupt();
       } finally {
         run.interruptAttempt = undefined;
+        // A terminal frame that landed while this request was in flight was
+        // held back for exactly this moment: the stop either applied, and the
+        // run is an interruption, or it did not, and the turn's own outcome
+        // stands.
+        const observed = run.observed;
+        if (observed !== undefined) finalize(run, classified(run, observed));
       }
     }
 
@@ -406,7 +475,10 @@ function createSessionFor(
         );
       }
 
-      if (run.terminated || !survivedInterrupt(receipt, run.uuid)) return;
+      // Reconciled even when the run is already terminal: a stop that was not
+      // applied has to withdraw its intent, or a result the turn produced on
+      // its own stays labelled as an interruption that never happened.
+      if (!survivedInterrupt(receipt, run.uuid)) return;
 
       // The submitted message outlived the stop and WILL run. The pinned
       // public `interrupt()` takes no arguments, so `cancel_queued` cannot be
@@ -478,6 +550,12 @@ function createSessionFor(
       if (teardown !== undefined) return teardown;
 
       const attempt = (async () => {
+        // Yield before touching the handle. A `return()` that throws
+        // *synchronously* rather than returning a rejected promise would
+        // otherwise run the `finally` below — which clears the shared attempt —
+        // before this scope has even assigned it, caching an already-rejected
+        // promise as the permanent answer to every later disposal.
+        await Promise.resolve();
         try {
           await handle.return?.();
         } catch (error) {

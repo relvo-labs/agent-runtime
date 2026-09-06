@@ -64,8 +64,16 @@ stamped with a private client uuid, and the SDK echoes it back as `user_message_
 inside `user_message_uuids` when a batch was coalesced) on the turn's first reply frame and
 on its result. Frames are bound to a run through that stamp; anything unattributable is
 dropped with a `debug` diagnostic rather than emitted into, or used to complete, the run in
-front of it. A producer that never stamps — an older CLI — keeps the previous single-turn
-behaviour, since demanding a stamp that cannot arrive would hang every run.
+front of it.
+
+That includes traffic that arrives before this session has correlated anything. An
+unstamped frame is not evidence of a producer that cannot stamp — a background, scheduled
+or synthetic turn is unstamped for the same reason — so absence of a stamp never confers
+ownership. A host talking to a producer that genuinely never stamps, such as a
+pre-`user_message_uuid` CLI, declares it with `createClaudeProvider({ correlation:
+'legacy-unstamped' })` and gets attribution by position back, because demanding a stamp
+that cannot arrive would hang every run. That declaration lapses the moment a stamp does
+appear: the producer has then proven it correlates.
 
 ### Interrupt semantics
 
@@ -73,6 +81,11 @@ Interrupt is idempotent and coalescing: concurrent calls share one control reque
 Intent is recorded before the round-trip, so a terminal result that arrives before the
 acknowledgement is still reported as `interrupted` rather than `failed`, and output
 produced before the stop is still delivered.
+
+That intent is provisional until the round-trip answers. A result that lands while the
+control request is still in flight closes the run to further output but does not settle it
+yet: if the request is then refused, or reports the input as still queued, no stop
+happened, and the run settles with the outcome the turn itself reported.
 
 The SDK answers with an `interrupt_receipt_v1` receipt listing input that **survived** the
 stop. The pinned public `interrupt()` takes no arguments, so `cancel_queued` cannot be
@@ -99,9 +112,11 @@ callers, and stays retryable to success if teardown rejects.
   contents.
 - **Upstream error prose.** `AgentError.message`, `providerCode` and diagnostics carry
   allowlisted classifications only — never SDK error text, which can contain credentials,
-  native ids, paths or the prompt. A host that wants the raw text wraps `query` in its own
-  binding, where it sees every SDK message and error without any of it reaching the durable
-  event log.
+  native ids, paths or the prompt. An assistant frame the SDK flagged with `error` is
+  reported as its classification alone: the blocks that came with it are the error body
+  rather than model output, so they are not published as message deltas either. A host that
+  wants the raw text wraps `query` in its own binding, where it sees every SDK message and
+  error without any of it reaching the durable event log.
 
 ## Testing against it
 

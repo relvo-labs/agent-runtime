@@ -216,8 +216,26 @@ export function createRunTranslator(): RunTranslator {
   const toolNames = new Map<string, string>();
 
   function translateAssistant(message: ClaudeQueryMessage): readonly ProviderEventInput[] {
+    if (message.error !== undefined && message.error !== null) {
+      // The SDK flagged this frame as an error. Its blocks are then the error
+      // *body*, not model output — upstream prose that routinely carries a
+      // credential, a native id, a path or the prompt — so nothing that came
+      // with it is published. Only the classification is, and only from the
+      // closed set the SDK declares.
+      const reported = asString(message.error);
+      const classification = reported !== undefined && ASSISTANT_ERRORS.has(reported) ? reported : 'unknown';
+      return [
+        {
+          payload: {
+            type: 'diagnostic',
+            level: 'warning',
+            message: `claude reported an assistant error: ${classification}`,
+          },
+        },
+      ];
+    }
+
     const events: ProviderEventInput[] = [];
-    const assistantError = asString(message.error);
     for (const block of blocksOf(message)) {
       const type = asString(block.type);
       if (type === 'text') {
@@ -236,16 +254,6 @@ export function createRunTranslator(): RunTranslator {
       // The tool's arguments are deliberately not summarised: they routinely
       // contain file contents and command lines from the workspace.
       events.push({ payload: { type: 'run.tool_activity', toolName: name, phase: 'invoked' } });
-    }
-    if (assistantError !== undefined) {
-      const classification = ASSISTANT_ERRORS.has(assistantError) ? assistantError : 'unknown';
-      events.push({
-        payload: {
-          type: 'diagnostic',
-          level: 'warning',
-          message: `claude reported an assistant error: ${classification}`,
-        },
-      });
     }
     return events;
   }

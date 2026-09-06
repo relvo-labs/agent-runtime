@@ -42,6 +42,22 @@ export type ClaudeSessionOptions = z.infer<typeof ClaudeSessionOptionsSchema>;
  */
 export type ClaudeProviderOptions = {
   readonly query?: ClaudeQuery;
+  /**
+   * How a turn is bound to the run that submitted it.
+   *
+   * `'required'` (the default) attributes a frame only to the run its client
+   * uuid names. An unstamped frame that no bound turn accounts for is dropped:
+   * a background, scheduled or synthetic turn is unstamped for exactly the same
+   * reason a legacy producer's reply is, so treating absence as ownership would
+   * let another turn's output be published and its result complete this run.
+   *
+   * `'legacy-unstamped'` restores attribution by position for a producer known
+   * not to stamp at all — a pre-`user_message_uuid` CLI, where requiring a stamp
+   * that can never arrive would hang every run. Declare it only when the host
+   * knows which producer it bound; on a stamping producer it re-opens the
+   * misattribution above until the first stamp is observed.
+   */
+  readonly correlation?: 'required' | 'legacy-unstamped';
   readonly model?: string;
   readonly maxTurns?: number;
   readonly permissionMode?: ClaudePermissionMode;
