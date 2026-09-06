@@ -1,16 +1,49 @@
 /**
- * Claude adapter package boundary.
+ * `@relvo-labs/agent-provider-claude` — a Claude adapter for the neutral
+ * provider SPI.
  *
- * Foundation v0.4 intentionally ships no live Claude integration. Consumers
- * can depend on this package name and its factory contract without mistaking a
- * placeholder for a working provider.
+ * One responsibility: translate between `@relvo-labs/agent-provider` and the
+ * official Claude Agent SDK's structured `query()` surface. No PTY, no terminal
+ * scraping, no ANSI parsing, and no provider-native identifier in anything it
+ * emits.
+ *
+ * The SDK itself is an optional peer dependency resolved at runtime — see
+ * `binding.ts` for why — so a host may either install it and let the adapter
+ * bind it, or supply its own `query` through `ClaudeProviderOptions`.
  */
 
-import type { JsonObject } from '@relvo-labs/agent-protocol';
-import type { AgentProvider } from '@relvo-labs/agent-provider';
+export {
+  createClaudeProvider,
+  CLAUDE_PROVIDER_ID,
+  CLAUDE_ADAPTER_VERSION,
+  CLAUDE_AGENT_SDK_VERSION,
+} from './provider.ts';
 
-export const CLAUDE_PROVIDER_ID = 'claude' as const;
-export const CLAUDE_ADAPTER_STATUS = 'scaffold' as const;
+export { CLAUDE_AGENT_SDK_PACKAGE } from './binding.ts';
 
-export type ClaudeProviderOptions = JsonObject;
-export type ClaudeProviderFactory = (options?: ClaudeProviderOptions) => AgentProvider;
+export {
+  ClaudePermissionModeSchema,
+  ClaudeSessionOptionsSchema,
+  type ClaudeProviderOptions,
+  type ClaudeProviderFactory,
+  type ClaudeSessionOptions,
+} from './options.ts';
+
+export type {
+  ClaudePermissionMode,
+  ClaudePromptMessage,
+  ClaudeQuery,
+  ClaudeQueryHandle,
+  ClaudeQueryMessage,
+  ClaudeQueryOptions,
+  ClaudeQueryParams,
+} from './seam.ts';
+
+/**
+ * Adapter status.
+ *
+ * `live` since the text-run vertical slice: this package executes real Claude
+ * turns when a `query` binding is available. It was `scaffold` in Foundation
+ * v0.4, when the package deliberately shipped no integration at all.
+ */
+export const CLAUDE_ADAPTER_STATUS = 'live' as const;

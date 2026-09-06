@@ -41,11 +41,56 @@ for (const file of files) {
   }
 }
 
-for (const packageName of ['provider-codex', 'provider-claude']) {
+// ---------------------------------------------------------------------------
+// Adapter boundaries
+// ---------------------------------------------------------------------------
+//
+// The Codex package is still an explicit scaffold: it must contain no live
+// integration behaviour at all.
+
+for (const packageName of ['provider-codex']) {
   const source = readFileSync(resolve(repoRoot, `packages/${packageName}/src/index.ts`), 'utf8');
   if (/node:child_process|\bfetch\s*\(|spawn\s*\(|exec\s*\(/u.test(source)) {
     problems.push(`packages/${packageName}: scaffold contains live integration behavior`);
   }
+}
+
+// The Claude package is live, so the assertion changes shape rather than
+// disappearing. Two invariants keep it honest:
+//
+//   1. Control paths stay structured. The adapter drives the SDK's message
+//      API; it must never grow a pseudo-terminal, a spawned CLI or ANSI
+//      scraping of its own.
+//   2. The SDK stays an optional peer resolved at runtime. A static import
+//      would make a proprietary, ~200 MB dependency mandatory for every
+//      consumer and would put it in the published runtime closure.
+
+const CLAUDE_SDK_PACKAGE = '@anthropic-ai/claude-agent-sdk';
+for (const file of files.filter((path) => path.startsWith('packages/provider-claude/src/'))) {
+  const source = readFileSync(resolve(repoRoot, file), 'utf8');
+  const terminalControl = /node:child_process|node-pty|\bspawn(?:Sync)?\s*\(|\bexecFile\s*\(/u;
+  const ansiEscape = /\\u001[bB]\[|\\x1[bB]\[/u;
+  if (terminalControl.test(source) || ansiEscape.test(source)) {
+    problems.push(`${file}: claude adapter must drive the SDK, not a terminal or a child process`);
+  }
+  if (new RegExp(String.raw`(?:from|import)\s*\(?\s*['"]${CLAUDE_SDK_PACKAGE}['"]`, 'u').test(source)) {
+    problems.push(`${file}: ${CLAUDE_SDK_PACKAGE} must stay an optional peer resolved at runtime`);
+  }
+}
+
+const claudeManifest = JSON.parse(readFileSync(resolve(repoRoot, 'packages/provider-claude/package.json'), 'utf8')) as {
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+};
+if (claudeManifest.dependencies?.[CLAUDE_SDK_PACKAGE] !== undefined) {
+  problems.push(`packages/provider-claude: ${CLAUDE_SDK_PACKAGE} must not be a runtime dependency`);
+}
+if (claudeManifest.peerDependencies?.[CLAUDE_SDK_PACKAGE] === undefined) {
+  problems.push(`packages/provider-claude: ${CLAUDE_SDK_PACKAGE} must be declared as a peer dependency`);
+}
+if (claudeManifest.peerDependenciesMeta?.[CLAUDE_SDK_PACKAGE]?.optional !== true) {
+  problems.push(`packages/provider-claude: the ${CLAUDE_SDK_PACKAGE} peer must be optional`);
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +160,6 @@ if (problems.length > 0) {
   process.exit(1);
 }
 process.stdout.write(
-  `static: OK — ${String(files.length)} candidate files scanned; adapter scaffolds remain non-live; ` +
-    'every package test script is executable\n',
+  `static: OK — ${String(files.length)} candidate files scanned; the codex scaffold remains non-live, ` +
+    'the claude adapter stays structured with an optional SDK peer; every package test script is executable\n',
 );

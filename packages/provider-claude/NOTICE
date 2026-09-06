@@ -1,1 +1,3 @@
-Relvo Agent Runtime Claude provider scaffold. Copyright 2026 Relvo Labs. Licensed under Apache-2.0. See the repository NOTICE for third-party attribution.
+Relvo Agent Runtime Claude provider adapter. Copyright 2026 Relvo Labs. Licensed under Apache-2.0. See the repository NOTICE for third-party attribution.
+
+This package integrates with @anthropic-ai/claude-agent-sdk (© Anthropic PBC, proprietary terms), which is an optional peer dependency and is neither bundled nor redistributed here. Its published type declarations at version 0.3.259 were reviewed to author the interoperability seam in src/seam.ts; no source text or declaration text was copied. The seam names only the fields required to call the SDK's query() entry point.

@@ -25,7 +25,7 @@ Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol sche
 | `@relvo-labs/agent-workspace`       | Workspace leases and guarded local implementation              |
 | `@relvo-labs/agent-workspace-git`   | Git workspace boundary with an injected command seam           |
 | `@relvo-labs/agent-provider-codex`  | Explicit future-adapter scaffold; no live integration          |
-| `@relvo-labs/agent-provider-claude` | Explicit future-adapter scaffold; no live integration          |
+| `@relvo-labs/agent-provider-claude` | Claude adapter over the official Claude Agent SDK query API    |
 
 ## Development
 
