@@ -3,6 +3,9 @@ import {
   WIRE_VERSION,
   createCounterIdFactory,
   createFixedClock,
+  CommandIdSchema,
+  type CommandReceipt,
+  type SessionId,
   type WorkspaceLeaseDescriptor,
   type WorkspaceSpec,
 } from '@relvo-labs/agent-protocol';
@@ -20,10 +23,16 @@ import {
   ClaudePermissionModeSchema,
   ClaudeSessionOptionsSchema,
   createClaudeProvider,
+  type ClaudeInterruptReceipt,
+  type ClaudeMessageUuid,
   type ClaudePermissionMode,
   type ClaudeProviderFactory,
   type ClaudeProviderOptions,
+  type ClaudePromptMessage,
   type ClaudeQuery,
+  type ClaudeQueryHandle,
+  type ClaudeQueryMessage,
+  type ClaudeQueryParams,
   type ClaudeSessionOptions,
 } from '@relvo-labs/agent-provider-claude';
 import { CODEX_ADAPTER_STATUS } from '@relvo-labs/agent-provider-codex';
@@ -54,12 +63,23 @@ async function validateExternalLease(spec: WorkspaceSpec, lease: WorkspaceLease)
 // A host composes the Claude adapter itself; the runtime never imports it.
 // Either bind the official SDK by omitting `query`, or inject one — the seam is
 // a named public type, so a wrong shape fails to compile here.
-const scriptedClaudeQuery: ClaudeQuery = ({ options }) => ({
+const scriptedClaudeQuery: ClaudeQuery = (params: ClaudeQueryParams): ClaudeQueryHandle => ({
   async *[Symbol.asyncIterator]() {
-    void options.cwd;
-    yield { type: 'result', subtype: 'success', is_error: false };
+    void params.options.cwd;
+    // Correlate the reply with the message the adapter submitted, exactly as
+    // the SDK does. `uuid` is optional on the wire, so narrow it first.
+    const submitted: ClaudePromptMessage[] = [];
+    for await (const message of params.prompt) submitted.push(message);
+    const uuid: ClaudeMessageUuid | undefined = submitted[0]?.uuid;
+    const result: ClaudeQueryMessage = {
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      ...(uuid === undefined ? {} : { user_message_uuid: uuid }),
+    };
+    yield result;
   },
-  interrupt: () => Promise.resolve(undefined),
+  interrupt: (): Promise<ClaudeInterruptReceipt> => Promise.resolve({ still_queued: [] }),
 });
 const claudeOptions: ClaudeProviderOptions = {
   model: 'claude-sonnet-4-6',
@@ -71,6 +91,16 @@ const claude: AgentProvider = claudeFactory(claudeOptions);
 const claudeRuntime: AgentExecutor = createAgentRuntime({ workspaces, providers: [claude] });
 const claudeSessionOptions: ClaudeSessionOptions = ClaudeSessionOptionsSchema.parse({ maxTurns: 4 });
 const claudePermissionMode: ClaudePermissionMode = ClaudePermissionModeSchema.parse('plan');
+
+/** A host drives the adapter through the executor contract it already has. */
+async function runClaudeTurn(sessionId: SessionId): Promise<CommandReceipt> {
+  return claudeRuntime.submitTurn({
+    type: 'submit_turn',
+    commandId: CommandIdSchema.parse('claude-consumer-turn-1'),
+    sessionId,
+    input: { parts: [{ type: 'text', text: 'summarise this repository' }] },
+  });
+}
 
 assertReadOnly(['status', '--short']);
 void runtime;
@@ -88,5 +118,6 @@ void CLAUDE_ADAPTER_VERSION;
 void CLAUDE_AGENT_SDK_PACKAGE;
 void CLAUDE_AGENT_SDK_VERSION;
 void claudePermissionMode;
+void runClaudeTurn;
 void claudeRuntime;
 void claudeSessionOptions;

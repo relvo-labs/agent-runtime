@@ -2,7 +2,7 @@
 
 Relvo Agent Runtime is a provider-neutral, No-PTY execution SDK for embedding coding agents in products. It gives a host application one durable command/event contract while leaving model-provider choice, workspace provisioning, and storage behind explicit interfaces.
 
-Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol schemas, deterministic in-memory execution, bounded replay-then-live subscriptions, and guarded workspace ownership. It does **not** include live Codex or Claude integration, a control plane, scheduling, remote execution, queues, tenancy, RBAC, workflow DAGs, or product-specific integrations.
+Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol schemas, deterministic in-memory execution, bounded replay-then-live subscriptions, and guarded workspace ownership. `@relvo-labs/agent-provider-claude` is the first live adapter: it executes text turns through the official Claude Agent SDK's structured `query()` API, with the SDK itself an optional peer dependency. Foundation v0.4 does **not** include a live Codex integration, a control plane, scheduling, remote execution, queues, tenancy, RBAC, workflow DAGs, or product-specific integrations.
 
 ## What is stable enough to build on
 

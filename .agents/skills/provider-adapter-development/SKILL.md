@@ -1,7 +1,7 @@
 ---
 name: provider-adapter-development
 description: Implement or change an AgentProvider against the neutral SPI, including capability descriptors, run handles, interaction settlement and the in-process trust boundary.
-version: 1.0.0
+version: 1.1.0
 stability: stable
 tags: [spi, provider, capabilities, trust-boundary]
 ---
@@ -26,8 +26,10 @@ Do not use this skill when:
 - you are changing how the Runtime composes providers or the registry — use
   `package-architecture`
 - the work is workspace acquisition or cleanup — use `workspace-lifecycle`
-- you are adding a production Codex or Claude adapter — **out of scope for the
-  foundation**; open an issue instead
+- you are adding a **new** production adapter package — that is a scoped,
+  reviewed milestone; open an issue first. `@relvo-labs/agent-provider-claude`
+  is live and in scope for this skill; `@relvo-labs/agent-provider-codex` is
+  still an explicit scaffold and must stay non-live until its own issue lands
 
 ## Owns
 
@@ -110,7 +112,26 @@ Do not use this skill when:
    enforced security control. See `docs/adr/ADR-0009-provider-trust-boundary.md`.
 
 7. **No PTY.** Control paths are structured. Do not add terminal scraping, ANSI parsing
-   or pseudo-terminal emulation to core or the SPI.
+   or pseudo-terminal emulation to core or the SPI. `tools/repo/check-static.ts` enforces
+   this for live adapter source by matching the module specifier, not the call site, so an
+   alias (`import { exec as run } from 'child_process'`) cannot slip past it.
+
+8. **Correlate before you settle.** A long-lived provider connection carries more than the
+   run in front of you: background, scheduled and already-retired turns share the same
+   stream. Bind each terminal frame to the run that caused it using the provider's own
+   correlation fields, and drop what you cannot attribute. Completing a run with another
+   turn's result is indistinguishable from a correct completion in the event log.
+
+9. **Publish classifications, not upstream prose.** `AgentError.message`, `providerCode`
+   and diagnostic text are durable and consumer-visible. Provider error strings routinely
+   contain credentials, native ids, paths and prompt text, so map them to a closed
+   allowlist instead of copying them — pattern-based redaction only catches the shapes you
+   already thought of. Raw text belongs in the host's own injected seam, not the log.
+
+10. **Depend on a non-permissive SDK as an optional peer.** A published package may only
+    carry permissively licensed runtime dependencies (`tools/repo/check-licenses.ts`).
+    Resolve such an SDK at runtime, keep the seam types hand-authored, and fail with a
+    typed `provider_unavailable` naming the package when it is absent.
 
 ## Verification
 
@@ -121,9 +142,14 @@ pnpm dag:check
 pnpm gate
 ```
 
-A new provider implementation must pass the shared conformance suite exported from
-`@relvo-labs/agent-provider/testing` without modifying the suite. If the suite must
-change to accommodate a provider, the SPI is under-specified — fix the SPI.
+`@relvo-labs/agent-provider/testing` exports `createScriptedProvider` — a deterministic
+double used to test the _runtime_ against the SPI. It is not a conformance suite for an
+adapter, and there is no exported adapter conformance suite yet: an adapter proves itself
+with its own deterministic tests that validate every emitted `ProviderEventInput` against
+the protocol schema and cover the failure, interrupt, disposal and correlation paths, with
+no credentials and no network. `packages/provider-claude/test` is the worked example.
+Extracting the shared parts into a real exported suite is open work; do not cite one that
+does not exist.
 
 Runtime cleanup tests inject disposal rejection and require a later identical close attempt
 to retry safely. An adapter that treats a rejected `dispose()` call as permanently consumed

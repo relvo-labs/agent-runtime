@@ -33,7 +33,30 @@ export type FakeQuery = {
   failNextInterrupt(reason: unknown): void;
   /** Make `return()` reject once, to exercise a failed disposal. */
   failNextReturn(reason: unknown): void;
+  /**
+   * Value the next `interrupt()` resolves with — an `interrupt_receipt_v1`
+   * payload, or `undefined` as an older CLI would answer.
+   */
+  setInterruptReceipt(receipt: unknown): void;
+  /**
+   * Hold `interrupt()` unresolved, the way the real control round-trip does
+   * while the CLI is still draining. Returns the release.
+   */
+  holdNextInterrupt(): () => void;
+  /** Hold `return()` unresolved so a concurrent disposal can be observed. */
+  holdNextReturn(): () => void;
 };
+
+/**
+ * The client uuid the adapter stamped on the n-th submitted message.
+ *
+ * Reading it back keeps the tests deterministic without predicting the value.
+ */
+export function submittedUuid(fake: FakeQuery, index = 0): string {
+  const uuid = fake.prompts[index]?.uuid;
+  if (uuid === undefined) throw new Error('the adapter did not stamp a client uuid on its input');
+  return uuid;
+}
 
 /** Drain the microtask queue; a macrotask boundary is a definite settle point. */
 export async function flush(): Promise<void> {
@@ -54,6 +77,9 @@ export function createFakeQuery(): FakeQuery {
   let returnCalls = 0;
   let nextInterruptFailure: { reason: unknown } | undefined;
   let nextReturnFailure: { reason: unknown } | undefined;
+  let interruptReceipt: unknown = undefined;
+  let heldInterrupt: (() => void) | undefined;
+  let heldReturn: (() => void) | undefined;
 
   function wake(): void {
     while (waiters.length > 0) {
@@ -79,6 +105,8 @@ export function createFakeQuery(): FakeQuery {
     }
   }
 
+  const release: { interrupt?: (() => void) | undefined; teardown?: (() => void) | undefined } = {};
+
   const handle: ClaudeQueryHandle = {
     async *[Symbol.asyncIterator]() {
       for (;;) {
@@ -97,29 +125,39 @@ export function createFakeQuery(): FakeQuery {
         yield result.value;
       }
     },
-    interrupt(): Promise<unknown> {
+    async interrupt(): Promise<unknown> {
       interruptCalls += 1;
+      const gate = heldInterrupt;
+      if (gate !== undefined) {
+        heldInterrupt = undefined;
+        await new Promise<void>((resolve) => {
+          release.interrupt = resolve;
+        });
+      }
       const rejection = nextInterruptFailure;
       if (rejection !== undefined) {
         nextInterruptFailure = undefined;
-        return Promise.reject(
-          rejection.reason instanceof Error ? rejection.reason : new Error(String(rejection.reason)),
-        );
+        throw rejection.reason instanceof Error ? rejection.reason : new Error(String(rejection.reason));
       }
-      return Promise.resolve(undefined);
+      return interruptReceipt;
     },
-    return(): Promise<unknown> {
+    async return(): Promise<unknown> {
       returnCalls += 1;
+      const gate = heldReturn;
+      if (gate !== undefined) {
+        heldReturn = undefined;
+        await new Promise<void>((resolve) => {
+          release.teardown = resolve;
+        });
+      }
       const rejection = nextReturnFailure;
       if (rejection !== undefined) {
         nextReturnFailure = undefined;
-        return Promise.reject(
-          rejection.reason instanceof Error ? rejection.reason : new Error(String(rejection.reason)),
-        );
+        throw rejection.reason instanceof Error ? rejection.reason : new Error(String(rejection.reason));
       }
       finished = true;
       wake();
-      return Promise.resolve(undefined);
+      return undefined;
     },
   };
 
@@ -156,6 +194,23 @@ export function createFakeQuery(): FakeQuery {
     },
     failNextReturn(reason: unknown): void {
       nextReturnFailure = { reason };
+    },
+    setInterruptReceipt(receipt: unknown): void {
+      interruptReceipt = receipt;
+    },
+    holdNextInterrupt(): () => void {
+      heldInterrupt = () => undefined;
+      return () => {
+        release.interrupt?.();
+        release.interrupt = undefined;
+      };
+    },
+    holdNextReturn(): () => void {
+      heldReturn = () => undefined;
+      return () => {
+        release.teardown?.();
+        release.teardown = undefined;
+      };
     },
   };
 }

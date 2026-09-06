@@ -66,11 +66,49 @@ for (const packageName of ['provider-codex']) {
 //      consumer and would put it in the published runtime closure.
 
 const CLAUDE_SDK_PACKAGE = '@anthropic-ai/claude-agent-sdk';
+
+/**
+ * Terminal-control detection.
+ *
+ * Matching call sites alone is not enough: an alias hides them
+ * (`import { exec as run } from 'child_process'`). The module specifier is the
+ * part that cannot be renamed away, so that is what this matches — bare and
+ * `node:`-prefixed, static import, dynamic import and require alike — alongside
+ * the call shapes and ANSI escapes that would indicate scraping.
+ */
+function terminalControlIn(source: string): boolean {
+  const processModule = /(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](?:node:)?child_process['"]/u;
+  const ptyModule = /(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](?:node-pty|@lydell\/node-pty)['"]/u;
+  const callShape = /\b(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(/u;
+  const ansiEscape = /\\u001[bB]\[|\\x1[bB]\[/u;
+  return processModule.test(source) || ptyModule.test(source) || callShape.test(source) || ansiEscape.test(source);
+}
+
+// The detector is itself checked, so a future edit cannot silently relax it.
+// A probe that stops failing is a validator that stopped validating.
+const TERMINAL_CONTROL_PROBES: readonly { readonly source: string; readonly detected: boolean }[] = [
+  { source: "import { exec as run } from 'child_process';", detected: true },
+  { source: "import { spawn } from 'node:child_process';", detected: true },
+  { source: "const cp = await import('child_process');", detected: true },
+  { source: "const { execFile: go } = require('node:child_process');", detected: true },
+  { source: "import pty from 'node-pty';", detected: true },
+  { source: 'child.stdout.write("\\u001b[2J");', detected: true },
+  { source: 'const result = spawnSync(argv);', detected: true },
+  { source: "import { query } from '@anthropic-ai/claude-agent-sdk';", detected: false },
+  { source: "import { isAbsolute } from 'node:path';", detected: false },
+  { source: 'const handle = query({ prompt, options });', detected: false },
+];
+for (const probe of TERMINAL_CONTROL_PROBES) {
+  if (terminalControlIn(probe.source) !== probe.detected) {
+    problems.push(
+      `terminal-control detector regressed: \`${probe.source}\` should ${probe.detected ? '' : 'not '}be detected`,
+    );
+  }
+}
+
 for (const file of files.filter((path) => path.startsWith('packages/provider-claude/src/'))) {
   const source = readFileSync(resolve(repoRoot, file), 'utf8');
-  const terminalControl = /node:child_process|node-pty|\bspawn(?:Sync)?\s*\(|\bexecFile\s*\(/u;
-  const ansiEscape = /\\u001[bB]\[|\\x1[bB]\[/u;
-  if (terminalControl.test(source) || ansiEscape.test(source)) {
+  if (terminalControlIn(source)) {
     problems.push(`${file}: claude adapter must drive the SDK, not a terminal or a child process`);
   }
   if (new RegExp(String.raw`(?:from|import)\s*\(?\s*['"]${CLAUDE_SDK_PACKAGE}['"]`, 'u').test(source)) {
@@ -91,6 +129,22 @@ if (claudeManifest.peerDependencies?.[CLAUDE_SDK_PACKAGE] === undefined) {
 }
 if (claudeManifest.peerDependenciesMeta?.[CLAUDE_SDK_PACKAGE]?.optional !== true) {
   problems.push(`packages/provider-claude: the ${CLAUDE_SDK_PACKAGE} peer must be optional`);
+}
+
+// The adapter documents the SDK line its hand-authored seam was derived from.
+// If the catalog pin moves without that constant moving, the package is
+// advertising a compatibility claim nobody re-checked.
+const workspaceManifest = readFileSync(resolve(repoRoot, 'pnpm-workspace.yaml'), 'utf8');
+const pinned = new RegExp(String.raw`^\s*'${CLAUDE_SDK_PACKAGE}':\s*(\S+)\s*$`, 'mu').exec(workspaceManifest)?.[1];
+const declared = /CLAUDE_AGENT_SDK_VERSION = '([^']+)'/u.exec(
+  readFileSync(resolve(repoRoot, 'packages/provider-claude/src/provider.ts'), 'utf8'),
+)?.[1];
+if (pinned === undefined) {
+  problems.push(`pnpm-workspace.yaml: ${CLAUDE_SDK_PACKAGE} must carry an exact catalog pin`);
+} else if (pinned !== declared) {
+  problems.push(
+    `packages/provider-claude: CLAUDE_AGENT_SDK_VERSION (${declared ?? 'absent'}) must match the catalog pin (${pinned})`,
+  );
 }
 
 // ---------------------------------------------------------------------------

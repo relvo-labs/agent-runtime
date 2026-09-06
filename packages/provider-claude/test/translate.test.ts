@@ -100,7 +100,7 @@ describe('claude message translation', () => {
     expect(JSON.stringify(result.events)).not.toContain('native-session');
   });
 
-  it('maps an error result to a failed termination carrying the native subtype as a provider code', () => {
+  it('maps an error result to a failed termination classified by its declared subtype', () => {
     const translator = createRunTranslator();
     const result = translator.translate({
       type: 'result',
@@ -113,7 +113,9 @@ describe('claude message translation', () => {
     if (result.termination?.outcome !== 'failed') throw new Error('expected a failed termination');
     expect(result.termination.error.code).toBe('provider_rejected');
     expect(result.termination.error.providerCode).toBe('error_max_turns');
-    expect(result.termination.error.message).toContain('turn budget exhausted');
+    expect(result.termination.error.message).toBe('claude ended the turn without completing it (error_max_turns)');
+    // The upstream prose is not carried, not even redacted: see redaction.test.ts.
+    expect(result.termination.error.message).not.toContain('turn budget exhausted');
   });
 
   it('treats a success subtype flagged as an error as a failure', () => {
@@ -122,7 +124,7 @@ describe('claude message translation', () => {
     expect(result.termination?.outcome).toBe('failed');
   });
 
-  it('redacts credential-shaped text and bounds the failure message', () => {
+  it('never carries upstream failure prose into the public error', () => {
     const translator = createRunTranslator();
     const secret = ['sk', 'ant', 'A'.repeat(30)].join('-');
     const result = translator.translate({
@@ -133,8 +135,11 @@ describe('claude message translation', () => {
     });
 
     if (result.termination?.outcome !== 'failed') throw new Error('expected a failed termination');
+    expect(result.termination.error.message).toBe(
+      'claude ended the turn without completing it (error_during_execution)',
+    );
     expect(result.termination.error.message).not.toContain(secret);
-    expect(result.termination.error.message).toContain('[redacted]');
+    expect(result.termination.error.message).not.toContain('auth failed');
     expect(result.termination.error.message.length).toBeLessThanOrEqual(2000);
   });
 

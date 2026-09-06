@@ -30,6 +30,8 @@ export {
 } from './options.ts';
 
 export type {
+  ClaudeInterruptReceipt,
+  ClaudeMessageUuid,
   ClaudePermissionMode,
   ClaudePromptMessage,
   ClaudeQuery,

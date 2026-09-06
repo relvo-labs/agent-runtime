@@ -11,7 +11,7 @@ import {
 import { isProviderRejection, type ProviderSession } from '@relvo-labs/agent-provider';
 
 import { createClaudeProvider } from '../src/index.ts';
-import { createFakeQuery, flush, type FakeQuery } from './fake-query.ts';
+import { createFakeQuery, flush, submittedUuid, type FakeQuery } from './fake-query.ts';
 
 const WORKSPACE_ROOT = '/tmp/relvo-claude-workspace';
 
@@ -205,7 +205,7 @@ describe('claude text run', () => {
     expect(sessionEvents.map((event) => event.payload)).toContainEqual({
       type: 'diagnostic',
       level: 'warning',
-      message: 'claude query stream failed: claude process exited with code 1',
+      message: 'the claude query stream failed (unknown)',
     });
   });
 
@@ -275,6 +275,82 @@ describe('claude run interrupt', () => {
     expect(fake.interruptCalls).toBe(0);
   });
 
+  it('reports a cancellation result that beats the interrupt acknowledgement as interrupted', async () => {
+    // The pinned SDK writes the receipt before the interrupted turn's result on
+    // a clean stop, but a turn that crashes during interrupt handling emits its
+    // error result first. Intent must be recorded before the round-trip, or a
+    // stop looks like a failure forever.
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const run = await session.startRun({ input: textInput('long job'), sink: recordingSink().sink, runRef: 'run-1' });
+    await flush();
+
+    const release = fake.holdNextInterrupt();
+    const interrupted = run.interrupt('user asked to stop');
+    await flush();
+    fake.push({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['aborted'] });
+    await flush();
+    release();
+    await interrupted;
+
+    await expect(run.completion).resolves.toEqual({ outcome: 'interrupted', reason: 'user asked to stop' });
+  });
+
+  it('coalesces concurrent interrupts into one control request', async () => {
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const run = await session.startRun({ input: textInput('long job'), sink: recordingSink().sink, runRef: 'run-1' });
+    await flush();
+
+    const release = fake.holdNextInterrupt();
+    const attempts = [run.interrupt('stop'), run.interrupt('stop again'), run.interrupt('stop once more')];
+    await flush();
+    release();
+    await Promise.all(attempts);
+
+    expect(fake.interruptCalls).toBe(1);
+    expect(fake.returnCalls).toBe(0);
+  });
+
+  it('refuses to claim interruption while the submitted input is still queued', async () => {
+    // `still_queued` lists client uuids that survived the stop and WILL run.
+    // The pinned public `interrupt()` takes no arguments, so the survivor cannot
+    // be recalled; claiming `interrupted` would mislabel the turn that follows.
+    const fake = createFakeQuery();
+    const { session, events: sessionEvents } = await openSession(fake);
+    const recorder = recordingSink();
+    const run = await session.startRun({ input: textInput('queued job'), sink: recorder.sink, runRef: 'run-1' });
+    await flush();
+    const uuid = submittedUuid(fake);
+    fake.setInterruptReceipt({ still_queued: [uuid] });
+
+    const error = await rejectionOf(run.interrupt('stop'));
+    expect(error.code).toBe('provider_rejected');
+    expect(error.details?.reason).toBe('input_still_queued');
+    expect(sessionEvents.map((event) => event.payload)).toContainEqual({
+      type: 'diagnostic',
+      level: 'warning',
+      message: 'claude could not recall input that was already submitted; the turn will still run',
+    });
+
+    // The turn then runs to completion, and is reported for what it was.
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: uuid });
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+  });
+
+  it('does not label a later result interrupted after a failed interrupt', async () => {
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const run = await session.startRun({ input: textInput('hi'), sink: recordingSink().sink, runRef: 'run-1' });
+    await flush();
+
+    fake.failNextInterrupt(new Error('control channel closed'));
+    await rejectionOf(run.interrupt('stop'));
+
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake) });
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+  });
+
   it('surfaces a failed interrupt as a typed rejection and allows an exact retry', async () => {
     const fake = createFakeQuery();
     const { session } = await openSession(fake);
@@ -310,6 +386,51 @@ describe('claude session disposal', () => {
       session.startRun({ input: textInput('after'), sink: recordingSink().sink, runRef: 'run-2' }),
     );
     expect(error.code).toBe('session_closed');
+  });
+
+  it('fences new runs as soon as disposal starts, not when it finishes', async () => {
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const release = fake.holdNextReturn();
+    const disposal = session.dispose();
+    await flush();
+
+    // Input is already closed here; admitting a run would hang it forever.
+    const error = await rejectionOf(
+      session.startRun({ input: textInput('too late'), sink: recordingSink().sink, runRef: 'run-1' }),
+    );
+    expect(error.code).toBe('session_closed');
+
+    release();
+    await disposal;
+  });
+
+  it('coalesces concurrent disposal into one teardown', async () => {
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const release = fake.holdNextReturn();
+    const attempts = [session.dispose(), session.dispose(), session.dispose()];
+    await flush();
+    release();
+    await Promise.all(attempts);
+
+    expect(fake.returnCalls).toBe(1);
+  });
+
+  it('settles an active run when the stream ends during a failed disposal', async () => {
+    const fake = createFakeQuery();
+    const { session } = await openSession(fake);
+    const run = await session.startRun({ input: textInput('hi'), sink: recordingSink().sink, runRef: 'run-1' });
+    await flush();
+
+    fake.failNextReturn(new Error('teardown failed'));
+    await expect(session.dispose()).rejects.toThrow();
+    fake.end();
+
+    // Disposal failed, but the run can never produce a result now: leaving it
+    // unsettled would hang the runtime's cleanup instead of failing it.
+    const termination = await run.completion;
+    expect(termination.outcome).toBe('interrupted');
   });
 
   it('stays retryable after a rejected disposal', async () => {

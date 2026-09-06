@@ -29,11 +29,29 @@
  */
 export type ClaudePermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
-/** One user message pushed into the SDK's streaming input. */
+/**
+ * A client message identifier.
+ *
+ * Shaped like the SDK's `UUID` (from `node:crypto`) so a stamped prompt stays
+ * assignable to `SDKUserMessage`.
+ */
+export type ClaudeMessageUuid = `${string}-${string}-${string}-${string}-${string}`;
+
+/**
+ * One user message pushed into the SDK's streaming input.
+ *
+ * `uuid` is the *client* message id. Stamping it is what makes a turn
+ * attributable: the SDK echoes it back as `user_message_uuid` on the turn's
+ * first reply frame and on its result, and lists it in an interrupt receipt's
+ * `still_queued` when the message survived the stop. An unstamped message runs
+ * but can never be correlated or listed, so this adapter always stamps one.
+ * The value is generated per run and never leaves the adapter.
+ */
 export type ClaudePromptMessage = {
   readonly type: 'user';
   readonly message: { readonly role: 'user'; readonly content: string };
   readonly parent_tool_use_id: null;
+  readonly uuid?: ClaudeMessageUuid;
 };
 
 /**
@@ -71,6 +89,31 @@ export type ClaudeQueryMessage = {
   readonly error?: unknown;
   readonly errors?: unknown;
   readonly session_id?: string;
+  /**
+   * Client uuid of the user message that triggered this turn. Present on the
+   * turn's first reply frame and on its result; absent on later frames, on
+   * synthetic/scheduled turns, and on turns submitted without a client uuid.
+   */
+  readonly user_message_uuid?: string;
+  /** Every client uuid this turn consumed, when a batch was coalesced. */
+  readonly user_message_uuids?: unknown;
+  /** Non-null on a subagent frame of the turn that is already bound. */
+  readonly parent_tool_use_id?: unknown;
+};
+
+/**
+ * The value an interrupt resolves with on a CLI advertising
+ * `interrupt_receipt_v1`. Older CLIs resolve with `undefined`.
+ *
+ * `still_queued` lists client uuids that **survived** the stop and will still
+ * run. The public `interrupt()` takes no arguments in the pinned SDK, so
+ * `cancel_queued` cannot be requested and a survivor cannot be recalled — this
+ * adapter therefore reports the stop as not applied rather than claiming a run
+ * was interrupted while its input is still going to execute.
+ */
+export type ClaudeInterruptReceipt = {
+  readonly still_queued?: unknown;
+  readonly cancelled?: unknown;
 };
 
 /**
