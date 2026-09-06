@@ -117,7 +117,11 @@ function evaluateTriggerPolicy(source: string): string[] {
   } else {
     let currentEvent = '';
     for (const line of lines.slice(onKey.index + 1)) {
-      if (line.trim() === '') continue;
+      // Blank and comment-only lines are not mapping entries and do not close the `on`
+      // mapping, at any column. They must be consumed as non-semantic *before* the
+      // indentation boundary below decides the mapping ended, otherwise a comment at
+      // column 0 would terminate the scan and hide every trigger entry after it.
+      if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
       if (!line.startsWith('  ')) break;
       const event = /^ {2}([a-z_]+):\s*$/u.exec(line);
       if (event?.[1] !== undefined) {
@@ -311,6 +315,42 @@ on:
     branches: [main]
   pull_request:
     types: [ready_for_review]
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    // Regression: a comment at column 0 is not a mapping terminator. Before this was
+    // fixed the scan broke at the comment and accepted the push trigger below it.
+    name: 'forbidden push trigger after a column-0 comment',
+    reason: /must not run on push/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+# additional event
+  push:
+
+permissions:
+  contents: read
+`,
+  },
+  {
+    // Regression: same terminator bug, reached through an unsupported filter key
+    // rather than a new event.
+    name: 'unsupported branches filter after a column-0 comment',
+    reason: /unsupported entry: branches: \[main\]/u,
+    source: `name: gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [ready_for_review]
+# additional filter
+    branches: [main]
 
 permissions:
   contents: read
