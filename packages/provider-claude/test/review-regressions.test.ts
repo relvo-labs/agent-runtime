@@ -172,6 +172,108 @@ describe('claude terminal result versus interrupt rejection', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 2b — stream termination versus a pending interrupt reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive one run to a correlated success while an interrupt round-trip is held
+ * open, then end the session's stream the way `terminate` asks.
+ *
+ * The stream ending is the session's news, not the turn's: this turn already
+ * reported its own outcome. Whether that outcome is an interruption is still
+ * undecided until the held control request answers, so the stream ending must
+ * not decide it early.
+ */
+async function successThenStreamTermination(terminate: (fake: FakeQuery) => void): Promise<{
+  run: ProviderRun;
+  attempt: Promise<void>;
+  uuid: string;
+  release: () => void;
+  fake: FakeQuery;
+  /** Whether the stream ending published a completion on its own. */
+  settledAtTermination: boolean;
+}> {
+  const fake = createFakeQuery();
+  const { session } = await openSession(fake);
+  const run = await session.startRun({ input: textInput('long job'), sink: recordingSink().sink, runRef: 'run-1' });
+  await flush();
+  const uuid = submittedUuid(fake, 0);
+
+  const release = fake.holdNextInterrupt();
+  const attempt = run.interrupt('user asked to stop');
+  await flush();
+
+  // The turn reports its own success while the control request is in flight.
+  fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: uuid });
+  await flush();
+
+  terminate(fake);
+  await flush();
+
+  // Read, not asserted here: each case asserts the outcome first, so a failure
+  // reports the completion the adapter actually published.
+  return { run, attempt, uuid, release, fake, settledAtTermination: await settled(run) };
+}
+
+describe('claude stream termination versus pending interrupt reconciliation', () => {
+  it('reports the observed success when the stream ends before a refused interrupt answers', async () => {
+    const { run, attempt, release, fake, settledAtTermination } = await successThenStreamTermination((query) =>
+      query.end(),
+    );
+
+    fake.failNextInterrupt(new Error('control channel closed'));
+    release();
+
+    const error = await rejectionOf(attempt);
+    expect(error.code).toBe('provider_rejected');
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    expect(settledAtTermination).toBe(false);
+  });
+
+  it('reports the observed success when the stream ends before a queued-survivor receipt arrives', async () => {
+    const { run, attempt, uuid, release, fake, settledAtTermination } = await successThenStreamTermination((query) =>
+      query.end(),
+    );
+
+    fake.setInterruptReceipt({ still_queued: [uuid] });
+    release();
+
+    const error = await rejectionOf(attempt);
+    expect(error.details?.reason).toBe('input_still_queued');
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    expect(settledAtTermination).toBe(false);
+  });
+
+  it('reports the observed success when the stream fails before a refused interrupt answers', async () => {
+    const { run, attempt, release, fake, settledAtTermination } = await successThenStreamTermination((query) => {
+      query.fail(new Error('claude cli exited'));
+    });
+
+    fake.failNextInterrupt(new Error('control channel closed'));
+    release();
+
+    const error = await rejectionOf(attempt);
+    expect(error.code).toBe('provider_rejected');
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    expect(settledAtTermination).toBe(false);
+  });
+
+  it('reports the observed success when the stream fails before a queued-survivor receipt arrives', async () => {
+    const { run, attempt, uuid, release, fake, settledAtTermination } = await successThenStreamTermination((query) => {
+      query.fail(new Error('claude cli exited'));
+    });
+
+    fake.setInterruptReceipt({ still_queued: [uuid] });
+    release();
+
+    const error = await rejectionOf(attempt);
+    expect(error.details?.reason).toBe('input_still_queued');
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    expect(settledAtTermination).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3 — synchronous teardown failure retryability
 // ---------------------------------------------------------------------------
 

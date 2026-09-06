@@ -287,12 +287,27 @@ function createSessionFor(
    * Settle whatever run is active because the session, not the turn, ended it:
    * the stream closed or failed, or the session was disposed. A turn that had
    * already reported its own outcome keeps it.
+   *
+   * `awaitInterrupt` says whether an interrupt round-trip still in flight may
+   * finish deciding how such an outcome is classified. The stream ending is the
+   * session's news and never that decision, so it must leave the observed
+   * result pending rather than publish provisional interrupt intent as final —
+   * a run that is already terminal cannot be reconciled afterwards. Disposal
+   * passes `false`: it has aborted the control request it would be waiting for,
+   * and completion may not hang on an answer that can no longer arrive.
+   *
+   * With no reconciliation pending, both paths settle immediately.
    */
-  function settle(termination: ProviderRunTermination): void {
+  function settle(termination: ProviderRunTermination, awaitInterrupt: boolean): void {
     const run = active;
     if (run === undefined || run.terminated) return;
     const observed = run.observed;
-    finalize(run, observed === undefined ? termination : classified(run, observed));
+    if (observed === undefined) {
+      finalize(run, termination);
+      return;
+    }
+    if (awaitInterrupt && run.interruptAttempt !== undefined) return;
+    finalize(run, classified(run, observed));
   }
 
   /**
@@ -371,20 +386,23 @@ function createSessionFor(
         // Disposal owns the outcome of a run still in flight, but the run must
         // still settle: its result can never arrive once the stream is over.
         if (disposing) {
-          settle({ outcome: 'interrupted', reason: DISPOSED_REASON });
+          settle({ outcome: 'interrupted', reason: DISPOSED_REASON }, false);
           return;
         }
         init.sink.emit({
           payload: { type: 'diagnostic', level: 'warning', message: 'claude query stream ended' },
         });
-        settle({
-          outcome: 'failed',
-          error: agentError('provider_contract_violation', 'claude query ended without a result for the active run'),
-        });
+        settle(
+          {
+            outcome: 'failed',
+            error: agentError('provider_contract_violation', 'claude query ended without a result for the active run'),
+          },
+          true,
+        );
       } catch (error) {
         streamClosed = true;
         if (disposing) {
-          settle({ outcome: 'interrupted', reason: DISPOSED_REASON });
+          settle({ outcome: 'interrupted', reason: DISPOSED_REASON }, false);
           return;
         }
         const cause = classifyThrown(error);
@@ -395,10 +413,13 @@ function createSessionFor(
             message: `the claude query stream failed (${cause})`,
           },
         });
-        settle({
-          outcome: 'failed',
-          error: agentError('provider_unavailable', `the claude query stream failed (${cause})`),
-        });
+        settle(
+          {
+            outcome: 'failed',
+            error: agentError('provider_unavailable', `the claude query stream failed (${cause})`),
+          },
+          true,
+        );
       }
     })();
   }
@@ -569,7 +590,7 @@ function createSessionFor(
         }
         disposed = true;
         streamClosed = true;
-        settle({ outcome: 'interrupted', reason: DISPOSED_REASON });
+        settle({ outcome: 'interrupted', reason: DISPOSED_REASON }, false);
       })();
       teardown = attempt;
       return attempt;
