@@ -1,0 +1,41 @@
+{
+  "name": "@relvo-labs/agent-executor",
+  "version": "0.1.0",
+  "description": "Consumer-facing AgentExecutor contract and its framework-agnostic conformance kit.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": "^22.18.0 || ^24.11.0 || ^26.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@relvo-labs/agent-protocol": "workspace:^"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/relvo-labs/agent-runtime.git",
+    "directory": "packages/executor"
+  }
+}

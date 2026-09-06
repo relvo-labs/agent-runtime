@@ -1,0 +1,51 @@
+{
+  "$defs": {
+    "sequence": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session-id": {
+      "pattern": "^ses_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/subscription-request.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bufferSize": {
+      "default": 1024,
+      "maximum": 65536,
+      "minimum": 8,
+      "type": "integer"
+    },
+    "fromSequence": {
+      "$ref": "#/$defs/sequence",
+      "default": 0
+    },
+    "overflowPolicy": {
+      "default": "signal_and_close",
+      "enum": [
+        "signal_and_close",
+        "signal_and_skip"
+      ],
+      "type": "string"
+    },
+    "sessionId": {
+      "$ref": "#/$defs/session-id"
+    },
+    "types": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "sessionId"
+  ],
+  "title": "subscription-request",
+  "type": "object",
+  "x-wire-version": "0.4"
+}

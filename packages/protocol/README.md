@@ -1,0 +1,3 @@
+# `@relvo-labs/agent-protocol`
+
+Authoritative Zod schemas, inferred TypeScript types, and generated JSON Schema for the Relvo Agent Runtime wire contract. The `/schemas` export exposes deterministic input-mode schemas for non-TypeScript consumers. Omitted default-filled values are optional in both validators unless the resulting default violates a post-default invariant; the generated conditional then rejects the omission exactly as Zod does. Zod additionally rejects cyclic, accessor-backed, or otherwise hostile in-process JavaScript graphs without throwing; generated JSON Schema describes parsed JSON instances, where object identity, accessors, proxies, and cycles do not exist.

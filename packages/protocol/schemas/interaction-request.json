@@ -1,0 +1,182 @@
+{
+  "$defs": {
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "approval-request": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedModes": {
+          "items": {
+            "$ref": "#/$defs/approval-mode"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "riskHint": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "$ref": "#/$defs/approval-subject"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "allowedModes"
+      ],
+      "type": "object"
+    },
+    "approval-subject": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "command",
+            "file_write",
+            "file_delete",
+            "network",
+            "tool",
+            "other"
+          ],
+          "type": "string"
+        },
+        "detail": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "interaction-request": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-request"
+        },
+        {
+          "$ref": "#/$defs/approval-request"
+        }
+      ]
+    },
+    "json-value": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/json-value"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "question-choice": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 400,
+          "minLength": 1,
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "type": "object"
+    },
+    "question-request": {
+      "additionalProperties": false,
+      "properties": {
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/question-choice"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "placeholder": {
+          "maxLength": 400,
+          "type": "string"
+        },
+        "prompt": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/interaction-request.json",
+  "$ref": "#/$defs/interaction-request",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "interaction-request",
+  "x-wire-version": "0.4"
+}

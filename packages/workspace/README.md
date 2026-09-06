@@ -1,0 +1,3 @@
+# `@relvo-labs/agent-workspace`
+
+Workspace SPI and guarded local implementation. Existing directories are borrowed and never removed; the local lease keeps canonical ownership/root in private immutable state rather than caller-mutable fields. Third-party descriptors are validated asynchronously and an existing lease must match the requested path's canonical realpath before exposure. Managed specs are runtime-parsed before filesystem effects; directories are newly created and post-resolution checked inside the managed base. Release is one concurrency-idempotent operation: concurrent callers coalesce, failed attempts remain retryable, and success is permanently idempotent.

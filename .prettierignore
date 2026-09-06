@@ -1,0 +1,8 @@
+dist
+coverage
+node_modules
+pnpm-lock.yaml
+.agents/skills/INDEX.md
+packages/protocol/schemas
+packages/protocol/src/generated
+CHANGELOG.md

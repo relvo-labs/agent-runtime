@@ -1,0 +1,48 @@
+packages:
+  - packages/*
+  - examples/*
+
+autoInstallPeers: false
+strictPeerDependencies: true
+
+# Dependency lifecycle scripts are denied by default (pnpm >= 10 behaviour).
+# Adding an entry here is a reviewed supply-chain decision, not a convenience.
+# See .agents/skills/pnpm-supply-chain/SKILL.md.
+onlyBuiltDependencies: []
+
+# Single source of truth for every third-party version in the workspace.
+# Packages reference `catalog:` so a version can never drift per package.
+catalog:
+  # --- runtime dependencies (shipped) -------------------------------------
+  zod: 4.5.4
+
+  # --- toolchain (dev only) ------------------------------------------------
+  # TypeScript is pinned to the 6.x line on purpose. typescript@7 is the
+  # native port and ships no JavaScript compiler API, which type-aware
+  # linting depends on. See docs/adr/ADR-0012-typescript-toolchain-line.md.
+  typescript: 6.0.3
+  # Typed against the LOWEST supported Node line (22.18) so a package can
+  # never compile against an API that is missing on the oldest matrix entry.
+  '@types/node': 22.20.1
+
+  vitest: 4.1.11
+  '@vitest/coverage-v8': 4.1.11
+  ajv: 8.17.1
+  ajv-formats: 3.0.1
+
+  eslint: 10.9.1
+  '@eslint/js': 10.0.1
+  typescript-eslint: 8.69.0
+  eslint-config-prettier: 10.1.8
+  prettier: 3.9.6
+
+  tsdown: 0.22.14
+  publint: 0.3.24
+  '@arethetypeswrong/cli': 0.18.5
+  '@changesets/cli': 3.0.1
+
+# Supply-chain cooldown: a freshly published version is the highest-risk window
+# for a compromised release. Refuse anything younger than 3 days unless it is
+# explicitly excluded below after review.
+minimumReleaseAge: 4320 # minutes (3 days)
+minimumReleaseAgeStrict: true

@@ -1,0 +1,87 @@
+{
+  "$defs": {
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "approval-response": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": [
+            "approved",
+            "denied"
+          ],
+          "type": "string"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/approval-mode"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "interaction-response": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-response"
+        },
+        {
+          "$ref": "#/$defs/approval-response"
+        }
+      ]
+    },
+    "question-response": {
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "maxLength": 16000,
+              "type": "string"
+            },
+            {
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            }
+          ]
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/interaction-response.json",
+  "$ref": "#/$defs/interaction-response",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "interaction-response",
+  "x-wire-version": "0.4"
+}

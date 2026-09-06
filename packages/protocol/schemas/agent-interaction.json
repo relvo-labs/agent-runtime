@@ -1,0 +1,538 @@
+{
+  "$defs": {
+    "agent-error": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/agent-error-code"
+        },
+        "details": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "message": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "providerCode": {
+          "maxLength": 200,
+          "type": "string"
+        },
+        "retryable": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "agent-error-code": {
+      "enum": [
+        "invalid_request",
+        "unknown_session",
+        "unknown_turn",
+        "unknown_run",
+        "unknown_interaction",
+        "illegal_state_transition",
+        "command_id_conflict",
+        "session_closed",
+        "run_already_terminal",
+        "interaction_already_settled",
+        "interaction_expired",
+        "capability_unsupported",
+        "workspace_unavailable",
+        "workspace_ownership_violation",
+        "provider_not_registered",
+        "provider_rejected",
+        "provider_unavailable",
+        "provider_contract_violation",
+        "store_conflict",
+        "store_unavailable",
+        "subscriber_overflow",
+        "cursor_out_of_range",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "approval-request": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedModes": {
+          "items": {
+            "$ref": "#/$defs/approval-mode"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "riskHint": {
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "subject": {
+          "$ref": "#/$defs/approval-subject"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "allowedModes"
+      ],
+      "type": "object"
+    },
+    "approval-response": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": [
+            "approved",
+            "denied"
+          ],
+          "type": "string"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/approval-mode"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "approval-subject": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "command",
+            "file_write",
+            "file_delete",
+            "network",
+            "tool",
+            "other"
+          ],
+          "type": "string"
+        },
+        "detail": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "summary": {
+          "maxLength": 2000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "interaction-id": {
+      "pattern": "^int_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "interaction-request": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-request"
+        },
+        {
+          "$ref": "#/$defs/approval-request"
+        }
+      ]
+    },
+    "interaction-response": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-response"
+        },
+        {
+          "$ref": "#/$defs/approval-response"
+        }
+      ]
+    },
+    "interaction-settlement": {
+      "additionalProperties": false,
+      "else": {
+        "not": {
+          "required": [
+            "response"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "responded"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/agent-error"
+        },
+        "outcome": {
+          "$ref": "#/$defs/settlement-outcome"
+        },
+        "response": {
+          "$ref": "#/$defs/interaction-response"
+        },
+        "settledAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "required": [
+        "outcome",
+        "settledAt"
+      ],
+      "then": {
+        "required": [
+          "response"
+        ]
+      },
+      "type": "object"
+    },
+    "json-value": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/json-value"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "question-choice": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 400,
+          "minLength": 1,
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "label"
+      ],
+      "type": "object"
+    },
+    "question-request": {
+      "additionalProperties": false,
+      "properties": {
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/question-choice"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "placeholder": {
+          "maxLength": 400,
+          "type": "string"
+        },
+        "prompt": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "question-response": {
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "maxLength": 16000,
+              "type": "string"
+            },
+            {
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            }
+          ]
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer"
+      ],
+      "type": "object"
+    },
+    "run-id": {
+      "pattern": "^run_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "session-id": {
+      "pattern": "^ses_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "settlement-outcome": {
+      "enum": [
+        "responded",
+        "cancelled",
+        "expired",
+        "withdrawn"
+      ],
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+      "type": "string"
+    },
+    "turn-id": {
+      "pattern": "^trn_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-interaction.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "not": {
+          "required": [
+            "settlement"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "settled"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "settlement"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {
+              "kind": {
+                "const": "question"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ]
+      },
+      "then": {
+        "properties": {
+          "settlement": {
+            "properties": {
+              "response": {
+                "properties": {
+                  "kind": {
+                    "const": "question"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {
+              "kind": {
+                "const": "approval"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "request"
+        ]
+      },
+      "then": {
+        "properties": {
+          "settlement": {
+            "properties": {
+              "response": {
+                "properties": {
+                  "kind": {
+                    "const": "approval"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "expiresAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "interactionId": {
+      "$ref": "#/$defs/interaction-id"
+    },
+    "request": {
+      "$ref": "#/$defs/interaction-request"
+    },
+    "requestedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "runId": {
+      "$ref": "#/$defs/run-id"
+    },
+    "sessionId": {
+      "$ref": "#/$defs/session-id"
+    },
+    "settlement": {
+      "$ref": "#/$defs/interaction-settlement"
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "settled"
+      ],
+      "type": "string"
+    },
+    "turnId": {
+      "$ref": "#/$defs/turn-id"
+    }
+  },
+  "required": [
+    "interactionId",
+    "sessionId",
+    "turnId",
+    "runId",
+    "status",
+    "request",
+    "requestedAt"
+  ],
+  "title": "agent-interaction",
+  "type": "object",
+  "x-wire-version": "0.4"
+}

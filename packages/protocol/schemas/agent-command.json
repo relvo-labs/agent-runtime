@@ -1,0 +1,414 @@
+{
+  "$defs": {
+    "approval-mode": {
+      "enum": [
+        "once",
+        "session",
+        "persistent"
+      ],
+      "type": "string"
+    },
+    "approval-response": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "enum": [
+            "approved",
+            "denied"
+          ],
+          "type": "string"
+        },
+        "kind": {
+          "const": "approval",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/approval-mode"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "command-id": {
+      "maxLength": 128,
+      "minLength": 8,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "type": "string"
+    },
+    "interaction-id": {
+      "pattern": "^int_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "interaction-response": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/question-response"
+        },
+        {
+          "$ref": "#/$defs/approval-response"
+        }
+      ]
+    },
+    "json-value": {
+      "anyOf": [
+        {
+          "type": [
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/json-value"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    },
+    "question-response": {
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "maxLength": 16000,
+              "type": "string"
+            },
+            {
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            }
+          ]
+        },
+        "kind": {
+          "const": "question",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer"
+      ],
+      "type": "object"
+    },
+    "run-id": {
+      "pattern": "^run_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "session-id": {
+      "pattern": "^ses_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "turn-input": {
+      "additionalProperties": false,
+      "properties": {
+        "metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "parts": {
+          "items": {
+            "$ref": "#/$defs/turn-input-part"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "parts"
+      ],
+      "type": "object"
+    },
+    "turn-input-part": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "maxLength": 1000000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": "^(?![\\\\/])(?![A-Za-z]:[\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$",
+              "type": "string"
+            },
+            "type": {
+              "const": "file_ref",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "workspace-spec": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "existing",
+              "type": "string"
+            },
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "managed",
+              "type": "string"
+            },
+            "name": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "type": "string"
+            },
+            "source": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "git",
+                  "type": "string"
+                },
+                "ref": {
+                  "minLength": 1,
+                  "pattern": "^[^-]",
+                  "type": "string"
+                },
+                "remote": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "remote"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-command.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "$ref": "#/$defs/command-id"
+        },
+        "providerId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "providerOptions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/json-value"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "type": {
+          "const": "open_session",
+          "type": "string"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace-spec"
+        }
+      },
+      "required": [
+        "commandId",
+        "type",
+        "providerId",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "$ref": "#/$defs/command-id"
+        },
+        "input": {
+          "$ref": "#/$defs/turn-input"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/session-id"
+        },
+        "type": {
+          "const": "submit_turn",
+          "type": "string"
+        }
+      },
+      "required": [
+        "commandId",
+        "type",
+        "sessionId",
+        "input"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "$ref": "#/$defs/command-id"
+        },
+        "reason": {
+          "maxLength": 2000,
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/run-id"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/session-id"
+        },
+        "type": {
+          "const": "interrupt_run",
+          "type": "string"
+        }
+      },
+      "required": [
+        "commandId",
+        "type",
+        "sessionId",
+        "runId"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "$ref": "#/$defs/command-id"
+        },
+        "interactionId": {
+          "$ref": "#/$defs/interaction-id"
+        },
+        "response": {
+          "$ref": "#/$defs/interaction-response"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/session-id"
+        },
+        "type": {
+          "const": "respond_to_interaction",
+          "type": "string"
+        }
+      },
+      "required": [
+        "commandId",
+        "type",
+        "sessionId",
+        "interactionId",
+        "response"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "commandId": {
+          "$ref": "#/$defs/command-id"
+        },
+        "ifRunActive": {
+          "default": "interrupt",
+          "enum": [
+            "interrupt",
+            "reject"
+          ],
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/session-id"
+        },
+        "type": {
+          "const": "close_session",
+          "type": "string"
+        }
+      },
+      "required": [
+        "commandId",
+        "type",
+        "sessionId"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "agent-command",
+  "x-wire-version": "0.4"
+}

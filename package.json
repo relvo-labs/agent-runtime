@@ -1,0 +1,53 @@
+{
+  "name": "@relvo-labs/agent-runtime-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Workspace root for the Relvo Agent Runtime foundation. Not published.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": "^22.18.0 || ^24.11.0 || ^26.0.0"
+  },
+  "scripts": {
+    "gate": "node tools/repo/gate.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "tsc --build tsconfig.build.json",
+    "engines:check": "node tools/repo/check-engines.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "pnpm -r --filter \"./packages/*\" run build",
+    "clean": "node tools/repo/clean.ts",
+    "schema:generate": "node tools/repo/generate-schemas.ts",
+    "schema:check": "node tools/repo/generate-schemas.ts --check",
+    "skills:index": "node tools/skills/generate-index.ts",
+    "skills:check": "node tools/skills/generate-index.ts --check && node tools/skills/validate.ts",
+    "dag:check": "node tools/repo/check-dag.ts",
+    "artifacts:check": "node tools/repo/check-artifacts.ts",
+    "supply-chain:check": "node tools/repo/check-supply-chain.ts",
+    "static:check": "node tools/repo/check-static.ts",
+    "licenses:check": "node tools/repo/check-licenses.ts",
+    "changeset": "changeset",
+    "changeset:status": "changeset status"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "catalog:",
+    "@changesets/cli": "catalog:",
+    "@eslint/js": "catalog:",
+    "@types/node": "catalog:",
+    "@vitest/coverage-v8": "catalog:",
+    "ajv": "catalog:",
+    "ajv-formats": "catalog:",
+    "eslint": "catalog:",
+    "eslint-config-prettier": "catalog:",
+    "prettier": "catalog:",
+    "publint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "typescript-eslint": "catalog:",
+    "vitest": "catalog:",
+    "zod": "catalog:"
+  }
+}

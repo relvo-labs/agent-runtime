@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "command-result": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "sessionId": {
+              "$ref": "#/$defs/session-id"
+            },
+            "type": {
+              "const": "session_opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "runId": {
+              "$ref": "#/$defs/run-id"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/session-id"
+            },
+            "turnId": {
+              "$ref": "#/$defs/turn-id"
+            },
+            "type": {
+              "const": "turn_accepted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "turnId",
+            "runId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "delivered": {
+              "type": "boolean"
+            },
+            "runId": {
+              "$ref": "#/$defs/run-id"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/session-id"
+            },
+            "type": {
+              "const": "run_interrupt_requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "runId",
+            "delivered"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "interactionId": {
+              "$ref": "#/$defs/interaction-id"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/session-id"
+            },
+            "type": {
+              "const": "interaction_settled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "interactionId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "interruptedActiveRun": {
+              "type": "boolean"
+            },
+            "sessionId": {
+              "$ref": "#/$defs/session-id"
+            },
+            "type": {
+              "const": "session_closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sessionId",
+            "interruptedActiveRun"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "interaction-id": {
+      "pattern": "^int_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "run-id": {
+      "pattern": "^run_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "session-id": {
+      "pattern": "^ses_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    },
+    "turn-id": {
+      "pattern": "^trn_[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{16,32}$",
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/command-result.json",
+  "$ref": "#/$defs/command-result",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "command-result",
+  "x-wire-version": "0.4"
+}

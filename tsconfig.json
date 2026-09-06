@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // Typecheck resolves workspace packages to SOURCE so a check never depends
+    // on build ordering. Resolution of the *published* declarations is proven
+    // separately, against packed tarballs, by `pnpm artifacts:check`.
+    // No `baseUrl`: it is deprecated in TS 6 and removed in TS 7. `paths`
+    // entries are resolved relative to this file.
+    "paths": {
+      "@relvo-labs/agent-protocol": ["./packages/protocol/src/index.ts"],
+      "@relvo-labs/agent-executor": ["./packages/executor/src/index.ts"],
+      "@relvo-labs/agent-provider": ["./packages/provider/src/index.ts"],
+      "@relvo-labs/agent-provider/testing": ["./packages/provider/src/testing/index.ts"],
+      "@relvo-labs/agent-provider-codex": ["./packages/provider-codex/src/index.ts"],
+      "@relvo-labs/agent-provider-claude": ["./packages/provider-claude/src/index.ts"],
+      "@relvo-labs/agent-workspace": ["./packages/workspace/src/index.ts"],
+      "@relvo-labs/agent-workspace-git": ["./packages/workspace-git/src/index.ts"],
+      "@relvo-labs/agent-runtime": ["./packages/runtime/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "tools/**/*.ts", "*.config.ts"],
+  "exclude": ["**/dist/**", "**/node_modules/**", "tools/skills/__fixtures__/**", "examples/**"]
+}
