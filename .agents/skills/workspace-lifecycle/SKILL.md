@@ -1,7 +1,7 @@
 ---
 name: workspace-lifecycle
 description: Acquire, lease and release agent workspaces so that borrowed directories are never destructively mutated and managed cleanup stays ownership-bound and idempotent.
-version: 1.0.0
+version: 1.1.0
 stability: stable
 tags: [workspace, lease, cleanup, filesystem-safety]
 ---
@@ -77,6 +77,14 @@ Do not use this skill when:
    `{ alreadyReleased: true }` and performs nothing. `WorkspaceReleaseReport` contains
    `destructiveOperations: string[]`; for a borrowed lease this array must be empty — that
    is a tested invariant, not a convention. Never fabricate a success report after failure.
+
+   **A provider-wide `releaseAll()` sweep is attempt-all, never fail-fast.** Snapshot the
+   tracked leases, attempt every entry even after one rejects, forget the entries that
+   succeeded, and leave the entries that failed tracked and retryable by a later sweep.
+   Only then reject, with an aggregate that stays truthful about the whole sweep:
+   `workspace_unavailable` carrying `attempted`, `released` and the failed lease ids, and
+   an `AggregateError` cause holding every individual failure. One lease that cannot be
+   released must never starve the cleanup of every later lease.
 
 4. **Do not follow symlinks out of the base directory.** Resolve with `fs.realpath`
    before comparing paths, and compare on path segments (`a/b` is not inside `a/bc`).

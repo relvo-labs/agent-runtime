@@ -141,7 +141,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `workspace-lifecycle`
 
-- **Version:** 1.0.0 (stable)
+- **Version:** 1.1.0 (stable)
 - **Path:** `.agents/skills/workspace-lifecycle/SKILL.md`
 - **Description:** Acquire, lease and release agent workspaces so that borrowed directories are never destructively mutated and managed cleanup stays ownership-bound and idempotent.
 - **Tags:** `cleanup`, `filesystem-safety`, `lease`, `workspace`

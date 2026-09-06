@@ -574,6 +574,23 @@
     },
     "interaction-settlement": {
       "additionalProperties": false,
+      "else": {
+        "not": {
+          "required": [
+            "response"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "responded"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
       "properties": {
         "error": {
           "$ref": "#/$defs/agent-error"
@@ -592,6 +609,11 @@
         "outcome",
         "settledAt"
       ],
+      "then": {
+        "required": [
+          "response"
+        ]
+      },
       "type": "object"
     },
     "json-value": {

@@ -77,6 +77,99 @@ const agentSessionBase = {
 };
 const sharedDetail = { value: 'shared' };
 
+// --- InteractionSettlement `responded` iff `response` -----------------------
+//
+// The invariant lives on a *shared* sub-schema, so it must survive being
+// extracted into `$defs` and referenced from every published root that embeds
+// it. These builders wrap one settlement in each of the six affected roots.
+
+const settledInteractionWith = (settlement: unknown): unknown => ({
+  ...interactionBase,
+  status: 'settled',
+  settlement,
+});
+const interactionSettledPayload = (settlement: unknown): unknown => ({
+  type: 'interaction.settled',
+  interactionId: 'int_0000000000000001',
+  turnId: 'trn_0000000000000001',
+  settlement,
+});
+const settlementEnvelope = (settlement: unknown): unknown => ({
+  eventId: 'evt_0000000000000001',
+  sessionId: 'ses_0000000000000001',
+  runId: 'run_0000000000000001',
+  sequence: 7,
+  occurredAt: timestamp,
+  wireVersion: '0.4',
+  payload: interactionSettledPayload(settlement),
+});
+const settlementSnapshot = (settlement: unknown): unknown => ({
+  session: { ...agentSessionBase, wireVersion: '0.4' },
+  turns: [],
+  runs: [],
+  interactions: [settledInteractionWith(settlement)],
+  revision: 1,
+});
+
+/** Every published root that transitively embeds `interaction-settlement`. */
+const settlementRoots: readonly {
+  readonly schema: PublishedSchemaName;
+  readonly wrap: (settlement: unknown) => unknown;
+}[] = [
+  { schema: 'agent-interaction', wrap: settledInteractionWith },
+  { schema: 'event-payload', wrap: interactionSettledPayload },
+  { schema: 'event-envelope', wrap: settlementEnvelope },
+  {
+    schema: 'event-page',
+    wrap: (settlement) => ({
+      events: [settlementEnvelope(settlement)],
+      nextSequence: 8,
+      revision: 1,
+      hasMore: false,
+    }),
+  },
+  { schema: 'session-snapshot', wrap: settlementSnapshot },
+  {
+    schema: 'subscription-message',
+    wrap: (settlement) => ({
+      type: 'event',
+      event: settlementEnvelope(settlement),
+      cursor: 'cur_7',
+      replay: false,
+    }),
+  },
+];
+
+const respondedWithoutResponse = { outcome: 'responded', settledAt: timestamp };
+const unrespondedWithResponse = {
+  outcome: 'cancelled',
+  settledAt: timestamp,
+  response: { kind: 'question', answer: 'sneaked in' },
+};
+const legalSettlement = {
+  outcome: 'responded',
+  settledAt: timestamp,
+  response: { kind: 'question', answer: 'ok' },
+};
+
+// --- Git ref must not begin with `-` ---------------------------------------
+//
+// A ref that starts with `-` is read by git as an option, not a revision. The
+// Zod refinement rejects it; the published JSON Schema has to say the same
+// thing or a non-TypeScript consumer validates an argument-injection vector as
+// conformant.
+
+const gitSpec = (ref: string): unknown => ({
+  kind: 'managed',
+  source: { kind: 'git', remote: 'https://example.invalid/repo.git', ref },
+});
+const openSessionWith = (ref: string): unknown => ({
+  commandId: 'open-git-ref',
+  type: 'open_session',
+  providerId: 'fixture',
+  workspace: gitSpec(ref),
+});
+
 const corpus: readonly ParityCase[] = [
   {
     schema: 'agent-command',
@@ -226,6 +319,18 @@ const corpus: readonly ParityCase[] = [
       },
     },
   },
+  // Legal settlements must stay accepted by both validators in every root, so
+  // the conditional cannot be "fixed" by rejecting everything.
+  ...settlementRoots.map(({ schema, wrap }) => ({ schema, value: wrap(legalSettlement) })),
+  ...settlementRoots.map(({ schema, wrap }) => ({
+    schema,
+    value: wrap({ outcome: 'expired', settledAt: timestamp }),
+  })),
+  { schema: 'workspace-spec', value: gitSpec('main') },
+  { schema: 'workspace-spec', value: gitSpec('release/v1-rc-1') },
+  { schema: 'workspace-spec', value: gitSpec('--force') },
+  { schema: 'agent-command', value: openSessionWith('refs/heads/main') },
+  { schema: 'agent-command', value: openSessionWith('-o') },
 ];
 
 describe('Zod and Draft 2020-12 JSON Schema parity', () => {
@@ -292,5 +397,46 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     const validate = ajv.compile(JSON_SCHEMAS[schema]);
     expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
     expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
+  });
+
+  it.each(
+    settlementRoots.flatMap(({ schema, wrap }) => [
+      { schema, label: '`responded` without a response', value: wrap(respondedWithoutResponse) },
+      { schema, label: 'a non-`responded` outcome carrying a response', value: wrap(unrespondedWithResponse) },
+    ]),
+  )('$schema rejects $label in both validators', ({ schema, value }) => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS[schema]);
+    expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
+    expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
+  });
+
+  it.each([
+    { schema: 'workspace-spec' as const, label: 'a standalone spec', value: gitSpec('--upload-pack=touch /tmp/pwn') },
+    { schema: 'workspace-spec' as const, label: 'a bare short option', value: gitSpec('-x') },
+    {
+      schema: 'agent-command' as const,
+      label: 'the open_session wrapper',
+      value: openSessionWith('--upload-pack=touch /tmp/pwn'),
+    },
+    { schema: 'agent-command' as const, label: 'a wrapped bare short option', value: openSessionWith('-x') },
+  ])('$schema rejects a leading-dash git ref in $label in both validators', ({ schema, value }) => {
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS[schema]);
+    expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
+    expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
+  });
+
+  it('publishes the settlement conditional on the shared $defs entry, not only on roots', () => {
+    for (const { schema } of settlementRoots) {
+      const document = JSON_SCHEMAS[schema] as { readonly $defs?: Record<string, unknown> };
+      const settlement = document.$defs?.['interaction-settlement'];
+      expect(settlement, `${schema} must reference the shared settlement definition`).toBeDefined();
+      expect(JSON.stringify(settlement)).toContain('"if"');
+    }
   });
 });
