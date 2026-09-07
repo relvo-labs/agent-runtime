@@ -10,3 +10,5 @@ Portions of the repository-local skill guidance adapt MIT-licensed ideas from:
 - rolldown/tsdown at f7f0cc3adb70d2589216d479a59f226869ac4b08
 
 Sources with absent or ambiguous licensing were reviewed for vocabulary only and were not copied. See each skill's Provenance section for details.
+
+@relvo-labs/agent-provider-claude interoperates with @anthropic-ai/claude-agent-sdk (© Anthropic PBC, proprietary terms). That package is an optional peer dependency: it is not bundled, redistributed or required to install this workspace. Its published type declarations at version 0.3.259 were reviewed, not copied, to author the interoperability seam.
