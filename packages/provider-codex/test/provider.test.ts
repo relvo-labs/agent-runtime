@@ -123,9 +123,21 @@ describe('descriptor', () => {
     expect(CODEX_ADAPTER_STATUS).toBe('live');
   });
 
-  it('declares `writes` from the execution policy it will actually request', () => {
-    expect(createCodexProvider().describe().workspace.writes).toBe(false);
+  it('declares `writes` even under a read-only policy, because tooling is not isolated', () => {
+    // A read-only sandbox constrains Codex's own file tools. It does not bound
+    // MCP servers, hooks or plugins from the user's configuration, so deriving
+    // `writes: false` from it would tell a host the lease root is safe from
+    // mutation when it is not.
+    expect(createCodexProvider().describe().workspace.writes).toBe(true);
     expect(createCodexProvider({ sandboxMode: 'workspace-write' }).describe().workspace.writes).toBe(true);
+  });
+
+  it('reports the declared policy as intent, and denies isolating configured tooling', () => {
+    expect(createCodexProvider().describe().extensions.declaredSandboxMode).toBe('read-only');
+    expect(createCodexProvider({ sandboxMode: 'danger-full-access' }).describe().extensions.declaredSandboxMode).toBe(
+      'danger-full-access',
+    );
+    expect(createCodexProvider().describe().extensions.isolatesConfiguredTooling).toBe(false);
   });
 
   it('exposes no recovery surface, matching the descriptor', () => {
@@ -454,6 +466,47 @@ describe('a text run', () => {
   });
 });
 
+describe('conversation and turn ownership', () => {
+  it('keeps one workspace-bound thread for the whole session and one turn per run', async () => {
+    // Issue #11 governs over the research summary's process-per-run suggestion:
+    // the conversation is not reset per run, and no connection is respawned.
+    const { fake, session } = await openSession();
+
+    const first = await startRun(session, createSink(), 'first question');
+    fake.push(turnCompleted('completed'));
+    await expect(first.completion).resolves.toEqual({ outcome: 'succeeded' });
+
+    fake.setResponder('turn/start', () => ({ turn: { id: 'turn-2', status: 'inProgress' } }));
+    const second = await startRun(session, createSink(), 'follow-up question');
+    fake.push(turnCompleted('completed', { turnId: 'turn-2' }));
+    await expect(second.completion).resolves.toEqual({ outcome: 'succeeded' });
+
+    // Exactly one handshake and one thread for two runs.
+    expect(fake.requests('initialize')).toHaveLength(1);
+    expect(fake.requests('thread/start')).toHaveLength(1);
+
+    // Two turns, both on that same thread, each named by its own run.
+    const turns = fake.requests('turn/start');
+    expect(turns).toHaveLength(2);
+    for (const turn of turns) expect(turn.params).toMatchObject({ threadId: FAKE_THREAD_ID });
+    expect((turns[0]?.params as { input: { text: string }[] }).input[0]?.text).toBe('first question');
+    expect((turns[1]?.params as { input: { text: string }[] }).input[0]?.text).toBe('follow-up question');
+  });
+
+  it('binds the thread to the acquired lease root exactly once', async () => {
+    const { fake, session } = await openSession();
+    const run = await startRun(session, createSink());
+    fake.push(turnCompleted('completed'));
+    await run.completion;
+
+    expect(fake.requests('thread/start')).toHaveLength(1);
+    expect(fake.requests('thread/start')[0]?.params).toMatchObject({ cwd: '/workspace' });
+    // No `thread/resume`, `thread/fork`, or second connection is ever used.
+    expect(fake.requests('thread/resume')).toHaveLength(0);
+    expect(fake.requests('thread/fork')).toHaveLength(0);
+  });
+});
+
 describe('correlation and foreign traffic', () => {
   it('ignores a frame from another thread', async () => {
     const { fake, session, sessionSink } = await openSession();
@@ -539,6 +592,66 @@ describe('correlation and foreign traffic', () => {
     await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
     expect(settlements).toBe(1);
     expect(runSink.texts()).toBe('');
+  });
+
+  it("cannot let a retired turn's tail crowd out the next run", async () => {
+    const responders = defaultResponders();
+    const { fake, session } = await openSession({}, responders);
+
+    const first = await startRun(session, createSink());
+    fake.push(turnCompleted('completed'));
+    await expect(first.completion).resolves.toEqual({ outcome: 'succeeded' });
+
+    // The next run's `turn/start` is deliberately left unanswered, so the whole
+    // burst below lands in the pre-binding window.
+    fake.setResponder('turn/start', () => undefined);
+    const secondSink = createSink();
+    const starting = startRun(session, secondSink, 'second');
+    await flush();
+
+    // A large tail from the *retired* turn. It could never settle run two, but
+    // if it were buffered it could exhaust the bound and starve run two's own
+    // early frames.
+    for (let index = 0; index < 2000; index += 1) {
+      fake.push(agentMessageDelta('stale ', { turnId: FAKE_TURN_ID }));
+    }
+    fake.push(agentMessageDelta('mine', { turnId: 'turn-2' }));
+    await flush();
+
+    fake.respond('turn/start', { turn: { id: 'turn-2', status: 'inProgress' } }, 1);
+    const second = await starting;
+    await flush();
+
+    // Run two received its own early frame, and none of the retired tail.
+    expect(secondSink.texts()).toBe('mine');
+    expect(secondSink.texts()).not.toContain('stale');
+
+    fake.push(turnCompleted('completed', { turnId: 'turn-2' }));
+    await expect(second.completion).resolves.toEqual({ outcome: 'succeeded' });
+  });
+
+  it("ignores a retired turn's terminal frame replayed while a later run is active", async () => {
+    const { fake, session } = await openSession();
+    const first = await startRun(session, createSink());
+    fake.push(turnCompleted('completed'));
+    await first.completion;
+
+    fake.setResponder('turn/start', () => ({ turn: { id: 'turn-2', status: 'inProgress' } }));
+    const second = await startRun(session, createSink(), 'second');
+
+    // The server replays the first turn's failure while run two is running.
+    fake.push(turnCompleted('failed', { turnId: FAKE_TURN_ID, error: { codexErrorInfo: 'unauthorized' } }));
+    await flush();
+
+    let settled = false;
+    void second.completion.then(() => {
+      settled = true;
+    });
+    await flush();
+    expect(settled).toBe(false);
+
+    fake.push(turnCompleted('completed', { turnId: 'turn-2' }));
+    await expect(second.completion).resolves.toEqual({ outcome: 'succeeded' });
   });
 
   it('ignores thread-scoped notifications that name no turn', async () => {

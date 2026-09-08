@@ -247,7 +247,8 @@ export function translateTurnCompleted(params: unknown): TerminalTranslation {
  *
  * It is explicitly *not* terminal: the README says it "may precede" the terminal
  * notification, which does not promise one follows, and the evidence does not
- * establish that one always does (research §10.3). So it produces a diagnostic
+ * establish that one always does (research, "Completion, usage, and failures").
+ * So it produces a diagnostic
  * and the run keeps waiting for `turn/completed`, EOF or exit. `willRetry` is
  * reported because it is the server's own statement about whether it is still
  * trying.

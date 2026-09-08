@@ -17,24 +17,45 @@ retryable cleanup.
 
 ## Protocol evidence and version
 
-- Research summary: `/opt/data/agent-runtime-control/continuation-20260908/codex-protocol-research.md`
-  (delivered by the external researcher; read in full before this plan was written).
-- Pinned evidence: `.../codex-protocol-evidence-0.153.4/` — `codex-cli 0.153.4`,
-  binary sha256 `56ef98ab…4d62da`, upstream `openai/codex` tree
-  `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` (`rust-v0.153.4`).
+- **Provenance of the research summary.** The separate researcher lane did **not** deliver
+  `codex-protocol-research.md`. This exact Claude writer session paused with the blocker,
+  then authored the summary itself from the pinned official evidence before making any
+  production protocol decision. No external researcher delivered it, and nothing in this
+  slice rests on an unpinned or remembered protocol claim.
+- Research summary: `/opt/data/agent-runtime-control/continuation-20260908/codex-protocol-research.md`.
+  It is a _derived_ document; where it and the generated schemas disagree, the schemas win.
+- **Primary evidence** (authoritative): `.../codex-protocol-evidence-0.153.4/json-schema-stable/`
+  and `.../typescript-stable/` — `codex-cli 0.153.4`, binary sha256 `56ef98ab…4d62da`,
+  upstream `openai/codex` source commit `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`
+  (`rust-v0.153.4`). Every wire shape in `seam.ts` and every test fixture is derived from a
+  named file in those two directories, cited at the point of use.
 - **Stable, non-experimental surface only.** `capabilities` is sent as `null` at
   `initialize`, which by construction cannot opt into `experimentalApi` or
   `requestAttestation`. No experimental method or field is used.
-- Independently re-derived from primary sources before planning: `ClientRequest.ts:104`
+- Read directly from the generated stable schemas before planning: `ClientRequest.ts:104`
   (`initialize` / `thread/start` / `turn/start` / `turn/interrupt` all stable),
-  `ClientNotification.ts` (`initialized`, no params), `protocol-rpc.rs` (no `jsonrpc`
-  member), `transport-stdio.rs` (JSONL framing, EOF), `transport-mod.rs:208-216`
-  (malformed line is logged and **ignored**, no error reply), `message_processor.rs:900`
-  (`Not initialized`), `v2/TurnInterruptResponse.ts` (`Record<string, never>`),
-  `v2/TurnStatus.ts` (`completed|interrupted|failed|inProgress`).
+  `ClientNotification.ts` (`initialized`, no params), `v2/TurnInterruptResponse.ts`
+  (`Record<string, never>`), `v2/TurnStatus.ts` (`completed|interrupted|failed|inProgress`),
+  `v2/UserInput.ts` with `codex_app_server_protocol.v2.schemas.json` (`text_elements` has
+  `"default": []` and is not required). Corroborated from the pinned implementation source:
+  `protocol-rpc.rs` (no `jsonrpc` member), `transport-stdio.rs` (JSONL framing, EOF),
+  `transport-mod.rs:208-216` (malformed line is logged and **ignored**, no error reply),
+  `message_processor.rs:900` (`Not initialized`).
 
-**No protocol-wire expansion and no Runtime change are required** (research §9.6). If that
+**No protocol-wire expansion and no Runtime change are required**: the bounded surface maps
+onto provider DTOs the protocol package already defines. If that
 turns out to be false mid-implementation, stop and replan rather than widening.
+
+## Conversation and turn ownership (Issue #11 governs)
+
+One provider session owns **one** app-server connection and **one** workspace-bound thread,
+created once by `thread/start` with `cwd` = the acquired lease root. Each Runtime run owns
+**exactly one** correlated native turn on that same thread.
+
+The research summary's "Narrow activation recommendation" suggests process-per-run. That is a
+recommendation, not a finding, and Issue #11 governs: the conversation is **not** reset per
+run, no process is respawned per run, and a second run appends a second turn to the same
+thread. `ephemeral: true` keeps that thread in memory only; it does not scope it to a run.
 
 ## Slices
 
@@ -60,15 +81,16 @@ turns out to be false mid-implementation, stop and replan rather than widening.
 
 ## Acceptance mapping
 
-| Issue acceptance                               | How this plan satisfies it                                                                                                                                    |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Text run through unchanged neutral Runtime SPI | Adapter implements `AgentProvider` only; zero edits under `packages/runtime`, `packages/protocol`, `packages/provider`.                                       |
-| Workspace + session/turn correlation           | `thread/start` carries `cwd` = lease root; every frame matched on `(threadId, turnId)`; non-matching frames dropped with a diagnostic.                        |
-| Settle exactly once, never hang                | Single `finalize()` guarded by `terminated`; settled by `turn/completed`, EOF, exit, transport error, or dispose — whichever is first.                        |
-| Observable retryable cleanup                   | `dispose()` rethrows a typed rejection and leaves `disposed = false`, so an identical retry still owns teardown; admission stays fenced.                      |
-| Descriptor advertises only tested behavior     | `messageDeltas: true`, `incrementalUsage: true`, `toolActivity: **false**`, `interrupt.mode: 'cooperative'`, `recovery: {}`, approvals/questions unsupported. |
-| Credential-free deterministic tests            | All canonical tests drive the injected seam or a locally spawned Node fake; no credentials, no network, no real Codex binary.                                 |
-| Packed consumer proof                          | `examples/consumer-smoke` exercises the Codex public surface against packed `.d.ts`.                                                                          |
+| Issue acceptance                                                   | How this plan satisfies it                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Text run through unchanged neutral Runtime SPI                     | Adapter implements `AgentProvider` only; zero edits under `packages/runtime`, `packages/protocol`, `packages/provider`.                                                                                                                                                                                                                      |
+| Workspace + session/turn correlation                               | One `thread/start` per session carries `cwd` = lease root and is reused by every run; each run owns exactly one `turn/start` on it; every frame matched on `(threadId, turnId)`.                                                                                                                                                             |
+| Foreign/late traffic cannot contaminate the active **or next** run | Settled turn ids are remembered, so a retired turn's tail is discarded on arrival rather than buffered against the next run. An unknown notification method is ignored, not treated as a fatal error for the active run.                                                                                                                     |
+| Settle exactly once, never hang                                    | Single `finalize()` guarded by `terminated`; settled by `turn/completed`, EOF, exit, transport error, or dispose — whichever is first.                                                                                                                                                                                                       |
+| Observable retryable cleanup                                       | `dispose()` rethrows a typed rejection and leaves `disposed = false`, so an identical retry still owns teardown; admission stays fenced.                                                                                                                                                                                                     |
+| Descriptor advertises only tested behavior                         | `messageDeltas: true`, `incrementalUsage: true`, `toolActivity: **false**`, `interrupt.mode: 'cooperative'`, `recovery: {}`, approvals/questions unsupported. `workspace.writes` is always `true` and `extensions.isolatesConfiguredTooling` is `false`, because a read-only policy does not bound configured MCP servers, hooks or plugins. |
+| Credential-free deterministic tests                                | All canonical tests drive the injected seam or a locally spawned Node fake; no credentials, no network, no real Codex binary.                                                                                                                                                                                                                |
+| Packed consumer proof                                              | `examples/consumer-smoke` exercises the Codex public surface against packed `.d.ts`.                                                                                                                                                                                                                                                         |
 
 ## Verification (focused; canonical `pnpm gate` is the coordinator's)
 

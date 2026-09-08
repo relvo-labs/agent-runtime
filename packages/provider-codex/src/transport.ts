@@ -17,7 +17,8 @@
  * Exit and EOF are the same event as far as the rest of the adapter is
  * concerned: the inbound iterable ends, and everything still pending settles.
  * That is deliberate — the bounded protocol surface has no shutdown handshake,
- * so waiting for a polite goodbye would wait forever (research §7).
+ * so waiting for a polite goodbye would wait forever (research, "Interrupt and
+ * shutdown").
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';

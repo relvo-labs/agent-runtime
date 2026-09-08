@@ -254,6 +254,6 @@ export const CODEX_NOTIFICATION = {
  * -32601 (method not found) is the honest classification: this adapter
  * implements none of the stable `ServerRequest` methods. Declining explicitly
  * matters because `item/tool/requestUserInput` carries `isBlocking`, so silence
- * can stall a turn indefinitely (research §6).
+ * can stall a turn indefinitely (research, "Wire and initialization").
  */
 export const METHOD_NOT_SUPPORTED = -32601;

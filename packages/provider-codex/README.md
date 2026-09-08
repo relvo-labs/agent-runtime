@@ -14,7 +14,9 @@ Upstream labels the `codex app-server` subcommand itself `[experimental]`. This 
 
 Pinned to **codex-cli 0.153.4** — upstream `openai/codex` tree `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`, release tag `rust-v0.153.4`.
 
-The wire types in `seam.ts` are hand-authored against that release's generated stable schemas. **Codex is not an npm dependency of this package**, so nothing here adds a large platform payload or a non-permissive licence to a published runtime closure. The host supplies the executable — or its own transport.
+The wire types in `seam.ts` are hand-authored against that release's generated stable schemas — `json-schema-stable/` and `typescript-stable/`, produced by `codex app-server generate-json-schema` / `generate-ts` without `--experimental`. **Those generated schemas are the primary evidence.** The hand-authored types and the test fixtures are derived from them and cite the exact source file at the point of use; where the two ever disagree, the schema is correct and this package has a bug.
+
+**Codex is not an npm dependency of this package**, so nothing here adds a large platform payload or a non-permissive licence to a published runtime closure. The host supplies the executable — or its own transport.
 
 ### Evidence classification
 
@@ -37,7 +39,8 @@ Do not read "compatible" as "verified against a live model". Those are different
 | Approvals / questions / elicitation | **Not supported.** Every server-initiated request is declined with a JSON-RPC error, so a blocking request cannot stall a turn.                                             |
 | Recovery / resume / export          | **Not supported.**                                                                                                                                                          |
 | Images, audio, file references      | **Not supported.**                                                                                                                                                          |
-| Workspace                           | Required. One thread is bound to the acquired lease root.                                                                                                                   |
+| Workspace                           | Required. One thread is bound to the acquired lease root for the whole session.                                                                                             |
+| Side-effect-free execution          | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                        |
 
 ## Usage
 
@@ -62,9 +65,15 @@ import { createCodexProvider, type CodexTransport } from '@relvo-labs/agent-prov
 const codex = createCodexProvider({ transport: ({ cwd }) => myTransportFor(cwd) });
 ```
 
-### Execution policy
+### Execution policy — and what it does _not_ isolate
 
 `sandboxMode` defaults to `read-only`. It is **Codex's own** execution policy, enforced by the app-server — not a sandbox this runtime imposes, and not a restriction on the in-process adapter (see `docs/adr/ADR-0009-provider-trust-boundary.md`).
+
+> **A read-only policy is not an isolation boundary, and this adapter makes no side-effect-free claim.**
+>
+> It constrains Codex's own filesystem tool calls. It says nothing about the MCP servers, hooks, plugins and skills the user's Codex configuration may start. Those run with their own authority and can read, write, and reach the network regardless of `sandboxMode`. Neither this adapter nor this runtime configures, inspects, or bounds them.
+>
+> For that reason `descriptor.workspace.writes` is **always `true`**, including under `read-only`: a host must treat the lease root as mutable whatever policy was requested. `descriptor.extensions.isolatesConfiguredTooling` is `false`, stated explicitly so nothing is inferred from the policy name.
 
 Choosing `workspace-write` or `danger-full-access` alongside a `cwd` also causes the app-server to mark that project trusted in the user's `config.toml`, which is a host-config mutation outside the acquired workspace. That is why the conservative value is the default.
 
@@ -76,14 +85,16 @@ This adapter neither reads, manages, nor forwards credentials. The child inherit
 
 | Concept   | Mapping                                                                                                                                                                                                    |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| session   | One app-server connection: `initialize` → `initialized` → one ephemeral `thread/start` bound to the workspace root.                                                                                        |
-| run       | One `turn/start`, correlated by the `(threadId, turnId)` pair it returns, until `turn/completed`.                                                                                                          |
+| session   | One app-server connection and **one** thread: `initialize` → `initialized` → a single ephemeral `thread/start` bound to the workspace root, reused by every run in the session.                            |
+| run       | Exactly one `turn/start` on that thread, correlated by the `(threadId, turnId)` pair it returns, until `turn/completed`. The conversation is never reset per run, and no process is respawned per run.     |
 | interrupt | `turn/interrupt`. Its `{}` reply acknowledges the _request_; the run settles on the `turn/completed` that follows, which the server marks `interrupted`. Output queued before the stop is still delivered. |
 | dispose   | Close stdin, then escalate SIGTERM → SIGKILL, then settle. Idempotent, and a failed attempt keeps its retry ownership rather than reporting success.                                                       |
 
 A run settles exactly once, from whichever of these happens first: its own `turn/completed`, connection EOF, child exit, transport failure, disposal, or a per-request deadline. Success and interruption are never _inferred_ from EOF.
 
-Traffic that cannot be attributed to the active `(threadId, turnId)` pair — another thread, a background turn, a late frame after the terminal one, or a malformed frame — is dropped with a diagnostic and can never settle a run.
+Traffic that cannot be attributed to the active `(threadId, turnId)` pair — another thread, a background turn, a late frame after the terminal one, a duplicate terminal frame, a reply naming no pending request, or a malformed frame — is dropped with a diagnostic. None of it settles a run, and none of it is treated as a fatal error for the run that _is_ active: an unknown notification method is simply ignored, because a newer server is expected to send methods this adapter does not know.
+
+The session also remembers the turn ids it has already settled, so a retired turn's tail is discarded on arrival rather than buffered against the next run — it could never have settled that run, but it could have crowded out the frames the run actually owns.
 
 ## Verification
 

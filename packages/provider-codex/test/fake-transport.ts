@@ -67,16 +67,23 @@ export const FAKE_TURN_ID = 'turn-0199a0b1-0000-7000-8000-000000000002';
 
 /**
  * The responses a healthy 0.153.4 app-server gives for the bounded surface.
- * Shapes follow the pinned stable TypeScript exactly.
+ *
+ * These are handwritten fixtures, so they are *secondary* evidence. The
+ * generated stable schemas are primary, and each shape below names the exact
+ * file in `codex-protocol-evidence-0.153.4/typescript-stable/` it was derived
+ * from. If a fixture and its cited schema ever disagree, the schema is right and
+ * the fixture is a bug.
  */
 export function defaultResponders(): Record<string, Responder> {
   return {
+    // `InitializeResponse.ts`
     initialize: () => ({
       userAgent: 'codex-test-agent',
       codexHome: '/home/example/.codex',
       platformFamily: 'unix',
       platformOs: 'linux',
     }),
+    // `v2/ThreadStartResponse.ts`, whose `thread` is `v2/Thread.ts`
     'thread/start': () => ({
       thread: { id: FAKE_THREAD_ID, cwd: '/workspace', turns: [] },
       model: 'gpt-5-codex',
@@ -89,9 +96,11 @@ export function defaultResponders(): Record<string, Responder> {
       sandbox: 'read-only',
       reasoningEffort: null,
     }),
+    // `v2/TurnStartResponse.ts`, whose `turn` is `v2/Turn.ts`
     'turn/start': () => ({
       turn: { id: FAKE_TURN_ID, items: [], itemsView: 'complete', status: 'inProgress', error: null },
     }),
+    // `v2/TurnInterruptResponse.ts` — `Record<string, never>`, i.e. exactly `{}`
     'turn/interrupt': () => ({}),
   };
 }
@@ -258,6 +267,7 @@ export function createFakeTransport(options: FakeTransportOptions = {}): FakeTra
 // Frame builders — shapes taken from the pinned stable TypeScript
 // ---------------------------------------------------------------------------
 
+/** `v2/AgentMessageDeltaNotification.ts` — `{ threadId, turnId, itemId, delta }`. */
 export function agentMessageDelta(delta: string, correlation?: { threadId?: string; turnId?: string }): unknown {
   return {
     method: 'item/agentMessage/delta',
@@ -270,6 +280,7 @@ export function agentMessageDelta(delta: string, correlation?: { threadId?: stri
   };
 }
 
+/** `v2/TurnCompletedNotification.ts` — `{ threadId, turn }`; status from `v2/TurnStatus.ts`. */
 export function turnCompleted(
   status: string,
   extra?: { threadId?: string; turnId?: string; error?: unknown },
@@ -292,6 +303,10 @@ export function turnCompleted(
   };
 }
 
+/**
+ * `v2/ThreadTokenUsageUpdatedNotification.ts` — `{ threadId, turnId, tokenUsage }`,
+ * whose breakdowns are `v2/TokenUsageBreakdown.ts`.
+ */
 export function tokenUsage(
   last: Record<string, number>,
   correlation?: { threadId?: string; turnId?: string },

@@ -15,7 +15,7 @@
  *
  * It also declines every server-initiated request. Silence is not an option:
  * `item/tool/requestUserInput` carries `isBlocking`, so an unanswered request
- * can stall a turn indefinitely (research §6).
+ * can stall a turn indefinitely (research, "Wire and initialization").
  */
 
 import { agentError, type JsonValue } from '@relvo-labs/agent-protocol';

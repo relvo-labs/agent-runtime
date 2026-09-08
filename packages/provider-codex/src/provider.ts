@@ -73,6 +73,9 @@ const DISPOSED_REASON = 'codex provider session disposed';
  */
 const MAX_BUFFERED_FRAMES = 512;
 
+/** How many settled turn ids a session remembers, to recognise their late tail. */
+const MAX_RETIRED_TURNS = 64;
+
 function rejection(code: Parameters<typeof agentError>[0], message: string, details?: JsonObject): never {
   throw new ProviderRejection(agentError(code, message, details === undefined ? {} : { details }));
 }
@@ -146,10 +149,37 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
   let teardown: Promise<void> | undefined;
   let announcedForeignTurn = false;
 
+  /**
+   * Native turn ids this session has already settled.
+   *
+   * The thread outlives every run on it, so a retired turn's late frames keep
+   * arriving on the same connection — the pinned protocol explicitly allows an
+   * `item/completed` to land after its `turn/completed` (README,
+   * `subAgentActivity`). Recognising them here means they are dropped outright
+   * rather than held in the *next* run's pre-binding buffer, where a burst could
+   * exhaust the bound and starve the frames that run actually owns. They could
+   * never have settled the next run — `bindTurn` discards anything that does not
+   * match — but they could have crowded it out, and that is contamination too.
+   *
+   * Bounded, because a long session runs many turns and this must not grow
+   * without limit.
+   */
+  const retiredTurns = new Set<string>();
+
+  function retire(turnId: string): void {
+    retiredTurns.add(turnId);
+    while (retiredTurns.size > MAX_RETIRED_TURNS) {
+      const oldest = retiredTurns.values().next();
+      if (oldest.done === true) break;
+      retiredTurns.delete(oldest.value);
+    }
+  }
+
   function finalize(run: ActiveRun, termination: ProviderRunTermination): void {
     if (run.terminated) return;
     run.terminated = true;
     run.concluded = true;
+    if (run.correlation !== undefined) retire(run.correlation.turnId);
     if (active === run) active = undefined;
     run.settle(termination);
   }
@@ -233,6 +263,13 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       return;
     }
     if (correlation.threadId !== threadId) {
+      noteForeignTraffic();
+      return;
+    }
+    // A turn this session already settled. Recognised before anything else so a
+    // retired turn's tail can neither be applied nor buffered against the run
+    // that came after it.
+    if (retiredTurns.has(correlation.turnId)) {
       noteForeignTraffic();
       return;
     }
@@ -618,7 +655,6 @@ type SessionRuntimeBox = {
  * run against a host-managed connection or a deterministic double.
  */
 export function createCodexProvider(options: CodexProviderOptions = {}): AgentProvider {
-  const sandbox = options.sandboxMode ?? 'read-only';
   const descriptor = defineProviderDescriptor({
     providerId: CODEX_PROVIDER_ID,
     providerVersion: CODEX_ADAPTER_VERSION,
@@ -646,8 +682,16 @@ export function createCodexProvider(options: CodexProviderOptions = {}): AgentPr
     workspace: {
       requires: 'directory',
       acceptsOwnership: ['borrowed', 'managed'],
-      // Codex's own execution policy decides this; `read-only` is the default.
-      writes: sandbox !== 'read-only',
+      // Always `true`, including under `sandboxMode: 'read-only'`.
+      //
+      // The read-only policy constrains Codex's *own* filesystem tool calls. It
+      // is not an isolation boundary for the MCP servers, hooks and plugins the
+      // user's Codex configuration may start: those run with their own
+      // authority, and nothing in this adapter or this runtime bounds them.
+      // Deriving `writes: false` from the sandbox mode would tell a host the
+      // workspace is safe from mutation when it is not, so this stays `true`
+      // and a host treats the lease root as mutable regardless of policy.
+      writes: true,
     },
     recovery: {},
     extensions: {
@@ -657,6 +701,19 @@ export function createCodexProvider(options: CodexProviderOptions = {}): AgentPr
       /** Deltas arrive per streamed text fragment, not per whole message. */
       textGranularity: 'delta',
       supportedInputParts: ['text'],
+      /**
+       * The execution policy this adapter will request from the app-server.
+       * Provider-declared intent for UX (ADR-0009) — reported so a host can see
+       * what was configured, not as an enforcement claim.
+       */
+      declaredSandboxMode: options.sandboxMode ?? 'read-only',
+      /**
+       * Stated explicitly so no consumer infers it from the sandbox mode: a
+       * read-only policy does not isolate MCP servers, hooks or plugins started
+       * from the user's Codex configuration, and this slice makes no
+       * side-effect-free claim of any kind.
+       */
+      isolatesConfiguredTooling: false,
     },
   });
 

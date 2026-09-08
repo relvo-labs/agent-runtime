@@ -87,7 +87,8 @@ export type CodexTransportEnd = 'eof' | 'failed';
  * frame. Ending the iteration means EOF; throwing means transport failure. Both
  * settle every pending request and any admitted run — a client that waits for a
  * graceful protocol goodbye waits forever, because the bounded surface has no
- * shutdown handshake (research §7).
+ * shutdown handshake — the stable `ClientRequest` union has no `shutdown` or
+ * `exit` method at all (research, "Interrupt and shutdown").
  */
 export type CodexTransport = {
   /**
