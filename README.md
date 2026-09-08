@@ -2,7 +2,7 @@
 
 Relvo Agent Runtime is a provider-neutral, No-PTY execution SDK for embedding coding agents in products. It gives a host application one durable command/event contract while leaving model-provider choice, workspace provisioning, and storage behind explicit interfaces.
 
-Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol schemas, deterministic in-memory execution, bounded replay-then-live subscriptions, and guarded workspace ownership. `@relvo-labs/agent-provider-claude` is the first live adapter: it executes text turns through the official Claude Agent SDK's structured `query()` API, with the SDK itself an optional peer dependency. Foundation v0.4 does **not** include a live Codex integration, a control plane, scheduling, remote execution, queues, tenancy, RBAC, workflow DAGs, or product-specific integrations.
+Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol schemas, deterministic in-memory execution, bounded replay-then-live subscriptions, and guarded workspace ownership. Two live adapters execute text turns through the same neutral SPI: `@relvo-labs/agent-provider-claude` over the official Claude Agent SDK's structured `query()` API, with the SDK an optional peer dependency, and `@relvo-labs/agent-provider-codex` over the official Codex app-server stdio JSONL protocol, with no Codex dependency at all. Both are deliberately narrow — text in, streamed text out, usage, and a cooperative interrupt — and their compatibility evidence is deterministic, not live-model. This foundation does **not** include a control plane, scheduling, remote execution, queues, tenancy, RBAC, workflow DAGs, or product-specific integrations.
 
 ## What is stable enough to build on
 
@@ -16,16 +16,16 @@ Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol sche
 
 ## Packages
 
-| Package                             | Responsibility                                                 |
-| ----------------------------------- | -------------------------------------------------------------- |
-| `@relvo-labs/agent-protocol`        | Zod wire schemas, inferred types, generated JSON Schema        |
-| `@relvo-labs/agent-executor`        | Consumer contract and executor conformance kit                 |
-| `@relvo-labs/agent-provider`        | Neutral provider SPI and deterministic test provider           |
-| `@relvo-labs/agent-runtime`         | Composition root, in-memory store, lifecycle and subscriptions |
-| `@relvo-labs/agent-workspace`       | Workspace leases and guarded local implementation              |
-| `@relvo-labs/agent-workspace-git`   | Git workspace boundary with an injected command seam           |
-| `@relvo-labs/agent-provider-codex`  | Explicit future-adapter scaffold; no live integration          |
-| `@relvo-labs/agent-provider-claude` | Claude adapter over the official Claude Agent SDK query API    |
+| Package                             | Responsibility                                                  |
+| ----------------------------------- | --------------------------------------------------------------- |
+| `@relvo-labs/agent-protocol`        | Zod wire schemas, inferred types, generated JSON Schema         |
+| `@relvo-labs/agent-executor`        | Consumer contract and executor conformance kit                  |
+| `@relvo-labs/agent-provider`        | Neutral provider SPI and deterministic test provider            |
+| `@relvo-labs/agent-runtime`         | Composition root, in-memory store, lifecycle and subscriptions  |
+| `@relvo-labs/agent-workspace`       | Workspace leases and guarded local implementation               |
+| `@relvo-labs/agent-workspace-git`   | Git workspace boundary with an injected command seam            |
+| `@relvo-labs/agent-provider-codex`  | Codex adapter over the official app-server stdio JSONL protocol |
+| `@relvo-labs/agent-provider-claude` | Claude adapter over the official Claude Agent SDK query API     |
 
 ## Development
 

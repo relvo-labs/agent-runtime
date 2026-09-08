@@ -1,7 +1,7 @@
 {
   "name": "@relvo-labs/agent-provider-codex",
   "version": "0.1.0",
-  "description": "Explicit scaffold boundary for a future Codex provider adapter; no live integration is included.",
+  "description": "Codex adapter for the neutral agent provider SPI, backed by the official Codex app-server stdio JSONL protocol.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
@@ -32,7 +32,8 @@
   },
   "dependencies": {
     "@relvo-labs/agent-protocol": "workspace:^",
-    "@relvo-labs/agent-provider": "workspace:^"
+    "@relvo-labs/agent-provider": "workspace:^",
+    "zod": "catalog:"
   },
   "repository": {
     "type": "git",
