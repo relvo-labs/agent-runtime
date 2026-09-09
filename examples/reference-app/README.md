@@ -88,14 +88,22 @@ PLAYWRIGHT_CHROMIUM_EXECUTABLE=/path/to/chrome pnpm --filter @relvo-labs/referen
 
 Drives a genuinely running instance of this app with `playwright-core` (a devDependency; no
 browser download — see the `pnpm-workspace.yaml` catalog comment) against a **host-supplied**
-Chromium/Chrome executable. Asserts, in a real browser: hostile prompt text renders as literal
-text and never executes or becomes an element (a real XSS check, not a unit-test approximation);
-**Close session** is reachable and activatable by keyboard alone; the page has no horizontal
-overflow at a 375×812 mobile viewport. Missing the executable path is a clear, immediate failure,
-never a silent skip — this check is intentionally **not** part of `pnpm gate` (a browser binary
-is not something this workspace installs, and the canonical gate must stay deterministic and
-environment-independent; see `.agents/skills/local-ci-parity/SKILL.md`). The coordinator's own
-independent desktop/mobile browser pass is separate from, and does not depend on, this command.
+Chromium/Chrome executable, and asserts real DOM state at each step, on both a desktop and a
+375×812 mobile viewport: the session badge reaches `ready` and the run badge stays hidden before
+any turn; a submitted turn's run badge reaches `running` **and Interrupt becomes enabled** (not
+only "ends up disabled after the fact", which would pass even if Interrupt had never worked); a
+real click on Interrupt reaches `interrupted`; a followup turn on the same session works and
+reaches `running` again; **Advance script** reaches `succeeded`; closing resets every badge, and a
+newly-opened session never shows a stale badge left over from the one just closed. It also asserts
+hostile prompt text renders as literal text and never executes or becomes an element (a real XSS
+check, not a unit-test approximation), that **Close session** is reachable and activatable by
+keyboard alone, and that the page has no horizontal overflow at the mobile viewport — both on the
+near-empty initial shell and with a session actively open. Missing the executable path is a clear,
+immediate failure, never a silent skip — this check is intentionally **not** part of `pnpm gate`
+(a browser binary is not something this workspace installs, and the canonical gate must stay
+deterministic and environment-independent; see `.agents/skills/local-ci-parity/SKILL.md`). The
+coordinator's own independent desktop/mobile browser pass is separate from, and does not depend
+on, this command.
 
 ## What this app is (and is not)
 

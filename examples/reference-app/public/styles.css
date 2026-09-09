@@ -30,6 +30,20 @@
   box-sizing: border-box;
 }
 
+/*
+ * The native `hidden` attribute must always win. Per the CSS cascade, an
+ * author-stylesheet rule that sets `display` on the SAME element (e.g.
+ * `.badge { display: inline-block }` below) beats the user-agent
+ * stylesheet's `[hidden] { display: none }` at equal specificity, because
+ * origin is resolved before specificity — regardless of selector order.
+ * Without this rule, `element.hidden = true` sets the attribute but the
+ * element stays visually displayed, which is exactly what let a closed
+ * session's run-state badge keep rendering `#run-state-badge`'s last value.
+ */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   color: var(--fg);

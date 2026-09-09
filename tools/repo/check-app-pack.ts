@@ -16,10 +16,11 @@
  * (scratch directory is removed in a `finally`).
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import type { Readable } from 'node:stream';
 import ts from 'typescript';
 
 /** This repo's `tsconfig*.json` files use `//` comments — plain `JSON.parse` cannot read them. */
@@ -62,18 +63,114 @@ function packageDirectories(): string[] {
     .sort();
 }
 
-async function waitForServer(url: string, deadlineMs: number): Promise<void> {
-  const deadline = Date.now() + deadlineMs;
-  for (;;) {
-    try {
-      const response = await fetch(url, { headers: { 'x-relvo-reference-app': '1' } });
-      if (response.status === 200) return;
-    } catch {
-      // not up yet
+type ManagedServer = {
+  /** Read back from the child's own stdout — never assumed from a fixed port. */
+  readonly baseUrl: string;
+  readonly child: ChildProcessByStdio<null, Readable, Readable>;
+  /** Resolved output so far, for diagnostics on failure. */
+  output(): string;
+  /**
+   * Sends SIGTERM, then genuinely waits for the process to exit (bounded),
+   * escalating to SIGKILL only if it has not. `ChildProcess#killed` means
+   * "a signal was sent", not "the process has exited" — checking it instead
+   * of the `exit` event would make the SIGKILL escalation below dead code.
+   */
+  stop(): Promise<void>;
+};
+
+const READY_LINE = /listening on (http:\/\/\S+)/u;
+const SHUTDOWN_GRACE_MS = 3000;
+
+/**
+ * Spawns `command`/`args` with `REFERENCE_APP_PORT=0` (an ephemeral port,
+ * never a fixed one this script guesses), and resolves only once the child's
+ * OWN stdout reports the address it actually bound
+ * (`reference-app: listening on http://host:port`, from `src/server.ts`).
+ *
+ * This is the one property a fixed-port + blind-poll approach cannot
+ * guarantee: readiness here is correlated to *this* spawned process, not to
+ * whatever happens to answer on a guessed port. If this process's port were
+ * ever already in use, `server.ts`'s own `listen()` would reject and this
+ * function rejects too — it never falls back to polling an unrelated
+ * listener and reporting a false pass.
+ */
+async function startManagedServer(options: {
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly readyDeadlineMs: number;
+}): Promise<ManagedServer> {
+  const child = spawn(process.execPath, options.args, {
+    cwd: options.cwd,
+    env: { ...options.env, REFERENCE_APP_PORT: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let exited = false;
+  child.stdout.on('data', (chunk: Buffer) => (output += chunk.toString()));
+  child.stderr.on('data', (chunk: Buffer) => (output += chunk.toString()));
+  const exitPromise = new Promise<void>((resolveExit) => {
+    child.once('exit', () => {
+      exited = true;
+      resolveExit();
+    });
+  });
+
+  const baseUrl = await new Promise<string>((resolveReady, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      detach();
+      reject(new Error(`server did not report readiness within ${String(options.readyDeadlineMs)}ms:\n${output}`));
+    }, options.readyDeadlineMs);
+    function detach(): void {
+      clearTimeout(timer);
+      child.stdout.removeListener('data', onData);
+      child.removeListener('exit', onExit);
     }
-    if (Date.now() > deadline) throw new Error(`server at ${url} did not become ready in time`);
-    await new Promise((resolve_) => setTimeout(resolve_, 100));
-  }
+    function onData(): void {
+      if (settled) return;
+      const match = READY_LINE.exec(output);
+      if (match === null) return;
+      settled = true;
+      detach();
+      resolveReady(match[1]!);
+    }
+    function onExit(): void {
+      if (settled) return;
+      settled = true;
+      detach();
+      reject(new Error(`server process exited before it reported readiness:\n${output}`));
+    }
+    child.stdout.on('data', onData);
+    child.once('exit', onExit);
+    onData(); // in case the line already arrived before these listeners attached
+  });
+
+  return {
+    baseUrl,
+    child,
+    output: () => output,
+    async stop(): Promise<void> {
+      if (exited) return;
+      child.kill('SIGTERM');
+      const exitedGracefully = await Promise.race([
+        exitPromise.then(() => true),
+        new Promise<boolean>((r) => {
+          setTimeout(() => {
+            r(false);
+          }, SHUTDOWN_GRACE_MS);
+        }),
+      ]);
+      if (!exitedGracefully) {
+        // Harmless if the process exited between the race settling and here
+        // (`kill` on an already-gone pid is a no-op, not a throw).
+        child.kill('SIGKILL');
+        await Promise.race([exitPromise, new Promise<void>((r) => setTimeout(r, SHUTDOWN_GRACE_MS))]);
+      }
+    },
+  };
 }
 
 async function main(): Promise<void> {
@@ -180,26 +277,16 @@ async function main(): Promise<void> {
   process.stdout.write('app-pack: typecheck and build OK against packed declarations (no source alias)\n');
 
   // ---- serve static assets + real scripted HTTP lifecycle -----------------
-  const port = 48173;
   const workspaceBase = join(scratchRoot, 'workspaces');
-  const server = spawn(process.execPath, ['src/server.ts'], {
+  const server = await startManagedServer({
+    args: ['src/server.ts'],
     cwd: consumer,
-    env: {
-      ...process.env,
-      REFERENCE_APP_PORT: String(port),
-      REFERENCE_APP_HOST: '127.0.0.1',
-      REFERENCE_APP_WORKSPACE_BASE: workspaceBase,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, REFERENCE_APP_HOST: '127.0.0.1', REFERENCE_APP_WORKSPACE_BASE: workspaceBase },
+    readyDeadlineMs: 10_000,
   });
-  let serverOutput = '';
-  server.stdout.on('data', (chunk: Buffer) => (serverOutput += chunk.toString()));
-  server.stderr.on('data', (chunk: Buffer) => (serverOutput += chunk.toString()));
 
   try {
-    const base = `http://127.0.0.1:${String(port)}`;
-    await waitForServer(`${base}/api/providers`, 10_000);
-
+    const base = server.baseUrl;
     const csrf = { 'content-type': 'application/json', 'x-relvo-reference-app': '1' };
     const asset = await fetch(`${base}/`);
     if (asset.status !== 200) throw new Error(`app-pack: static index did not serve, got ${String(asset.status)}`);
@@ -247,12 +334,14 @@ async function main(): Promise<void> {
       'app-pack: OK — served static assets and a full scripted open→turn→advance→close HTTP lifecycle from the packed install\n',
     );
   } catch (error) {
-    process.stderr.write(`app-pack: server output was:\n${serverOutput}\n`);
+    process.stderr.write(`app-pack: server output was:\n${server.output()}\n`);
     throw error;
   } finally {
-    server.kill('SIGTERM');
-    await new Promise((resolve_) => setTimeout(resolve_, 200));
-    if (!server.killed) server.kill('SIGKILL');
+    // Genuinely awaited — including the SIGKILL escalation if needed — so the
+    // process is truly gone (not merely signalled) before this function
+    // returns and the outer `finally` below removes the workspace directory
+    // it may still be holding a handle into.
+    await server.stop();
   }
 }
 

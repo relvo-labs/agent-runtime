@@ -23,6 +23,18 @@ const state = {
   assistantNode: null,
   /** key -> { commandId, fingerprint } — see `submitCommand` below. */
   pendingCommands: new Map(),
+  /**
+   * Bumped every time `startSubscription` opens a new connection — a fresh
+   * session, a reconnect, or an overflow-triggered resubscribe are all a new
+   * generation. A message parsed from an older connection's response body
+   * (already `abort()`-ed, but a frame already buffered before the abort took
+   * effect can still finish parsing) is dropped rather than applied: a stale
+   * frame must never publish state for whichever session/connection is
+   * current now. See `.agents`-external skill `frontend-correctness-review`
+   * ("stale requests cannot publish success, error, loading completion,
+   * ... state").
+   */
+  connectionGeneration: 0,
 };
 
 const el = {
@@ -197,8 +209,7 @@ function resetSessionUi() {
   state.currentRunState = null;
   state.lastConsumedSequence = 0;
   state.assistantNode = null;
-  state.abortController?.abort();
-  state.abortController = null;
+  abortCurrentConnection();
   el.sessionPanel.hidden = true;
   el.transcript.textContent = '';
   el.sessionIdBadge.textContent = '—';
@@ -207,6 +218,7 @@ function resetSessionUi() {
   showBanner(el.connectionError, null);
   el.openSessionButton.disabled = false;
   el.advanceScriptButton.hidden = true;
+  el.sendFailingTurnButton.hidden = true;
 }
 
 async function openSession() {
@@ -234,7 +246,13 @@ async function openSession() {
     el.sessionIdBadge.textContent = state.sessionId;
     el.sessionStateBadge.textContent = 'opening';
     el.sessionPanel.hidden = false;
-    el.advanceScriptButton.hidden = providerId !== 'scripted-demo';
+    // The scripted-demo lane is the only one this app knows how to pace
+    // manually or trigger a canned failure on; hiding these for a real
+    // provider profile also means nobody accidentally sends a scripted
+    // trigger phrase to a billed live provider.
+    const isScriptedDemo = providerId === 'scripted-demo';
+    el.advanceScriptButton.hidden = !isScriptedDemo;
+    el.sendFailingTurnButton.hidden = !isScriptedDemo;
     setSessionControlsEnabled(true);
     startSubscription(state.sessionId, 0);
   } catch {
@@ -247,10 +265,39 @@ function startSubscription(sessionId, fromSequence) {
   state.abortController?.abort();
   const controller = new AbortController();
   state.abortController = controller;
-  void pumpSubscription(sessionId, fromSequence, controller.signal);
+  // A fresh generation for THIS connection attempt — a new session, a
+  // reconnect of the same session, or an overflow-triggered resubscribe are
+  // all a new generation, so anything still in flight from a previous one
+  // (already aborted, but possibly mid-parse) is recognisable as stale.
+  state.connectionGeneration += 1;
+  const generation = state.connectionGeneration;
+  void pumpSubscription(sessionId, fromSequence, controller.signal, generation);
 }
 
-async function pumpSubscription(sessionId, fromSequence, signal) {
+/** True once a newer connection has superseded `generation`. */
+function isStaleConnection(generation) {
+  return generation !== state.connectionGeneration;
+}
+
+/**
+ * Abandons the current connection deliberately (session reset or an
+ * explicit Disconnect). Bumps the generation HERE, not only inside the next
+ * `startSubscription` call: `AbortController.abort()` cancels the *request*,
+ * but bytes the browser already received and buffered internally (a whole
+ * batch of trailing SSE frames can arrive over loopback before an abort is
+ * even processed) are still delivered to a pending `reader.read()` call
+ * afterwards. Without bumping the generation immediately, those trailing
+ * frames would still pass the staleness check — they were, after all, from
+ * "the current generation" right up until this point — and could publish
+ * state for a session that has already been reset or reopened.
+ */
+function abortCurrentConnection() {
+  state.connectionGeneration += 1;
+  state.abortController?.abort();
+  state.abortController = null;
+}
+
+async function pumpSubscription(sessionId, fromSequence, signal, generation) {
   let response;
   try {
     response = await fetch(
@@ -258,10 +305,11 @@ async function pumpSubscription(sessionId, fromSequence, signal) {
       { headers: { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE }, signal },
     );
   } catch {
-    if (signal.aborted) return;
+    if (signal.aborted || isStaleConnection(generation)) return;
     showBanner(el.connectionError, 'could not connect to the event stream');
     return;
   }
+  if (isStaleConnection(generation)) return; // superseded while the request was in flight
   if (response.status === 404) {
     // The backend no longer knows this session id — most likely it restarted
     // since this page loaded. Reconnect is NOT durable provider resume; be
@@ -281,6 +329,7 @@ async function pumpSubscription(sessionId, fromSequence, signal) {
   try {
     for (;;) {
       const { done, value } = await reader.read();
+      if (isStaleConnection(generation)) return; // a newer connection has already taken over
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let separatorIndex;
@@ -290,23 +339,27 @@ async function pumpSubscription(sessionId, fromSequence, signal) {
         for (const line of frame.split('\n')) {
           if (!line.startsWith('data:')) continue;
           const message = JSON.parse(line.slice('data:'.length).trim());
-          await handleSubscriptionMessage(message);
+          await handleSubscriptionMessage(message, generation);
+          if (isStaleConnection(generation)) return;
         }
       }
     }
   } catch {
-    if (!signal.aborted) showBanner(el.connectionError, 'the event stream disconnected unexpectedly');
+    if (!signal.aborted && !isStaleConnection(generation)) {
+      showBanner(el.connectionError, 'the event stream disconnected unexpectedly');
+    }
   }
 }
 
-async function handleSubscriptionMessage(message) {
+async function handleSubscriptionMessage(message, generation) {
+  if (isStaleConnection(generation)) return; // never let a stale connection publish state
   appendInspectorEntry(message.type, message);
   if (message.type === 'caught_up') {
     state.lastConsumedSequence = message.sequence;
     return;
   }
   if (message.type === 'overflow') {
-    await backfillAfterOverflow(message);
+    await backfillAfterOverflow(message, generation);
     return;
   }
   if (message.type === 'closed') {
@@ -323,6 +376,13 @@ function applyEvent(event) {
   state.lastConsumedSequence = Math.max(state.lastConsumedSequence, event.sequence);
   const payload = event.payload;
   switch (payload.type) {
+    case 'session.opened':
+      // The runtime never emits a separate `session.state_changed` for this
+      // transition — `session.opened` itself is documented to mark the
+      // session ready (see `packages/runtime/src/projection.ts`), so this is
+      // the one and only signal the session left `opening`.
+      el.sessionStateBadge.textContent = 'ready';
+      break;
     case 'session.state_changed':
       el.sessionStateBadge.textContent = payload.to;
       break;
@@ -335,6 +395,16 @@ function applyEvent(event) {
         'user-message',
       );
       state.assistantNode = null;
+      break;
+    case 'run.started':
+      // Likewise, a run's initial `running` state arrives only on this
+      // event — there is no companion `run.state_changed` for it. Missing
+      // this case is exactly what left the run badge empty and Interrupt
+      // permanently disabled even though the run was genuinely running.
+      state.currentRunState = 'running';
+      el.runStateBadge.hidden = false;
+      el.runStateBadge.textContent = 'running';
+      el.interruptButton.disabled = false;
       break;
     case 'run.state_changed':
       state.currentRunState = payload.to;
@@ -350,6 +420,12 @@ function applyEvent(event) {
       break;
     case 'run.finished':
       state.assistantNode = null;
+      // The run's terminal outcome (`succeeded`/`failed`/`interrupted`) IS a
+      // real run state — show it, not just leave the last transient value
+      // (or nothing at all) on the badge.
+      state.currentRunState = payload.termination.outcome;
+      el.runStateBadge.hidden = false;
+      el.runStateBadge.textContent = payload.termination.outcome;
       el.interruptButton.disabled = true;
       if (payload.termination.outcome !== 'succeeded') {
         appendTranscriptLine(
@@ -375,18 +451,23 @@ function applyEvent(event) {
  * transcript: the backfilled range starts exactly at `droppedFromSequence`
  * and nothing already rendered live is re-applied.
  */
-async function backfillAfterOverflow(overflow) {
+async function backfillAfterOverflow(overflow, generation) {
+  const sessionId = state.sessionId;
   showBanner(
     el.connectionError,
     `this subscription fell behind and lost ${String(overflow.undeliveredCount)} event(s) on the wire ` +
       '(nothing was lost server-side) — backfilling now…',
   );
   const { body } = await api(
-    `/api/sessions/${encodeURIComponent(state.sessionId)}/events?fromSequence=${String(overflow.droppedFromSequence - 1)}`,
+    `/api/sessions/${encodeURIComponent(sessionId)}/events?fromSequence=${String(overflow.droppedFromSequence - 1)}`,
   );
+  // The session may have been closed (or a newer connection already opened)
+  // while the backfill request was in flight — never apply a stale batch or
+  // reconnect on behalf of a connection nothing still refers to.
+  if (isStaleConnection(generation) || state.sessionId !== sessionId) return;
   for (const event of body.page?.events ?? []) applyEvent(event);
   showBanner(el.connectionError, null);
-  startSubscription(state.sessionId, state.lastConsumedSequence);
+  startSubscription(sessionId, state.lastConsumedSequence);
 }
 
 function setSessionControlsEnabled(enabled) {
@@ -401,14 +482,20 @@ function setSessionControlsEnabled(enabled) {
 
 async function sendTurnText(text) {
   if (text.length === 0 || state.sessionId === null) return;
+  const sessionId = state.sessionId;
   try {
-    const { body } = await submitCommand('turn', { sessionId: state.sessionId, text }, (commandId) =>
-      api(`/api/sessions/${encodeURIComponent(state.sessionId)}/turns`, {
+    const { body } = await submitCommand('turn', { sessionId, text }, (commandId) =>
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
         method: 'POST',
         body: JSON.stringify({ commandId, text }),
       }),
     );
     appendInspectorEntry('receipt submit_turn', body.receipt ?? body);
+    // The session may have been closed (and possibly a new one opened)
+    // while this request was in flight — never let a stale response clear
+    // the input box or publish a banner/run id for whatever session is
+    // current now.
+    if (state.sessionId !== sessionId) return;
     const receipt = body.receipt;
     if (receipt?.disposition === 'rejected') {
       showBanner(el.connectionError, receipt.error?.message ?? 'the turn was rejected');
@@ -418,6 +505,7 @@ async function sendTurnText(text) {
     el.turnInput.value = '';
     if (receipt?.result?.runId) state.currentRunId = receipt.result.runId;
   } catch {
+    if (state.sessionId !== sessionId) return;
     showBanner(el.connectionError, 'could not reach the server — the message was not sent. Try again.');
   }
 }
@@ -432,27 +520,27 @@ async function sendFailingTurn() {
 
 async function advanceScript() {
   if (state.sessionId === null) return;
-  const { body } = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/advance-script`, { method: 'POST' });
+  const sessionId = state.sessionId;
+  const { body } = await api(`/api/sessions/${encodeURIComponent(sessionId)}/advance-script`, { method: 'POST' });
+  if (state.sessionId !== sessionId) return; // superseded while this request was in flight
   appendInspectorEntry('advance-script', body.snapshot ?? body);
 }
 
 async function interruptRun() {
   if (state.sessionId === null || state.currentRunId === null) return;
+  const sessionId = state.sessionId;
+  const runId = state.currentRunId;
   try {
-    const { body } = await submitCommand(
-      'interrupt',
-      { sessionId: state.sessionId, runId: state.currentRunId },
-      (commandId) =>
-        api(
-          `/api/sessions/${encodeURIComponent(state.sessionId)}/runs/${encodeURIComponent(state.currentRunId)}/interrupt`,
-          {
-            method: 'POST',
-            body: JSON.stringify({ commandId }),
-          },
-        ),
+    const { body } = await submitCommand('interrupt', { sessionId, runId }, (commandId) =>
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/interrupt`, {
+        method: 'POST',
+        body: JSON.stringify({ commandId }),
+      }),
     );
+    if (state.sessionId !== sessionId) return;
     appendInspectorEntry('receipt interrupt_run', body.receipt ?? body);
   } catch {
+    if (state.sessionId !== sessionId) return;
     showBanner(el.connectionError, 'could not reach the server — interrupt may not have been delivered. Try again.');
   }
 }
@@ -488,7 +576,7 @@ async function closeSession() {
 }
 
 function disconnectStream() {
-  state.abortController?.abort();
+  abortCurrentConnection();
   el.disconnectButton.disabled = true;
   el.reconnectButton.disabled = false;
   showBanner(
