@@ -297,9 +297,13 @@ tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsco
    `disposition: "rejected"` receipt) when cleanup fails, exactly so the same `commandId` retries
    the same logical attempt; this app answers that as a typed `503` JSON error naming the real,
    retryable cause (never a silent 200, never a generic 500) — see `callRuntimeCommand` in
-   `src/http/routes.ts`. A genuinely **rejected** close receipt (the session was, say, already
-   gone) is answered as a normal `200` carrying `disposition: "rejected"`; the browser client never
-   resets its UI for an effect that did not happen.
+   `src/http/routes.ts`. A genuinely **rejected** close receipt is answered as a normal `200`
+   carrying `disposition: "rejected"` — what the browser client does with it then depends on
+   _which_ rejection it is: `error.code: "unknown_session"` (the session was already gone) is a
+   **hard reset** with a visible explanation (see
+   [Close-versus-interrupt policy](#close-versus-interrupt-policy)), never a claim that the session
+   is still open; every _other_ rejected close leaves the UI exactly as it was — the session really
+   is still open, so nothing is reset for an effect that did not happen.
 9. **`getSession` / `readEvents`** — `GET /api/sessions/:id` and `GET /api/sessions/:id/events` —
    the same projections and durable history any consumer can read independent of a live
    subscription. Query values (`fromSequence`, `bufferSize`) are parsed strictly — `"1junk"` or

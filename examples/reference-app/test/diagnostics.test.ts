@@ -17,9 +17,15 @@ import { AgentRuntimeError, agentError } from '@relvo-labs/agent-protocol';
 import { safeDiagnostic } from '../src/diagnostics.ts';
 
 // A recognisable sentinel that must NEVER appear in `safeDiagnostic`'s
-// output, no matter how deeply it is nested. Deliberately shaped like the
-// kinds of upstream detail a real provider failure could carry.
-const SECRET_SENTINEL = 'sk-TEST-SENTINEL-do-not-leak-3f9a1c';
+// output, no matter how deeply it is nested. Deliberately unmistakably
+// SYNTHETIC — plain marker text, never shaped like any real credential
+// format (no `sk-`/`gh_`/`AKIA`-style prefix) — so this file itself stays
+// clean of anything `tools/repo/check-static.ts`'s secret-pattern scanner
+// (unchanged, and correctly so — see `.agents/skills/local-ci-parity`)
+// would, rightly, also flag in a genuine leak. The point of this sentinel is
+// only to prove `safeDiagnostic` strips arbitrary sensitive-looking text; it
+// does not need to mimic a real token's shape to do that.
+const SECRET_SENTINEL = 'SYNTHETIC-SENSITIVE-MARKER-not-a-real-credential-3f9a1c-do-not-leak';
 const NATIVE_ID_SENTINEL = 'pid=48213 native-handle=0x7ffee204';
 const PATH_SENTINEL = '/home/test-user/.codex/credentials.json';
 
