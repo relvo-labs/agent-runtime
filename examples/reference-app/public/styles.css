@@ -1,0 +1,199 @@
+:root {
+  color-scheme: light dark;
+  --fg: #1a1a1a;
+  --bg: #ffffff;
+  --muted: #5a5a5a;
+  --border: #d0d0d0;
+  --accent: #2b5fd9;
+  --error-bg: #fdecea;
+  --error-fg: #7a1f16;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #eaeaea;
+    --bg: #14161a;
+    --muted: #a3a3a3;
+    --border: #3a3d42;
+    --accent: #7fa2ff;
+    --error-bg: #3a1a17;
+    --error-fg: #ffb4a8;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.5;
+}
+
+.app-header,
+main,
+.app-footer {
+  max-width: 56rem;
+  margin: 0 auto;
+  padding: 1rem 1.25rem;
+}
+
+.app-header__subtitle {
+  font-weight: 400;
+  color: var(--muted);
+  font-size: 0.6em;
+}
+
+.app-header__lede {
+  color: var(--muted);
+  max-width: 46rem;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.field-row label {
+  min-width: 6rem;
+  font-weight: 600;
+}
+
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  padding: 0.4rem 0.6rem;
+}
+
+#turn-input {
+  flex: 1 1 20rem;
+  min-width: 16rem;
+  resize: vertical;
+}
+
+button {
+  font: inherit;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  border-radius: 0.35rem;
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
+  font-family: ui-monospace, monospace;
+}
+
+.badge--state {
+  font-family: inherit;
+  font-weight: 600;
+}
+
+.capability-summary {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.banner {
+  border-radius: 0.35rem;
+  padding: 0.6rem 0.8rem;
+  margin: 0.5rem 0;
+}
+
+.banner--error {
+  background: var(--error-bg);
+  color: var(--error-fg);
+}
+
+.transcript {
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  padding: 0.75rem;
+  min-height: 6rem;
+  max-height: 24rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+}
+
+.transcript .tool-activity,
+.transcript .diagnostic {
+  display: block;
+  color: var(--muted);
+  font-style: italic;
+  margin: 0.25rem 0;
+}
+
+.inspector-log {
+  max-height: 20rem;
+  overflow-y: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  padding-left: 1.25rem;
+}
+
+.inspector-log li {
+  margin-bottom: 0.35rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.app-footer {
+  color: var(--muted);
+  font-size: 0.85rem;
+}

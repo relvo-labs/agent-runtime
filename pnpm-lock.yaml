@@ -108,6 +108,21 @@ importers:
         specifier: 'catalog:'
         version: 4.5.4
 
+  examples/reference-app:
+    dependencies:
+      '@relvo-labs/agent-protocol':
+        specifier: workspace:^
+        version: link:../../packages/protocol
+      '@relvo-labs/agent-provider':
+        specifier: workspace:^
+        version: link:../../packages/provider
+      '@relvo-labs/agent-runtime':
+        specifier: workspace:^
+        version: link:../../packages/runtime
+      '@relvo-labs/agent-workspace':
+        specifier: workspace:^
+        version: link:../../packages/workspace
+
   packages/executor:
     dependencies:
       '@relvo-labs/agent-protocol':

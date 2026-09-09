@@ -1,0 +1,56 @@
+/**
+ * Reference app configuration.
+ *
+ * Every field here has a safe default appropriate for a loopback-only demo.
+ * Nothing is read from a browser request; this module is the single place a
+ * host operator can adjust behaviour, and every value it produces is trusted.
+ */
+
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+export type ReferenceAppConfig = {
+  /** Loopback only. Never `0.0.0.0` or a public interface — see SECURITY. */
+  readonly host: string;
+  /** `0` picks an ephemeral port; used by tests and optionally by dev runs. */
+  readonly port: number;
+  /**
+   * Base directory this app owns for disposable *managed* workspaces. Every
+   * session gets its own directory under here, created fresh and removed on
+   * close. This app never operates against a borrowed/existing directory.
+   */
+  readonly workspaceBaseDirectory: string;
+  /** Maximum accepted JSON request body, in bytes. */
+  readonly maxRequestBodyBytes: number;
+};
+
+function readPort(value: string | undefined, fallback: number): number {
+  if (value === undefined || value === '') return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65_535) {
+    throw new Error(`REFERENCE_APP_PORT must be an integer in [0, 65535], got \`${value}\``);
+  }
+  return parsed;
+}
+
+/**
+ * Build configuration from the process environment. Called once at process
+ * start; a test constructs its own config object directly instead of mutating
+ * `process.env`, so the two never interfere.
+ */
+export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): ReferenceAppConfig {
+  const host = env.REFERENCE_APP_HOST ?? '127.0.0.1';
+  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+    throw new Error(
+      `refusing to bind the reference app to \`${host}\`: this demo only ever binds loopback ` +
+        '(127.0.0.1, ::1, or localhost). It is not hardened for a shared or public interface.',
+    );
+  }
+  return {
+    host,
+    port: readPort(env.REFERENCE_APP_PORT, 4173),
+    workspaceBaseDirectory:
+      env.REFERENCE_APP_WORKSPACE_BASE ?? join(tmpdir(), 'relvo-reference-app', String(process.pid)),
+    maxRequestBodyBytes: 64 * 1024,
+  };
+}

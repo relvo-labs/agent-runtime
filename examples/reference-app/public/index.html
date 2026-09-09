@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Relvo Agent Runtime — Reference App</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Relvo Agent Runtime <span class="app-header__subtitle">reference app</span></h1>
+      <p class="app-header__lede">
+        A runnable walkthrough of <code>@relvo-labs/agent-runtime</code>: open a session, send a turn, watch real
+        receipts and events stream in, interrupt, and close — all through this page's own Node HTTP/SSE backend.
+      </p>
+    </header>
+
+    <main>
+      <section aria-labelledby="setup-heading" class="panel">
+        <h2 id="setup-heading">1. Choose a provider and open a session</h2>
+        <div class="field-row">
+          <label for="provider-select">Provider</label>
+          <select id="provider-select"></select>
+          <button id="open-session-button" type="button">Open session</button>
+        </div>
+        <p id="provider-capability-summary" class="capability-summary" role="note"></p>
+        <p id="setup-error" class="banner banner--error" role="alert" hidden></p>
+      </section>
+
+      <section aria-labelledby="session-heading" class="panel" id="session-panel" hidden>
+        <h2 id="session-heading">2. Session</h2>
+        <div class="badges">
+          <span class="badge" id="session-id-badge">—</span>
+          <span class="badge badge--state" id="session-state-badge">—</span>
+          <span class="badge badge--state" id="run-state-badge" hidden></span>
+        </div>
+        <p id="connection-error" class="banner banner--error" role="alert" hidden></p>
+
+        <div class="field-row">
+          <label for="turn-input">Message</label>
+          <textarea id="turn-input" rows="3" maxlength="4000"></textarea>
+        </div>
+        <div class="button-row">
+          <button id="send-turn-button" type="button">Send turn</button>
+          <button id="interrupt-button" type="button" disabled>Interrupt run</button>
+          <button id="close-session-button" type="button">Close session</button>
+        </div>
+
+        <h3>Transcript</h3>
+        <div id="transcript" class="transcript" aria-live="polite" aria-label="Assistant transcript"></div>
+      </section>
+
+      <section aria-labelledby="inspector-heading" class="panel" id="inspector-panel" hidden>
+        <h2 id="inspector-heading">Receipt &amp; event inspector</h2>
+        <p class="capability-summary" role="note">
+          Raw, safely-rendered JSON for every command receipt and subscription message this page has seen. Nothing here
+          is ever inserted as HTML.
+        </p>
+        <ol id="inspector-log" class="inspector-log" aria-label="Receipts and events"></ol>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>
+        See
+        <a href="https://github.com/relvo-labs/agent-runtime/blob/main/examples/reference-app/README.md">README.md</a>
+        for the full integration walkthrough, security model, and how to run this against a real Codex or Claude profile
+        instead of the scripted demo.
+      </p>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -27,6 +27,14 @@ Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol sche
 | `@relvo-labs/agent-provider-codex`  | Codex adapter over the official app-server stdio JSONL protocol |
 | `@relvo-labs/agent-provider-claude` | Claude adapter over the official Claude Agent SDK query API     |
 
+## Try it: reference app
+
+[`examples/reference-app`](examples/reference-app/README.md) is a runnable, private (unpublished) walkthrough:
+a consumer-owned Node HTTP/SSE backend and a plain browser UI over `@relvo-labs/agent-runtime`, exercising the
+full open → subscribe → turn → interrupt → close → shutdown lifecycle against a credential-free scripted
+provider by default, with opt-in Codex/Claude profiles. Start with its own README for setup and the exact
+integration steps.
+
 ## Development
 
 Use the repository toolchain exactly:

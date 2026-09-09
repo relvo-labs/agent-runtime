@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // Dev-time typecheck resolves the SDK to SOURCE, exactly like the root
+    // workspace typecheck, so this app can be worked on without a prior
+    // `pnpm build`. Published-artifact resolution is proven separately by
+    // `pnpm artifacts:check` (see docs/adr referenced from the skill), which
+    // installs this app against packed tarballs instead.
+    "paths": {
+      "@relvo-labs/agent-protocol": ["../../packages/protocol/src/index.ts"],
+      "@relvo-labs/agent-executor": ["../../packages/executor/src/index.ts"],
+      "@relvo-labs/agent-provider": ["../../packages/provider/src/index.ts"],
+      "@relvo-labs/agent-provider/testing": ["../../packages/provider/src/testing/index.ts"],
+      "@relvo-labs/agent-workspace": ["../../packages/workspace/src/index.ts"],
+      "@relvo-labs/agent-runtime": ["../../packages/runtime/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}
