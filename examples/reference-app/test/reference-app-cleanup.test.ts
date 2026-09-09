@@ -1,12 +1,44 @@
 /**
- * Cleanup-failure retry, shutdown with an open SSE connection, and the
- * "missing real-provider setup — no silent fallback" requirement.
+ * Cleanup-failure retry, shutdown with an open SSE connection, the
+ * "missing real-provider setup — no silent fallback" requirement, and
+ * whole-app shutdown's own retry-safety and Codex abandoned-connection
+ * cleanup ownership.
  */
 
 import { existsSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { defineProviderDescriptor } from '@relvo-labs/agent-provider';
+import type { CodexAbandonedConnectionReport, CodexProvider } from '@relvo-labs/agent-provider-codex';
 
 import { commandId, openScriptedSession, startTestApp, type JsonRecord } from './helpers.ts';
+
+/**
+ * A minimal, valid `CodexProvider` stand-in: enough of a real descriptor to
+ * register with the runtime, plus a scriptable `releaseAbandonedConnections`.
+ * `createSession` is never exercised by these tests — only the cleanup
+ * wiring `app.ts#close()` is responsible for is under test here.
+ */
+function createFakeCodexProvider(
+  releaseAbandonedConnections: () => Promise<CodexAbandonedConnectionReport>,
+): CodexProvider {
+  return {
+    describe: () =>
+      defineProviderDescriptor({
+        providerId: 'codex',
+        providerVersion: '0.0.0-test',
+        displayName: 'Fake Codex (test only)',
+        run: { interrupt: { mode: 'unsupported' }, streaming: {}, maxConcurrentRunsPerSession: 1 },
+        interaction: { approval: { supported: false }, question: { supported: false }, settlementTimeoutMs: null },
+        workspace: { requires: 'directory' },
+        recovery: { exportsRecoveryRecord: false },
+      }),
+    createSession: () => {
+      throw new Error('not exercised by this test');
+    },
+    releaseAbandonedConnections,
+    abandonedConnectionCount: 0,
+  };
+}
 
 describe('reference-app: cleanup, shutdown, and honest provider setup failure', () => {
   it('retries a failed cleanup with the same commandId until it actually succeeds', async () => {
@@ -146,5 +178,74 @@ describe('reference-app: cleanup, shutdown, and honest provider setup failure', 
     } finally {
       await started.teardown();
     }
+  });
+
+  it('retries a failed whole-app close() with the same retry-safe cleanup, not a silent exit(0)', async () => {
+    // Mirrors the per-session HTTP retry test above, but exercises
+    // `app.close()` itself — the method `server.ts`'s SIGINT/SIGTERM handler
+    // calls. A workspace release failure during the runtime's own shutdown
+    // sweep must make `close()` reject, not resolve, so a caller can retry.
+    let failNext = true;
+    const started = await startTestApp(
+      {},
+      {
+        removeDirectory: async (path) => {
+          if (failNext) {
+            failNext = false;
+            throw new Error('simulated cleanup failure (test only; never a real filesystem error)');
+          }
+          const { rm } = await import('node:fs/promises');
+          await rm(path, { recursive: true, force: true });
+        },
+      },
+    );
+    const sessionId = await openScriptedSession(started);
+    const snapshot = await started.call(`/api/sessions/${sessionId}`);
+    const root = ((snapshot.body.snapshot as JsonRecord).session as JsonRecord).workspace as JsonRecord;
+
+    await expect(started.app.close()).rejects.toBeTruthy();
+    expect(existsSync(root.root as string)).toBe(true); // nothing falsely reported as removed
+
+    // Retried, the exact same shutdown sweep actually finishes — matching
+    // `AgentRuntime#shutdown()`'s own documented retry-safety ("a later call
+    // retries cleanup").
+    await started.app.close();
+    expect(existsSync(root.root as string)).toBe(false);
+
+    // Already fully closed above — `teardown()` would call `close()` a third
+    // time; clean up the scratch directory directly instead, matching the
+    // pattern the SSE-shutdown test above already uses.
+    const { rmSync } = await import('node:fs');
+    rmSync(started.workspaceBase, { recursive: true, force: true });
+  });
+
+  it('propagates a Codex abandoned-connection cleanup failure as a retryable close() failure', async () => {
+    let attempt = 0;
+    const fakeCodex = createFakeCodexProvider(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error('simulated abandoned-connection teardown failure (test only)');
+      }
+      return { attempted: 1, released: 1, pending: 0 };
+    });
+    const started = await startTestApp({}, { testCodexProvider: fakeCodex });
+
+    // The real Codex profile is not opted into via config, but the runtime
+    // still registered — and, more importantly, RETAINED A HANDLE TO — this
+    // stand-in, exactly the wiring `runtime-factory.ts`/`app.ts` must do for
+    // the real adapter.
+    const providers = (await started.call('/api/providers')).body.providers as JsonRecord[];
+    expect(providers.some((p) => p.providerId === 'codex')).toBe(true);
+
+    await expect(started.app.close()).rejects.toThrow(/abandoned-connection/);
+    expect(attempt).toBe(1);
+
+    // Retried, the same sweep is attempted again and this time succeeds —
+    // proving the failure did not silently consume the cleanup obligation.
+    await started.app.close();
+    expect(attempt).toBe(2);
+
+    const { rmSync } = await import('node:fs');
+    rmSync(started.workspaceBase, { recursive: true, force: true });
   });
 });

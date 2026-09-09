@@ -11,6 +11,7 @@ import { createSystemClock, createCounterIdFactory, type Clock, type IdFactory }
 import { createAgentRuntime, type AgentRuntime } from '@relvo-labs/agent-runtime';
 import { createLocalWorkspaceProvider, type WorkspaceProvider } from '@relvo-labs/agent-workspace';
 import type { AgentProvider } from '@relvo-labs/agent-provider';
+import type { CodexAbandonedConnectionReport, CodexProvider } from '@relvo-labs/agent-provider-codex';
 
 import { createScriptedDemoProvider, SCRIPTED_PROVIDER_ID } from './providers/scripted.ts';
 import { createCodexRealProvider } from './providers/codex.ts';
@@ -37,6 +38,17 @@ export type ReferenceAppRuntime = {
    * scripted-demo session is open.
    */
   readonly advanceScriptedDemo: () => Promise<void>;
+  /**
+   * Retry teardown of every Codex connection abandoned by a failed handshake
+   * (`CodexProvider#releaseAbandonedConnections` — see
+   * `packages/provider-codex/src/provider.ts`). `undefined` when the real
+   * Codex profile is not registered (a no-op, not a silent success). Rejects
+   * (with a retryable `provider_unavailable`) when something is still
+   * pending — `app.ts#close()` propagates that rather than swallowing it, so
+   * an owned-but-unreleased app-server child process stays a visible,
+   * retryable shutdown failure instead of a silently leaked handle.
+   */
+  readonly releaseAbandonedCodexConnections: () => Promise<CodexAbandonedConnectionReport | undefined>;
 };
 
 export type ReferenceAppRuntimeOptions = {
@@ -50,6 +62,14 @@ export type ReferenceAppRuntimeOptions = {
     readonly codex?: { readonly executable?: string };
     readonly claude?: { readonly model?: string };
   };
+  /**
+   * Test-only seam: register this stand-in instead of constructing a real
+   * `CodexProvider`, so a test can deterministically script
+   * `releaseAbandonedConnections()` (e.g. to reject, proving `app.ts#close()`
+   * genuinely propagates that failure) without a real Codex handshake.
+   * Takes precedence over `realProviders.codex` when both are given.
+   */
+  readonly testCodexProvider?: CodexProvider;
 };
 
 export function createReferenceAppRuntime(options: ReferenceAppRuntimeOptions): ReferenceAppRuntime {
@@ -66,9 +86,13 @@ export function createReferenceAppRuntime(options: ReferenceAppRuntimeOptions): 
   const scripted = createScriptedDemoProvider();
   const providers: AgentProvider[] = [scripted.provider];
 
-  if (options.realProviders?.codex) {
-    providers.push(createCodexRealProvider(options.realProviders.codex));
-  }
+  // Retained separately from `providers` (which only ever needs the neutral
+  // `AgentProvider` view the runtime consumes) so this app can still reach
+  // the Codex adapter's own cleanup ownership after registration.
+  const codex =
+    options.testCodexProvider ??
+    (options.realProviders?.codex ? createCodexRealProvider(options.realProviders.codex) : undefined);
+  if (codex) providers.push(codex);
   if (options.realProviders?.claude) {
     providers.push(createClaudeRealProvider(options.realProviders.claude));
   }
@@ -95,5 +119,6 @@ export function createReferenceAppRuntime(options: ReferenceAppRuntimeOptions): 
       // could still observe the run as non-terminal.
       await runtime.quiesce();
     },
+    releaseAbandonedCodexConnections: () => (codex ? codex.releaseAbandonedConnections() : Promise.resolve(undefined)),
   };
 }

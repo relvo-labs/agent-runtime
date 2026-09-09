@@ -416,6 +416,12 @@ export async function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
+  // Applied first, unconditionally — including on every early-return failure
+  // below (URI-too-long, Host/Origin/CSRF rejection). A rejection response
+  // still carries `Cache-Control: no-store`/`X-Content-Type-Options`/framing
+  // protection; those are not only for the happy path.
+  applyBaselineHeaders(response);
+
   const method = request.method ?? 'GET';
   const rawUrl = request.url ?? '/';
   if (rawUrl.length > MAX_URL_LENGTH) {
@@ -439,7 +445,6 @@ export async function handleRequest(
     sendError(response, security.status, security.code, security.message);
     return;
   }
-  applyBaselineHeaders(response);
 
   if (!isApiRoute) {
     if (method !== 'GET' && method !== 'HEAD') {

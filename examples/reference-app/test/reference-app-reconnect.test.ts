@@ -84,31 +84,86 @@ describe('reference-app: reconnect, overflow, and disconnect-vs-cancellation', (
     expect(overflow.droppedFromSequence).toBeGreaterThan(0);
     expect(overflow.resumeCursor).toMatch(/^cur_\d+$/);
     expect(overflow.undeliveredCount as number).toBeGreaterThan(0);
-    // The default policy ends the stream right after signalling — never
-    // silently continuing as though nothing had been missed.
-    const closedAfterOverflow = await readUntil(() => true, 100).catch(() => undefined);
-    void closedAfterOverflow;
+
+    // The default policy (`signal_and_close`) ends the stream right after
+    // signalling — never silently continuing as though nothing had been
+    // missed. Prove this with a GENUINE end-of-stream read, not a vacuous
+    // predicate: `readUntil(() => true, …)` never even calls `reader.read()`
+    // because its loop condition is already false on entry, so it proved
+    // nothing about whether the stream actually closed. Read until either a
+    // real `done: true` (the stream ended, as required) or a real deadline —
+    // and fail loudly if any further frame arrives instead, since that would
+    // mean `signal_and_close` silently became `signal_and_skip`.
+    let eof = false;
+    const eofDeadline = Date.now() + 2000;
+    for (;;) {
+      if (Date.now() > eofDeadline) break;
+      const { done, value } = await reader.read();
+      if (done) {
+        eof = true;
+        break;
+      }
+      const leftover = decoder.decode(value, { stream: true }).trim();
+      if (leftover.length > 0) {
+        throw new Error(`stream kept delivering data after overflow under signal_and_close: ${leftover}`);
+      }
+    }
+    expect(eof).toBe(true);
 
     // Nothing was actually lost server-side: the durable log still has every
     // event, and the client can backfill exactly the missed range from the
     // cursor the overflow message gave it — reconstructing the transcript
-    // without a gap and without re-adding anything already delivered.
+    // completely, with no gap and nothing re-added that was already
+    // delivered.
     const droppedFrom = overflow.droppedFromSequence as number;
-    const alreadyDelivered = new Set(
-      seen.filter((m) => m.type === 'event').map((m) => (m.event as JsonRecord).sequence as number),
-    );
+    const alreadyDeliveredSequences = seen
+      .filter((m) => m.type === 'event')
+      .map((m) => (m.event as JsonRecord).sequence as number)
+      .sort((a, b) => a - b);
     const backfill = await started.call(`/api/sessions/${sessionId}/events?fromSequence=${String(droppedFrom - 1)}`);
     expect(backfill.status).toBe(200);
-    const backfilledEvents = (backfill.body.page as JsonRecord).events as JsonRecord[];
+    const backfillPage = backfill.body.page as JsonRecord;
+    const backfilledEvents = backfillPage.events as JsonRecord[];
     expect(backfilledEvents.length).toBeGreaterThan(0);
-    // No duplication: none of the backfilled sequences were already delivered
-    // live before the overflow.
-    for (const event of backfilledEvents) {
-      expect(alreadyDelivered.has(event.sequence as number)).toBe(false);
-    }
-    // No gap: the backfill's sequences are contiguous starting at the drop point.
+    // The recovered range must be COMPLETE in one page — a partial recovery
+    // that silently stopped part-way through would be exactly as bad as
+    // never recovering at all.
+    expect(backfillPage.hasMore).toBe(false);
     const backfilledSequences = backfilledEvents.map((event) => event.sequence as number);
-    expect(Math.min(...backfilledSequences)).toBe(droppedFrom);
+
+    // No duplication: none of the backfilled sequences were already
+    // delivered live before the overflow.
+    const alreadyDeliveredSet = new Set(alreadyDeliveredSequences);
+    for (const sequence of backfilledSequences) {
+      expect(alreadyDeliveredSet.has(sequence)).toBe(false);
+    }
+
+    // Gap-free, end to end: replay (sequences 1..N delivered live before the
+    // overflow) plus the backfill together must form one contiguous run from
+    // 1 through the final recovered sequence — not merely "starts at the
+    // right place" and "doesn't overlap", which a batch with an internal
+    // hole would also satisfy.
+    const allSequences = [...alreadyDeliveredSequences, ...backfilledSequences];
+    expect(allSequences[0]).toBe(1);
+    for (let i = 1; i < allSequences.length; i += 1) {
+      expect(allSequences[i]).toBe(allSequences[i - 1]! + 1);
+    }
+
+    // And the recovered end must be the TRUE end: a fresh, independent
+    // `readEvents(0)` (bypassing everything captured by this test's own
+    // subscription/backfill bookkeeping) must agree on exactly how many
+    // events exist and end at the same final sequence.
+    const authoritative = await started.call(`/api/sessions/${sessionId}/events?fromSequence=0`);
+    const authoritativePage = authoritative.body.page as JsonRecord;
+    expect(authoritativePage.hasMore).toBe(false);
+    const finalSequence = allSequences[allSequences.length - 1]!;
+    expect((authoritativePage.events as JsonRecord[]).length).toBe(finalSequence);
+    // `nextSequence` is already a ready-to-use `fromSequence` for the NEXT
+    // call (see the "resumes a fresh subscription…" test below, which relies
+    // on exactly this) — i.e. it equals the last delivered sequence itself,
+    // not one past it; `fromSequence` is an exclusive lower bound throughout
+    // this app (see e.g. the `droppedFrom - 1` backfill call above).
+    expect(authoritativePage.nextSequence).toBe(finalSequence);
 
     controller.abort();
   });

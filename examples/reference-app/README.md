@@ -28,9 +28,14 @@ one registered by default — see [Lanes](#two-lanes) below), click **Open sessi
 message, and click **Send turn**. Nothing happens yet — click **Advance script** to actually
 progress it (see why below), watch the transcript, receipt/event inspector, and session/run
 state badges update from real streamed events, then try **Interrupt run** _before_ advancing to
-see a genuine in-flight interrupt. Click **Close session** when done. Stop the server with
-<kbd>Ctrl-C</kbd> — it shuts the runtime down cleanly (releases the provider session and deletes
-the managed workspace directory) before exiting.
+see a genuine in-flight interrupt. Click **Close session** when done — see
+[Close-versus-interrupt policy](#close-versus-interrupt-policy) for exactly what that does to an
+active run, and why the transcript/badges stay on screen rather than resetting immediately. Stop
+the server with <kbd>Ctrl-C</kbd> — it shuts the runtime down cleanly (releases the provider
+session and deletes the managed workspace directory) before exiting; a failed cleanup is reported
+and left retryable with a second <kbd>Ctrl-C</kbd>, never silently swallowed by an exit code of 0
+(see item 10 under [Integration walkthrough](#integration-walkthrough-what-the-code-actually-does)
+below).
 
 Configuration is environment-driven (see `src/config.ts`); useful for development:
 
@@ -41,7 +46,7 @@ REFERENCE_APP_PORT=0 pnpm --filter @relvo-labs/reference-app start   # ephemeral
 ### Running the tests, typecheck, and build
 
 ```bash
-pnpm --filter @relvo-labs/reference-app test        # this app's own tests (34+ cases, 5 files)
+pnpm --filter @relvo-labs/reference-app test        # this app's own tests (49 cases, 6 files)
 pnpm test                                            # root gate step; picks these up too
 
 pnpm build                                           # required first — see below
@@ -76,9 +81,14 @@ pnpm app-pack:check    # tools/repo/check-app-pack.ts
 
 Packs all eight SDK packages, copies this app's `src/`/`public/` (never a workspace symlink) into
 an isolated scratch consumer whose `node_modules` resolves every `@relvo-labs/*` import to those
-tarballs with a clean pnpm store, typechecks and builds it there, then starts the built app for
-real and drives a full scripted `open → turn → advance-script → close` HTTP lifecycle against it.
-This is wired into `pnpm gate` (step `app-pack`, after `build`/`app-build`/`artifacts`).
+tarballs with a clean pnpm store, typechecks and **builds** it there, then starts the app by
+executing its **built** `dist/server.js` — never the `src/server.ts` this scratch consumer's own
+`tsc` build already emitted that from — and drives a full scripted
+`open → turn → advance-script → close` HTTP lifecycle against that running built artifact. Running
+the built output, not the source it was built from, is the whole point of this proof: `server.ts`'s
+one startup line is present unchanged in both its source and built form, so genuinely proving the
+_built_ file runs matters. This is wired into `pnpm gate` (step `app-pack`, after
+`build`/`app-build`/`artifacts`).
 
 ### Real-browser check (not part of the canonical gate)
 
@@ -93,12 +103,18 @@ Chromium/Chrome executable, and asserts real DOM state at each step, on both a d
 any turn; a submitted turn's run badge reaches `running` **and Interrupt becomes enabled** (not
 only "ends up disabled after the fact", which would pass even if Interrupt had never worked); a
 real click on Interrupt reaches `interrupted`; a followup turn on the same session works and
-reaches `running` again; **Advance script** reaches `succeeded`; closing resets every badge, and a
-newly-opened session never shows a stale badge left over from the one just closed. It also asserts
-hostile prompt text renders as literal text and never executes or becomes an element (a real XSS
-check, not a unit-test approximation), that **Close session** is reachable and activatable by
-keyboard alone, and that the page has no horizontal overflow at the mobile viewport — both on the
-near-empty initial shell and with a session actively open. Missing the executable path is a clear,
+reaches `running` again; **Advance script** reaches `succeeded`. Closing a session with **no**
+active run reaches `closed` while the run's own last badge stays visible as preserved evidence (see
+[Close-versus-interrupt policy](#close-versus-interrupt-policy)); closing a session **with** a
+still-running run — driven through a genuine click, not a state inspection — proves the explicit
+`ifRunActive: "interrupt"` policy actually interrupts it first, that the Close button disables
+itself synchronously (the overlapping-close race guard), and that the interrupted run's own outcome
+stays visible in the transcript until a brand-new **Open session** click clears it. It also asserts
+a newly-opened session never shows a stale badge left over from the one just closed, that hostile
+prompt text renders as literal text and never executes or becomes an element (a real XSS check, not
+a unit-test approximation), that **Close session** is reachable and activatable by keyboard alone,
+and that the page has no horizontal overflow at the mobile viewport — both on the near-empty
+initial shell and with a session actively open. Missing the executable path is a clear,
 immediate failure, never a silent skip — this check is intentionally **not** part of `pnpm gate`
 (a browser binary is not something this workspace installs, and the canonical gate must stay
 deterministic and environment-independent; see `.agents/skills/local-ci-parity/SKILL.md`). The
@@ -167,7 +183,13 @@ guesses, stores, or forwards one:
   (default `~/.codex`), or `CODEX_API_KEY`/`CODEX_ACCESS_TOKEN` for non-interactive use — is what
   Codex itself resolves. Compatibility baseline: **codex-cli 0.153.4**. Live docs read during
   implementation: <https://developers.openai.com/codex/auth>,
-  <https://developers.openai.com/codex/environment-variables>.
+  <https://developers.openai.com/codex/environment-variables>. This app retains its own typed
+  `CodexProvider` handle (not merely the generic `AgentProvider` the runtime is registered with) so
+  that whole-app shutdown (`app.ts#close()`) can also call the adapter's own
+  `releaseAbandonedConnections()` — cleanup for a handshake whose own teardown also failed, which is
+  adapter-specific and no `AgentRuntime#shutdown()` call performs on its behalf. A failure there
+  makes the whole `close()` attempt reject too, retried the same way as any other cleanup failure
+  (see `test/reference-app-cleanup.test.ts`).
 - **Claude** — `REFERENCE_APP_ENABLE_CLAUDE=1`, optionally `REFERENCE_APP_CLAUDE_MODEL=<model id>`
   (defaults to `claude-sonnet-4-6`, this repository's own documented example model). Permission
   mode is fixed at the conservative `plan` — never `acceptEdits`/`bypassPermissions`. Requires the
@@ -208,6 +230,7 @@ src/
     scripted.ts            the scripted-demo provider's fixed scripts (default, failure, burst-for-tests) and identity
     codex.ts, claude.ts     opt-in real-profile wrappers (conservative defaults; no auth logic)
   commands.ts            narrow, typed, strict-allowlist extraction of request-body fields
+  diagnostics.ts         sanitized error-to-log-line conversion — never a raw Error/AggregateError/cause
   http/
     routes.ts               the one place an HTTP request becomes an AgentExecutor call
     security.ts             Host(+port)/Origin/anti-CSRF checks + baseline response headers
@@ -216,15 +239,22 @@ src/
     sse.ts                   SubscriptionMessage → `data: <json>\n\n` framing, backpressure, deadline, disconnect handling
     static-assets.ts         fixed allowlist of exact pathnames → files (no path-traversal surface)
   app.ts               wires config + runtime + HTTP server into one start/stop object; graceful SSE-aware shutdown
-  server.ts            process entry point (env config, SIGINT/SIGTERM → clean shutdown)
+  server.ts            process entry point (env config, SIGINT/SIGTERM → clean shutdown; a failed
+                        cleanup reports and stays retryable, never a false exit 0)
 scripts/
   browser-check.ts     real-browser Playwright check (see above; not part of `pnpm gate`)
 test/
   helpers.ts                        shared real-HTTP/SSE test harness
   reference-app.test.ts             core lifecycle, admission, strict-field/security matrix
+  session-admission.test.ts         "one session at a time" server-side enforcement, retry-safety
   reference-app-interrupt.test.ts   genuine in-flight interrupt, subsequent turn, scripted failure
-  reference-app-reconnect.test.ts   overflow + backfill, reconnect-without-replay, disconnect-vs-cancel
-  reference-app-cleanup.test.ts     cleanup-failure retry, shutdown+open-SSE, missing-provider setup failure
+  reference-app-reconnect.test.ts   overflow + gap-free backfill (genuine EOF, cross-checked against
+                                     a fresh independent readEvents), reconnect-without-replay,
+                                     disconnect-vs-cancel
+  reference-app-cleanup.test.ts     cleanup-failure retry (both per-session and whole-`app.close()`),
+                                     shutdown+open-SSE, missing-provider setup failure, Codex
+                                     abandoned-connection cleanup ownership
+  config.test.ts                    strict, non-truncating `REFERENCE_APP_PORT` parsing
 tsconfig.json         typecheck project (noEmit); no `paths` — resolves via real node_modules
 tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsconfig.json
 ```
@@ -259,24 +289,71 @@ tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsco
 7. **`interruptRun`** — `POST /api/sessions/:id/runs/:runId/interrupt` — reports whatever the SDK
    reports, including a truthful `delivered: false` for an already-terminal run and `true` for a
    genuine in-flight one.
-8. **`closeSession`** — `POST /api/sessions/:id/close` — disposes the provider session and
-   releases the managed workspace lease. `closeSession` **rejects its promise** (not a
+8. **`closeSession`** — `POST /api/sessions/:id/close { commandId, ifRunActive }` — disposes the
+   provider session and releases the managed workspace lease. The browser client always sends
+   `ifRunActive: "interrupt"` explicitly — see
+   [Close-versus-interrupt policy](#close-versus-interrupt-policy) — never omitting the field to
+   fall through to the SDK's own default. `closeSession` **rejects its promise** (not a
    `disposition: "rejected"` receipt) when cleanup fails, exactly so the same `commandId` retries
    the same logical attempt; this app answers that as a typed `503` JSON error naming the real,
    retryable cause (never a silent 200, never a generic 500) — see `callRuntimeCommand` in
-   `src/http/routes.ts`.
+   `src/http/routes.ts`. A genuinely **rejected** close receipt (the session was, say, already
+   gone) is answered as a normal `200` carrying `disposition: "rejected"`; the browser client never
+   resets its UI for an effect that did not happen.
 9. **`getSession` / `readEvents`** — `GET /api/sessions/:id` and `GET /api/sessions/:id/events` —
    the same projections and durable history any consumer can read independent of a live
    subscription. Query values (`fromSequence`, `bufferSize`) are parsed strictly — `"1junk"` or
    `"1.5"` are rejected outright, never silently truncated to `1` the way `Number.parseInt` would.
 10. **Process shutdown** (`Ctrl-C`, or `app.close()` in tests) calls `AgentRuntime#shutdown()`
-    first, then gives every open SSE pipe a bounded grace period to end its own response normally
-    (never destroying a live stream out from under its own cleanup), before closing the server.
+    first — then, only once that succeeds, releases any abandoned Codex adapter connections (see
+    the opt-in Codex profile) — then gives every open SSE pipe a bounded grace period to end its
+    own response normally (never destroying a live stream out from under its own cleanup), before
+    closing the server. A failure at any step makes the whole attempt **reject**, exactly matching
+    `AgentRuntime#shutdown()`'s own documented retry-safety ("a later call retries cleanup"):
+    `server.ts`'s signal handler reports the failure (through the same sanitized diagnostic used
+    everywhere else — see [Security](#security)) and stays alive rather than exiting 0, so a second
+    `Ctrl-C` genuinely retries the same cleanup instead of the process silently disappearing having
+    only half-finished.
 
 Every command sent to the runtime includes an explicit `type` field and a caller-generated, unique
 `commandId`. A retried `commandId` with the same payload returns the original
 `disposition: "duplicate"` receipt; a retried `commandId` with a different payload returns
 `disposition: "rejected"`, `error.code: "command_id_conflict"` — never a silent second effect.
+
+### Close-versus-interrupt policy
+
+`close_session` accepts an `ifRunActive` field with two documented values, `"interrupt"` or
+`"reject"`, and — like every other command — has no silent default of its own; a caller must
+choose. **This app's browser client always sends `ifRunActive: "interrupt"` explicitly**, in both
+`public/app.js`'s `closeSession()` and its `commandId`-fingerprinting payload: closing a session
+always ends any still-active run first (a real `interrupted` outcome, not an abandoned one), rather
+than rejecting the close outright just because a run happens to be in flight.
+
+Two things follow from that choice, both real UI behavior you can watch happen (and which
+`scripts/browser-check.ts`'s `exerciseCloseWhileRunActive` check drives with a genuine in-flight
+run and click, not a state inspection):
+
+- **The active run's own outcome is real, streamed evidence** — `run.state_changed` /
+  `run.finished` for the interrupt arrive over the same SSE subscription as always, and the
+  transcript/run badge show it, before the session's own `closed` message arrives.
+- **A close is a graceful release, not a hard reset.** Once the session genuinely finishes closing,
+  the browser client (`releaseSessionForReopen()`) frees the one-session slot for a new
+  **Open session** click but deliberately leaves the transcript and every badge exactly as they
+  were — that interrupted run's outcome included — so a human can actually see it. Contrast this
+  with the **hard reset** (`resetSessionUi()`) an unknown/stale session (e.g. a `404` after a
+  backend restart — see `pumpSubscription`) gets: that case clears everything, because there is no
+  trustworthy final state left to show. Only the _next_ `openSession()` call clears the previous
+  session's preserved transcript/badges, right when its own fresh session is confirmed open — never
+  the close itself, and never a bounded fallback timer that fires early. (That fallback — 5s,
+  `CLOSE_FALLBACK_MS` — exists only for the edge case where the close receipt came back `applied`
+  but the SSE stream itself will never deliver a `closed` message, e.g. because it had already
+  disconnected; it does not shorten how long real evidence stays visible when the stream is
+  actually still delivering it.)
+
+A **rejected** close receipt (`disposition: "rejected"`, e.g. the session was already gone by the
+time the request arrived) never touches the UI at all beyond an error banner — the session the page
+still knows about is still genuinely open, so nothing is reset, and the same `commandId` (retained,
+not reissued) is what a retry click reuses.
 
 ## Security
 
@@ -303,13 +380,23 @@ Additional server-side controls, independent of the above:
   silently ignored (`readKnownFields` in `src/commands.ts`). Path parameters (`sessionId`,
   `runId`) are validated against the SDK's own `SessionIdSchema`/`RunIdSchema` before ever
   reaching the runtime.
-- **Strict, non-truncating numeric parsing** for every query value (`src/http/query.ts`) —
-  `Number.parseInt` is never used in this app.
+- **Strict, non-truncating numeric parsing** for every query value (`src/http/query.ts`) and for
+  `REFERENCE_APP_PORT` itself (`src/config.ts`) — `Number.parseInt`/`Number()` coercion is never
+  used directly on untrusted input in this app; a value like `"1junk"`, `"1.5"`, `"007"`, or
+  `"0x10"` is rejected outright, never silently truncated or reinterpreted the way
+  `Number.parseInt`/`Number()` would.
 - **Bounded request bodies** (default 64 KiB; the test suite configures a smaller cap and asserts
   `413` past it), a `content-type: application/json` check, and a bounded request URI length.
-- **Baseline response headers** on every answer: `Cache-Control: no-store`,
-  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a restrictive
-  `Content-Security-Policy`. Never a wildcard or reflected CORS header.
+- **Baseline response headers** applied first, unconditionally, on **every** response this server
+  ever sends — including a `414`/`400`/`403` rejection (URI-too-long, Host/Origin/CSRF failure)
+  raised before the request is otherwise even parsed, not only the happy path:
+  `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a
+  restrictive `Content-Security-Policy`. Never a wildcard or reflected CORS header.
+- **Sanitized diagnostic logging** (`src/diagnostics.ts`) — a caught error is never logged as a raw
+  `Error`/`AggregateError`/`.cause` (which can carry an upstream provider's own secrets, paths, or
+  stack frames); an `AgentRuntimeError`/`AgentError` logs its documented-safe `code: message`, and
+  any other error logs only its constructor name. Used uniformly by the route catch-all in
+  `src/app.ts` and by `server.ts`'s shutdown-failure log.
 - **Bounded SSE transport**: real backpressure (never buffering unboundedly ahead of a slow
   client) and a write deadline (a genuinely dead peer is released, not waited on forever); release
   tied to the _response_'s own lifecycle (`response.on('close')`), not the request's.
@@ -323,6 +410,11 @@ Additional server-side controls, independent of the above:
   never read, stored, or forwarded by this app, let alone sent to the browser.
 - **Static assets served from a fixed allowlist** of exact pathnames — never by joining a request
   path onto a directory.
+- **`public/app.js` has its own syntax gate** (`pnpm app:public-js-check`, `node --check`, wired
+  into `pnpm gate` as step `app-public-js-syntax` right after `lint`) — ESLint's own config ignores
+  `examples/**`, and no TypeScript project covers this plain browser file either, so this is the
+  one cheap, credential-free, deterministic guard against a syntax error in the shipped browser
+  entry point slipping through every other gate step unnoticed.
 
 See the root [`SECURITY.md`](../../SECURITY.md) for the SDK-wide security model this app builds on.
 

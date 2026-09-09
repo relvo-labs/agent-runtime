@@ -85,7 +85,8 @@ const SHUTDOWN_GRACE_MS = 3000;
  * Spawns `command`/`args` with `REFERENCE_APP_PORT=0` (an ephemeral port,
  * never a fixed one this script guesses), and resolves only once the child's
  * OWN stdout reports the address it actually bound
- * (`reference-app: listening on http://host:port`, from `src/server.ts`).
+ * (`reference-app: listening on http://host:port`, printed by `server.ts`'s
+ * one startup line, present unchanged in both its source and built form).
  *
  * This is the one property a fixed-port + blind-poll approach cannot
  * guarantee: readiness here is correlated to *this* spawned process, not to
@@ -277,9 +278,13 @@ async function main(): Promise<void> {
   process.stdout.write('app-pack: typecheck and build OK against packed declarations (no source alias)\n');
 
   // ---- serve static assets + real scripted HTTP lifecycle -----------------
+  // Deliberately `dist/server.js` — the artifact the build step immediately
+  // above just proved compiles — not `src/server.ts`. Node's native TS
+  // stripping would happily run the source file too, which would silently
+  // stop proving anything about the build output this check exists to test.
   const workspaceBase = join(scratchRoot, 'workspaces');
   const server = await startManagedServer({
-    args: ['src/server.ts'],
+    args: ['dist/server.js'],
     cwd: consumer,
     env: { ...process.env, REFERENCE_APP_HOST: '127.0.0.1', REFERENCE_APP_WORKSPACE_BASE: workspaceBase },
     readyDeadlineMs: 10_000,

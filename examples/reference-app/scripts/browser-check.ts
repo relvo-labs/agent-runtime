@@ -220,6 +220,84 @@ async function exerciseFullSessionLifecycle(page: Page, label: string): Promise<
   process.stdout.write(`browser-check: [${label}] full ready→running→interrupted→followup→succeeded cycle — OK\n`);
 }
 
+/**
+ * Closes a session while a run is genuinely still active, proving:
+ *   - the Close button disables itself SYNCHRONOUSLY on click — the
+ *     overlapping-same-operation race guard `submitCommand`/`closeSession`
+ *     rely on — not merely "ends up disabled once the network round-trip
+ *     finishes";
+ *   - `closeSession()`'s explicit, documented `ifRunActive: "interrupt"`
+ *     policy actually interrupts the still-active run (a real state
+ *     transition, never silently ignored or left hanging) before the
+ *     session itself finishes closing;
+ *   - the interrupted run's own real outcome, and the whole transcript, are
+ *     PRESERVED as evidence once the session reports itself closed — this is
+ *     a graceful release, never the hard reset a stale/unknown session gets;
+ *   - only a brand-new `Open session` afterwards clears that preserved
+ *     evidence — never the close itself.
+ */
+async function exerciseCloseWhileRunActive(page: Page, label: string): Promise<void> {
+  await page.selectOption('#provider-select', 'scripted-demo');
+  await page.click('#open-session-button');
+  await page.waitForSelector('#session-panel:not([hidden])', { timeout: 5000 });
+  await waitForBadgeText(page, 'session-state-badge', 'ready');
+
+  await page.fill('#turn-input', `${label} — closed while still running`);
+  await page.click('#send-turn-button');
+  await waitForBadgeText(page, 'run-state-badge', 'running');
+
+  await page.click('#close-session-button');
+  assert(
+    await page.locator('#close-session-button').isDisabled(),
+    `${label}: Close must disable itself immediately, before its own request even resolves`,
+  );
+
+  // The explicit `ifRunActive: "interrupt"` policy in action: the
+  // still-active run is genuinely interrupted before the session finishes
+  // closing — not silently abandoned, and not left running forever.
+  await waitForBadgeText(page, 'run-state-badge', 'interrupted');
+  await waitForBadgeText(page, 'session-state-badge', 'closed');
+
+  const transcriptAfterClose = (await page.locator('#transcript').textContent()) ?? '';
+  assert(
+    transcriptAfterClose.includes('interrupted'),
+    `${label}: the interrupted run's own outcome must be visible in the transcript once closed`,
+  );
+  assert(
+    !(await page.locator('#run-state-badge').isHidden()),
+    `${label}: run badge must stay visible (preserved evidence), not hidden immediately on close`,
+  );
+  assert(
+    !(await page.locator('#open-session-button').isDisabled()),
+    `${label}: Open session must be re-enabled once the session genuinely finished closing`,
+  );
+
+  // A brand-new session is what actually clears the preserved evidence —
+  // never the close itself.
+  await page.selectOption('#provider-select', 'scripted-demo');
+  await page.click('#open-session-button');
+  await page.waitForSelector('#session-panel:not([hidden])', { timeout: 5000 });
+  await waitForBadgeText(page, 'session-state-badge', 'ready');
+  const transcriptAfterReopen = (await page.locator('#transcript').textContent()) ?? '';
+  assert(
+    !transcriptAfterReopen.includes('interrupted'),
+    `${label}: a fresh Open session must clear the PREVIOUS session's preserved transcript`,
+  );
+  assert(
+    await page.locator('#run-state-badge').isHidden(),
+    `${label}: a fresh Open session must hide the previous session's preserved run badge`,
+  );
+
+  // Leave no session open behind this check — the caller may open another
+  // one immediately afterwards, and this app allows only one at a time.
+  await page.click('#close-session-button');
+  await waitForBadgeText(page, 'session-state-badge', 'closed');
+
+  process.stdout.write(
+    `browser-check: [${label}] close-while-active honors ifRunActive:interrupt and preserves evidence until reopen — OK\n`,
+  );
+}
+
 async function main(): Promise<void> {
   const { chromium } = await import('playwright-core');
 
@@ -287,24 +365,33 @@ async function main(): Promise<void> {
     await waitForBadgeText(desktopPage, 'run-state-badge', 'succeeded');
 
     // ---- keyboard operability: reach and activate Close session by keyboard
+    // No run is active at this point (the last one already `succeeded` via
+    // Advance) — the session closes directly, with the terminal badges
+    // PRESERVED as evidence rather than reset (see `releaseSessionForReopen`
+    // in `public/app.js`): a graceful release is not the same UI event as the
+    // hard reset a stale/unknown session gets.
     await desktopPage.locator('#close-session-button').focus();
     await desktopPage.keyboard.press('Enter');
-    await desktopPage.waitForSelector('#session-panel', { state: 'hidden', timeout: 5000 });
+    await waitForBadgeText(desktopPage, 'session-state-badge', 'closed');
     assert(
-      (await badgeText(desktopPage, 'session-state-badge')) === '—',
-      'desktop: session badge must reset after close, not keep showing the closed session’s last state',
+      (await badgeText(desktopPage, 'run-state-badge')) === 'succeeded',
+      'desktop: run badge must be PRESERVED as final evidence after a graceful close, not hidden or reset',
     );
     assert(
-      await desktopPage.locator('#run-state-badge').isHidden(),
-      'desktop: run badge must be hidden again after close',
+      !(await desktopPage.locator('#open-session-button').isDisabled()),
+      'desktop: Open session must be re-enabled once the session genuinely finished closing',
     );
     process.stdout.write('browser-check: Close session is reachable and activatable by keyboard alone — OK\n');
+
+    // ---- close-while-active: the explicit ifRunActive:"interrupt" policy,
+    // the overlapping-close race guard, and preserved-evidence-until-reopen.
+    await exerciseCloseWhileRunActive(desktopPage, 'desktop-close-while-active');
 
     // ---- close/reopen: a fresh session must never show a stale badge from
     // the one just closed (the exact P1/P2 regression this check now guards).
     await exerciseFullSessionLifecycle(desktopPage, 'desktop-reopened');
     await desktopPage.click('#close-session-button');
-    await desktopPage.waitForSelector('#session-panel', { state: 'hidden', timeout: 5000 });
+    await waitForBadgeText(desktopPage, 'session-state-badge', 'closed');
     await desktopPage.close();
 
     // ======================================================================
@@ -334,7 +421,7 @@ async function main(): Promise<void> {
       'browser-check: responsive at a 375×812 mobile viewport with an active session, no horizontal overflow — OK\n',
     );
     await mobilePage.click('#close-session-button');
-    await mobilePage.waitForSelector('#session-panel', { state: 'hidden', timeout: 5000 });
+    await waitForBadgeText(mobilePage, 'session-state-badge', 'closed');
     await mobilePage.close();
 
     process.stdout.write('browser-check: OK\n');

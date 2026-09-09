@@ -35,6 +35,8 @@ const state = {
    * ... state").
    */
   connectionGeneration: 0,
+  /** Bounded fallback timer for a close whose SSE `closed` never arrives. */
+  closeFallbackTimer: null,
 };
 
 const el = {
@@ -131,28 +133,31 @@ async function api(path, options = {}) {
 /**
  * Issues one *command* (open/turn/interrupt/close), preserving the same
  * caller-generated `commandId` across a retry of the *same* payload — an
- * ambiguous transport failure (this function throwing) must be retryable
- * without risking a second effect — while a *changed* payload (different
- * text, different target) always gets a fresh id, because that is a new
- * intent, not a retry of the old one. The id is retired the moment any
- * definite HTTP response comes back (even a rejected receipt): only a
- * genuine network failure leaves it pending for a caller-triggered retry.
+ * ambiguous transport failure (this function throwing), or a response the
+ * caller's `retainOnResult` predicate flags as ambiguous (e.g. `close`'s
+ * `503` cleanup-failure — see `closeSession`), must be retryable without
+ * risking a second, different effect. A *changed* payload (different text,
+ * a different target) always gets a fresh id, because that is a new intent,
+ * not a retry of the old one.
+ *
+ * The pending record is only ever deleted if it is STILL the one this call
+ * itself set. Without that guard, an overlapping newer call for the same
+ * `key` (a different payload, so a fresh commandId) could have its own
+ * still-pending record clobbered by an OLDER call's `finally`-style cleanup
+ * — retiring the wrong attempt's retry tracking.
  */
-async function submitCommand(key, payload, send) {
+async function submitCommand(key, payload, send, options = {}) {
   const fingerprint = JSON.stringify(payload);
   const existing = state.pendingCommands.get(key);
   const commandId = existing && existing.fingerprint === fingerprint ? existing.commandId : genCommandId(key);
   state.pendingCommands.set(key, { commandId, fingerprint });
-  try {
-    const result = await send(commandId);
-    state.pendingCommands.delete(key);
-    return result;
-  } catch (error) {
-    // Left in place on purpose: a caller-triggered retry of this exact
-    // intent will reuse `commandId`. Cleared explicitly by `retry()` below
-    // only once the caller gives up.
-    throw error;
+  const result = await send(commandId); // a throw leaves the record in place, same as before
+  const retain = options.retainOnResult ? options.retainOnResult(result) : false;
+  if (!retain) {
+    const current = state.pendingCommands.get(key);
+    if (current && current.commandId === commandId) state.pendingCommands.delete(key);
   }
+  return result;
 }
 
 function runIsActive(runState) {
@@ -202,6 +207,12 @@ function updateCapabilitySummary(descriptor) {
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * A hard reset: the session is gone in a way this page cannot recover
+ * evidence for (a 404 — most likely the backend restarted; see
+ * `pumpSubscription`). Unlike `releaseSessionForReopen`, this also clears the
+ * transcript/badges, because there is nothing trustworthy left to show.
+ */
 function resetSessionUi() {
   state.sessionId = null;
   state.providerId = null;
@@ -209,6 +220,10 @@ function resetSessionUi() {
   state.currentRunState = null;
   state.lastConsumedSequence = 0;
   state.assistantNode = null;
+  if (state.closeFallbackTimer !== null) {
+    clearTimeout(state.closeFallbackTimer);
+    state.closeFallbackTimer = null;
+  }
   abortCurrentConnection();
   el.sessionPanel.hidden = true;
   el.transcript.textContent = '';
@@ -216,6 +231,32 @@ function resetSessionUi() {
   el.sessionStateBadge.textContent = '—';
   el.runStateBadge.hidden = true;
   showBanner(el.connectionError, null);
+  el.openSessionButton.disabled = false;
+  el.advanceScriptButton.hidden = true;
+  el.sendFailingTurnButton.hidden = true;
+}
+
+/**
+ * A graceful release: the session actually closed. Frees the one-session
+ * slot for a new `Open session` click, but deliberately leaves the
+ * transcript, the session/run badges, and the inspector log exactly as they
+ * were — the whole point of this being a SEPARATE function from
+ * `resetSessionUi` is that a human gets to see the final state (including,
+ * per the explicit `ifRunActive: "interrupt"` policy this app always sends —
+ * see `closeSession` — an active run's own real `interrupted` outcome)
+ * before it disappears. The NEXT `openSession` call clears the transcript
+ * for its own fresh session, once one actually starts.
+ */
+function releaseSessionForReopen() {
+  if (state.closeFallbackTimer !== null) {
+    clearTimeout(state.closeFallbackTimer);
+    state.closeFallbackTimer = null;
+  }
+  state.sessionId = null;
+  state.providerId = null;
+  state.currentRunId = null;
+  abortCurrentConnection();
+  setSessionControlsEnabled(false);
   el.openSessionButton.disabled = false;
   el.advanceScriptButton.hidden = true;
   el.sendFailingTurnButton.hidden = true;
@@ -241,6 +282,14 @@ async function openSession() {
       el.openSessionButton.disabled = false;
       return;
     }
+    // A fresh session starts with a clean slate — this is where the PREVIOUS
+    // session's preserved final transcript/badges (see
+    // `releaseSessionForReopen`) actually get cleared, not at close time.
+    el.transcript.textContent = '';
+    el.runStateBadge.hidden = true;
+    state.currentRunState = null;
+    showBanner(el.connectionError, null);
+
     state.sessionId = receipt.result.sessionId;
     state.providerId = providerId;
     el.sessionIdBadge.textContent = state.sessionId;
@@ -364,7 +413,12 @@ async function handleSubscriptionMessage(message, generation) {
   }
   if (message.type === 'closed') {
     el.sessionStateBadge.textContent = message.reason === 'session_failed' ? 'failed' : 'closed';
-    setSessionControlsEnabled(false);
+    // The session is genuinely terminal now — this is the authoritative
+    // point at which the one-session slot is freed for a new `Open session`
+    // click. `releaseSessionForReopen` deliberately does not touch the
+    // transcript or this badge: they stay as the final, real evidence of
+    // what happened until a NEW session's own `openSession` clears them.
+    releaseSessionForReopen();
     return;
   }
   // message.type === 'event'
@@ -482,7 +536,14 @@ function setSessionControlsEnabled(enabled) {
 
 async function sendTurnText(text) {
   if (text.length === 0 || state.sessionId === null) return;
+  if (el.sendTurnButton.disabled) return; // a submission is already in flight — see below
   const sessionId = state.sessionId;
+  // Disabled for the duration of this one request: two overlapping
+  // submit_turn attempts for the SAME session (e.g. a double-click before
+  // the first response lands) must never race — one must fully complete
+  // before the next is even issued.
+  el.sendTurnButton.disabled = true;
+  el.sendFailingTurnButton.disabled = true;
   try {
     const { body } = await submitCommand('turn', { sessionId, text }, (commandId) =>
       api(`/api/sessions/${encodeURIComponent(sessionId)}/turns`, {
@@ -507,6 +568,11 @@ async function sendTurnText(text) {
   } catch {
     if (state.sessionId !== sessionId) return;
     showBanner(el.connectionError, 'could not reach the server — the message was not sent. Try again.');
+  } finally {
+    if (state.sessionId === sessionId) {
+      el.sendTurnButton.disabled = false;
+      el.sendFailingTurnButton.disabled = state.providerId !== 'scripted-demo';
+    }
   }
 }
 
@@ -520,16 +586,24 @@ async function sendFailingTurn() {
 
 async function advanceScript() {
   if (state.sessionId === null) return;
+  if (el.advanceScriptButton.disabled) return; // already in flight
   const sessionId = state.sessionId;
-  const { body } = await api(`/api/sessions/${encodeURIComponent(sessionId)}/advance-script`, { method: 'POST' });
-  if (state.sessionId !== sessionId) return; // superseded while this request was in flight
-  appendInspectorEntry('advance-script', body.snapshot ?? body);
+  el.advanceScriptButton.disabled = true;
+  try {
+    const { body } = await api(`/api/sessions/${encodeURIComponent(sessionId)}/advance-script`, { method: 'POST' });
+    if (state.sessionId !== sessionId) return; // superseded while this request was in flight
+    appendInspectorEntry('advance-script', body.snapshot ?? body);
+  } finally {
+    if (state.sessionId === sessionId) el.advanceScriptButton.disabled = false;
+  }
 }
 
 async function interruptRun() {
   if (state.sessionId === null || state.currentRunId === null) return;
+  if (el.interruptButton.disabled) return; // already in flight, or already terminal
   const sessionId = state.sessionId;
   const runId = state.currentRunId;
+  el.interruptButton.disabled = true;
   try {
     const { body } = await submitCommand('interrupt', { sessionId, runId }, (commandId) =>
       api(`/api/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/interrupt`, {
@@ -539,39 +613,93 @@ async function interruptRun() {
     );
     if (state.sessionId !== sessionId) return;
     appendInspectorEntry('receipt interrupt_run', body.receipt ?? body);
+    // If the interrupt did not actually apply and the run is (per the SDK's
+    // own state, not an assumption) still active, it is still genuinely
+    // interruptible — re-enable rather than leaving it stuck disabled after
+    // a no-op. A run that DID get an interrupt delivered is left to the SSE
+    // stream's own `run.state_changed`/`run.finished` to correct.
+    if (body.receipt?.disposition === 'rejected' && runIsActive(state.currentRunState)) {
+      el.interruptButton.disabled = false;
+    }
   } catch {
     if (state.sessionId !== sessionId) return;
     showBanner(el.connectionError, 'could not reach the server — interrupt may not have been delivered. Try again.');
+    if (runIsActive(state.currentRunState)) el.interruptButton.disabled = false;
   }
 }
+
+/**
+ * A close whose success receipt arrived, but whose SSE `closed` message
+ * (the actual trigger for `releaseSessionForReopen`) never did — e.g. the
+ * stream had already disconnected. Bounded so the one-session slot is never
+ * stuck forever; the transcript/badges are left exactly as `closeSession`
+ * left them either way.
+ */
+const CLOSE_FALLBACK_MS = 5000;
 
 async function closeSession() {
   if (state.sessionId === null) return;
   const sessionId = state.sessionId;
+  el.closeSessionButton.disabled = true;
   try {
-    const { status, body } = await submitCommand('close', { sessionId }, (commandId) =>
-      api(`/api/sessions/${encodeURIComponent(sessionId)}/close`, {
-        method: 'POST',
-        body: JSON.stringify({ commandId }),
-      }),
+    // `ifRunActive` is sent explicitly — never omitted to fall through to
+    // the SDK's own default. `"interrupt"` is this app's deliberate,
+    // documented choice (see README.md "Close-versus-interrupt policy"):
+    // closing always ends any active run first, and — because this app no
+    // longer tears the UI down until the SSE stream's own terminal `closed`
+    // message arrives (see below) — a human actually gets to see that run's
+    // real `interrupted` outcome before the session disappears.
+    const { status, body } = await submitCommand(
+      'close',
+      { sessionId, ifRunActive: 'interrupt' },
+      (commandId) =>
+        api(`/api/sessions/${encodeURIComponent(sessionId)}/close`, {
+          method: 'POST',
+          body: JSON.stringify({ commandId, ifRunActive: 'interrupt' }),
+        }),
+      // A 503 cleanup failure is genuinely ambiguous — no receipt was ever
+      // persisted server-side either way (see `callRuntimeCommand` in
+      // `src/http/routes.ts`) — so the SAME commandId must stay retryable,
+      // not be silently retired only to be reissued fresh on the next click.
+      { retainOnResult: (outcome) => outcome.status === 503 },
     );
+    if (state.sessionId !== sessionId) return; // superseded while this request was in flight
+
     if (status === 503) {
-      // A retryable cleanup failure. `closeSession` rejects its *promise*
-      // rather than persisting a receipt exactly for this case (see
-      // `callRuntimeCommand` in `src/http/routes.ts`), so no commandId was
-      // ever recorded server-side either way; a fresh click (a new
-      // commandId, already the case since `submitCommand` clears its own
-      // record on any definite HTTP answer, including this one) retries the
-      // same close cleanly.
       appendInspectorEntry('close_session error', body.error ?? body);
       showBanner(el.connectionError, `close failed and can be retried: ${body.error?.message ?? 'unknown error'}`);
+      el.closeSessionButton.disabled = false;
       return;
     }
     appendInspectorEntry('receipt close_session', body.receipt ?? body);
+    const receipt = body.receipt;
+    if (receipt === undefined || receipt.disposition === 'rejected') {
+      // The close was REJECTED — the session is still open. Never tear the
+      // UI down for an effect that did not happen.
+      showBanner(el.connectionError, receipt?.error?.message ?? 'the close was rejected — the session is still open');
+      el.closeSessionButton.disabled = false;
+      return;
+    }
+    // Applied: the session is closing. Deliberately do NOT call
+    // `releaseSessionForReopen()` here — the SSE stream is still delivering
+    // the resulting events (the active run's own real `interrupted` outcome,
+    // per the explicit policy above), and tearing the UI down immediately
+    // would hide that evidence. `handleSubscriptionMessage`'s `closed` case
+    // does the actual release once the stream itself reports the session is
+    // terminal; the bounded fallback below covers a stream that will not
+    // (e.g. already disconnected).
     setSessionControlsEnabled(false);
-    resetSessionUi();
+    showBanner(el.connectionError, 'closing — waiting for the final events…');
+    state.closeFallbackTimer = setTimeout(() => {
+      if (state.sessionId === sessionId) {
+        showBanner(el.connectionError, null);
+        releaseSessionForReopen();
+      }
+    }, CLOSE_FALLBACK_MS);
   } catch {
+    if (state.sessionId !== sessionId) return;
     showBanner(el.connectionError, 'could not reach the server — close may not have completed. Try again.');
+    el.closeSessionButton.disabled = false;
   }
 }
 

@@ -9,21 +9,34 @@
 
 import { createReferenceApp } from './app.ts';
 import { loadConfigFromEnv } from './config.ts';
+import { safeDiagnostic } from './diagnostics.ts';
 
 const config = loadConfigFromEnv();
 const app = createReferenceApp(config);
 
-let shuttingDown = false;
+let shutdownInFlight = false;
 async function shutdown(signal: string): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
+  if (shutdownInFlight) return; // a concurrent signal while one attempt is already running
+  shutdownInFlight = true;
   // eslint-disable-next-line no-console -- process lifecycle, not client-facing
   console.log(`reference-app: received ${signal}, shutting down…`);
   try {
     await app.close();
-  } finally {
-    process.exit(0);
+  } catch (error) {
+    // `app.close()`'s own cleanup (runtime shutdown, the Codex
+    // abandoned-connection sweep) is documented retry-safe — a failure here
+    // must stay a VISIBLE, RETRYABLE failure, never a quiet exit(0) that
+    // discards an unreleased managed workspace or provider resource. Reset
+    // the guard so a second SIGINT/SIGTERM can retry the exact same cleanup,
+    // and keep the process alive so there is something left to retry against.
+    shutdownInFlight = false;
+    // eslint-disable-next-line no-console -- never the raw error; see diagnostics.ts
+    console.error(
+      `reference-app: shutdown failed and can be retried (send ${signal} again, or force-kill): ${safeDiagnostic(error)}`,
+    );
+    return;
   }
+  process.exit(0);
 }
 process.on('SIGINT', () => void shutdown('SIGINT'));
 process.on('SIGTERM', () => void shutdown('SIGTERM'));

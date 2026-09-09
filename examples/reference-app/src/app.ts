@@ -8,6 +8,8 @@ import { createServer, type Server } from 'node:http';
 import type { ReferenceAppConfig } from './config.ts';
 import { createReferenceAppRuntime, type ReferenceAppRuntime } from './runtime-factory.ts';
 import { handleRequest, type RouteContext } from './http/routes.ts';
+import { safeDiagnostic } from './diagnostics.ts';
+import type { CodexProvider } from '@relvo-labs/agent-provider-codex';
 
 export type ReferenceApp = {
   readonly server: Server;
@@ -21,6 +23,7 @@ export type ReferenceApp = {
 /** Test-only construction overrides. Never driven from the environment. */
 export type ReferenceAppTestOverrides = {
   readonly removeDirectory?: (path: string) => Promise<void>;
+  readonly testCodexProvider?: CodexProvider;
 };
 
 /** A shutdown-time grace period for in-flight SSE pipes to end on their own. */
@@ -40,6 +43,7 @@ export function createReferenceApp(
   const runtimeApp = createReferenceAppRuntime({
     workspaceBaseDirectory: config.workspaceBaseDirectory,
     ...(testOverrides.removeDirectory === undefined ? {} : { removeDirectory: testOverrides.removeDirectory }),
+    ...(testOverrides.testCodexProvider === undefined ? {} : { testCodexProvider: testOverrides.testCodexProvider }),
     ...(Object.keys(realProviders).length > 0 ? { realProviders } : {}),
   });
 
@@ -82,8 +86,12 @@ export function createReferenceApp(
       } else if (!response.writableEnded) {
         response.end();
       }
+      // Never the raw `error` object — see `diagnostics.ts` for why: Node's
+      // default `console.error` formatting recurses into `.cause` and, for
+      // an `AggregateError`, every entry of `.errors`, which can carry a raw
+      // provider failure (upstream prose, native ids, paths, credentials).
       // eslint-disable-next-line no-console -- the one place this app logs; never forwarded to a client
-      console.error('reference-app: unhandled route error', error);
+      console.error('reference-app: unhandled route error:', safeDiagnostic(error));
     });
   });
 
@@ -111,6 +119,20 @@ export function createReferenceApp(
       //    what lets each SSE pipe's own live loop see a terminal message and
       //    end itself).
       await runtimeApp.runtime.shutdown();
+
+      // 1b. Codex's own abandoned-connection sweep is independent of session
+      //     shutdown — a handshake can fail (and then fail its OWN teardown
+      //     too) before a session ever exists for `runtime.shutdown()` to
+      //     know about, leaving an owned app-server child process with
+      //     nothing else tracking it (see `providers/codex.ts` and
+      //     `runtime-factory.ts`). This is exactly as retryable as step 1
+      //     (`AgentRuntime#shutdown()` is itself documented retry-safe: "a
+      //     later call retries cleanup"), so a rejection here must abort
+      //     THIS attempt before the server/SSE streams below are touched —
+      //     a caller's retry then re-runs the whole sequence from the top,
+      //     rather than getting stuck on a half-closed server it can no
+      //     longer retry `server.close()` against.
+      await runtimeApp.releaseAbandonedCodexConnections();
 
       // 2. Give every currently-open SSE pipe a bounded chance to actually
       //    consume that terminal message and end its own response normally.

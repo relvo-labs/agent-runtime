@@ -30,6 +30,7 @@
     "app:build": "pnpm --filter @relvo-labs/reference-app build",
     "app:test": "pnpm --filter @relvo-labs/reference-app test",
     "app-pack:check": "node tools/repo/check-app-pack.ts",
+    "app:public-js-check": "node --check examples/reference-app/public/app.js",
     "app:browser-check": "pnpm --filter @relvo-labs/reference-app browser-check",
     "supply-chain:check": "node tools/repo/check-supply-chain.ts",
     "static:check": "node tools/repo/check-static.ts",

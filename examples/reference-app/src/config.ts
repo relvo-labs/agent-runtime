@@ -37,10 +37,25 @@ export type ReferenceAppConfig = {
   readonly claudeModel?: string | undefined;
 };
 
+/**
+ * Every digit, no sign, no fraction, no leading zero unless the value is
+ * exactly `0` — the same strict shape `src/http/query.ts` requires of a
+ * caller-supplied query value. `Number.parseInt` is deliberately not used
+ * here either: `Number.parseInt('1junk', 10)` silently truncates to `1`,
+ * which is not what an operator who made a typo in an environment variable
+ * asked for, and a silently-wrong bind port is exactly the kind of mistake
+ * this file's own doc comment says every value here is trusted to have
+ * avoided.
+ */
+const STRICT_NON_NEGATIVE_INT = /^(?:0|[1-9]\d*)$/u;
+
 function readPort(value: string | undefined, fallback: number): number {
   if (value === undefined || value === '') return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65_535) {
+  if (!STRICT_NON_NEGATIVE_INT.test(value)) {
+    throw new Error(`REFERENCE_APP_PORT must be a plain non-negative integer, got \`${value}\``);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > 65_535) {
     throw new Error(`REFERENCE_APP_PORT must be an integer in [0, 65535], got \`${value}\``);
   }
   return parsed;

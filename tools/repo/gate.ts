@@ -10,6 +10,12 @@ type GateStep = {
 export const GATE_STEPS: readonly GateStep[] = [
   { id: 'format', command: ['pnpm', 'format:check'] },
   { id: 'lint', command: ['pnpm', 'lint'] },
+  // ESLint's own config ignores `examples/**` (ESM-syntax gate on a plain,
+  // dependency-free browser file), and no TypeScript project covers
+  // `public/app.js` either — this is the one, cheap, credential-free,
+  // deterministic guard that a syntax error in the shipped browser entry
+  // point cannot slip through all other 17 steps unnoticed.
+  { id: 'app-public-js-syntax', command: ['pnpm', 'app:public-js-check'] },
   { id: 'typecheck', command: ['pnpm', 'typecheck'] },
   { id: 'engines', command: ['pnpm', 'engines:check'] },
   { id: 'schemas', command: ['pnpm', 'schema:check'] },

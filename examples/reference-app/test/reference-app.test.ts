@@ -49,11 +49,32 @@ describe('reference-app: credential-free scripted vertical slice', () => {
   });
 
   it('every JSON API response carries no-store, nosniff and framing-protection headers', async () => {
-    const { headers } = await started.call('/api/providers');
-    expect(headers.get('cache-control')).toBe('no-store');
-    expect(headers.get('x-content-type-options')).toBe('nosniff');
-    expect(headers.get('x-frame-options')).toBe('DENY');
-    expect(headers.get('access-control-allow-origin')).toBeNull();
+    function assertBaselineHeaders(headers: Headers) {
+      expect(headers.get('cache-control')).toBe('no-store');
+      expect(headers.get('x-content-type-options')).toBe('nosniff');
+      expect(headers.get('x-frame-options')).toBe('DENY');
+      expect(headers.get('access-control-allow-origin')).toBeNull();
+    }
+    // The happy path.
+    const success = await started.call('/api/providers');
+    assertBaselineHeaders(success.headers);
+
+    // A rejection MUST carry the same baseline headers — a 4xx response is
+    // still a response an attacker could try to get cached, sniffed, or
+    // framed. Three independent rejection paths, all before any route logic:
+    // request-URI-too-long, missing anti-CSRF header, and a malformed path
+    // segment reaching a route.
+    const tooLong = await started.call(`/api/providers?${'x'.repeat(3000)}`);
+    expect(tooLong.status).toBe(414);
+    assertBaselineHeaders(tooLong.headers);
+
+    const missingCsrf = await fetch(`${started.baseUrl}/api/providers`, { headers: {} });
+    expect(missingCsrf.status).toBe(403);
+    assertBaselineHeaders(missingCsrf.headers);
+
+    const malformedSession = await started.call('/api/sessions/not-a-real-session-id');
+    expect(malformedSession.status).toBe(400);
+    assertBaselineHeaders(malformedSession.headers);
   });
 
   it('runs the full session lifecycle end to end through the real runtime', async () => {
