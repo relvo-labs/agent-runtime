@@ -10,6 +10,12 @@ type GateStep = {
 export const GATE_STEPS: readonly GateStep[] = [
   { id: 'format', command: ['pnpm', 'format:check'] },
   { id: 'lint', command: ['pnpm', 'lint'] },
+  // ESLint's own config ignores `examples/**` (ESM-syntax gate on a plain,
+  // dependency-free browser file), and no TypeScript project covers
+  // `public/app.js` either — this is the one, cheap, credential-free,
+  // deterministic guard that a syntax error in the shipped browser entry
+  // point cannot slip through all other 17 steps unnoticed.
+  { id: 'app-public-js-syntax', command: ['pnpm', 'app:public-js-check'] },
   { id: 'typecheck', command: ['pnpm', 'typecheck'] },
   { id: 'engines', command: ['pnpm', 'engines:check'] },
   { id: 'schemas', command: ['pnpm', 'schema:check'] },
@@ -18,9 +24,12 @@ export const GATE_STEPS: readonly GateStep[] = [
   { id: 'static', command: ['pnpm', 'static:check'] },
   { id: 'supply-chain', command: ['pnpm', 'supply-chain:check'] },
   { id: 'licenses', command: ['pnpm', 'licenses:check'] },
-  { id: 'tests', command: ['pnpm', 'test'] },
+  { id: 'tests', command: ['pnpm', 'test'] }, // includes examples/reference-app/test via vitest.config.ts's include glob
   { id: 'build', command: ['pnpm', 'build'] },
+  { id: 'app-typecheck', command: ['pnpm', 'app:typecheck'] }, // needs `build` first: no source alias (see its tsconfig.json)
+  { id: 'app-build', command: ['pnpm', 'app:build'] },
   { id: 'artifacts', command: ['pnpm', 'artifacts:check'] },
+  { id: 'app-pack', command: ['pnpm', 'app-pack:check'] }, // packs + installs examples/reference-app against tarballs too
   { id: 'changesets', command: ['pnpm', 'changeset:status'] },
   { id: 'audit', command: ['pnpm', 'audit', '--prod', '--audit-level=high'] },
 ];

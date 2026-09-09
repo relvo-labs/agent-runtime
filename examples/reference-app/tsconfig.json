@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    // `dom` is for `scripts/browser-check.ts`'s Playwright `page.evaluate()`
+    // callbacks only, which type-check as browser-context code; nothing in
+    // `src/` runs in a browser or references a DOM global.
+    "lib": ["es2023", "dom"]
+    // Deliberately NO `paths` entry for any `@relvo-labs/*` package. This app
+    // is a consumer, not a workspace package proving its own SPI: issue #14
+    // explicitly forbids "TS path aliases to SDK source" and "workspace-link-
+    // only proof" for this application. Every `@relvo-labs/*` import here
+    // resolves the same way it would in an external project — through the
+    // real `node_modules` symlink pnpm creates from this package's declared
+    // `dependencies`, to that package's published `exports` map, to its BUILT
+    // `dist/index.d.ts`. That means `pnpm build` (repository root) must run
+    // before this app's own `typecheck`/`build` — see `README.md`.
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+}

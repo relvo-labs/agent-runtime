@@ -15,9 +15,16 @@ const runtime = createAgentRuntime({
   providers: [createClaudeProvider({ model: 'claude-sonnet-4-6' })],
 });
 
-await runtime.openSession({ commandId, providerId: 'claude', workspace });
-await runtime.submitTurn({ commandId, sessionId, input: { parts: [{ type: 'text', text: 'hello' }] } });
+await runtime.openSession({ type: 'open_session', commandId, providerId: 'claude', workspace });
+await runtime.submitTurn({
+  type: 'submit_turn',
+  commandId,
+  sessionId,
+  input: { parts: [{ type: 'text', text: 'hello' }] },
+});
 ```
+
+`type` is required on every command — it is what makes `AgentExecutor#dispatch` and each typed method agree on shape, and it is easy to drop by hand as the snippet above shows. `commandId` is a caller-generated, unique string (see `@relvo-labs/agent-protocol`'s `CommandIdSchema`); `sessionId` is the `openSession` receipt's own result, not invented; `workspace` is a `WorkspaceSpec` your host constructs (see `@relvo-labs/agent-workspace`). This snippet illustrates composition — it is not, on its own, a runnable program. For a complete, executable walkthrough that actually runs this exact sequence end to end (including workspace acquisition, a real subscription, receipts vs. completion, and cleanup), see [`examples/reference-app`](../../examples/reference-app/README.md).
 
 ## Installing the SDK
 

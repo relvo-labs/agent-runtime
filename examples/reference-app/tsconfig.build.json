@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Unlike `tsconfig.json` (typecheck-only, includes tests), this project
+    // actually emits: `pnpm build` here is a real compile, not an alias for
+    // `typecheck`. It proves `src/` compiles to valid JS against the SDK's
+    // real installed declarations, the same way a consumer's own build would.
+    "noEmit": false,
+    "declaration": false,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"]
+}

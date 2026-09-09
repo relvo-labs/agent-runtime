@@ -1,0 +1,32 @@
+{
+  "name": "@relvo-labs/reference-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Runnable SDK integration reference app: consumer-owned Node HTTP/SSE backend and a plain browser UI over @relvo-labs/agent-runtime. Not published.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node src/server.ts",
+    "test": "vitest run test",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json",
+    "browser-check": "node scripts/browser-check.ts"
+  },
+  "dependencies": {
+    "@relvo-labs/agent-protocol": "workspace:^",
+    "@relvo-labs/agent-provider": "workspace:^",
+    "@relvo-labs/agent-provider-claude": "workspace:^",
+    "@relvo-labs/agent-provider-codex": "workspace:^",
+    "@relvo-labs/agent-runtime": "workspace:^",
+    "@relvo-labs/agent-workspace": "workspace:^"
+  },
+  "devDependencies": {
+    "playwright-core": "catalog:"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/relvo-labs/agent-runtime.git",
+    "directory": "examples/reference-app"
+  }
+}

@@ -48,6 +48,14 @@ catalog:
   '@arethetypeswrong/cli': 0.18.5
   '@changesets/cli': 3.0.1
 
+  # Dev-only, examples/reference-app only: drives a system-supplied Chromium
+  # for its optional browser check (`scripts/browser-check.ts`). `playwright-core`
+  # (not `playwright`) ships no postinstall browser download — it drives a
+  # browser supplied via `executablePath`/environment override, never one
+  # this workspace's install fetches. Verified against the live registry:
+  # 1.63.0 published 2026-09-04 (> the 3-day cooldown as of this pin).
+  playwright-core: 1.63.0
+
 # Supply-chain cooldown: a freshly published version is the highest-risk window
 # for a compromised release. Refuse anything younger than 3 days unless it is
 # explicitly excluded below after review.
