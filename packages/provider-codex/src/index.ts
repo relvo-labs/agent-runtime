@@ -17,7 +17,13 @@
  * `capabilities: null`, which cannot opt into the experimental API.
  */
 
-export { createCodexProvider, CODEX_PROVIDER_ID, CODEX_ADAPTER_VERSION } from './provider.ts';
+export {
+  createCodexProvider,
+  CODEX_PROVIDER_ID,
+  CODEX_ADAPTER_VERSION,
+  type CodexAbandonedConnectionReport,
+  type CodexProvider,
+} from './provider.ts';
 
 export {
   createCodexStdioTransport,

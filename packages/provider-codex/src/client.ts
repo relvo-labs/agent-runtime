@@ -68,6 +68,51 @@ function wireRejection(method: string, error: CodexWireError): ProviderRejection
   );
 }
 
+/** Why a request failed, when the failure did not come from the server. */
+export const CODEX_REQUEST_FAILURE = {
+  /** The peer never answered within the deadline. Admission is unknown. */
+  timeout: 'request_timeout',
+  /** The stream ended while the request was in flight. Admission is unknown. */
+  connectionLost: 'connection_lost',
+  /** Refused locally; the frame was never written. Nothing was admitted. */
+  connectionClosed: 'connection_closed',
+} as const;
+
+/**
+ * Failure codes that prove the server decided, so nothing was admitted.
+ *
+ * Every wire classification qualifies: an error frame naming our request id is
+ * the server answering *that* request. `connection_closed` qualifies too,
+ * because the frame was never written at all.
+ *
+ * Everything else — a deadline, a stream that died mid-flight, or any value
+ * this layer cannot classify — does **not** qualify. A lost reply is not a
+ * rejection: the turn may be running right now.
+ */
+const AUTHORITATIVE_CODES: ReadonlySet<string> = new Set([
+  'overloaded',
+  'invalid_request',
+  'method_not_found',
+  'invalid_params',
+  'internal_error',
+  'parse_error',
+  'unclassified',
+  CODEX_REQUEST_FAILURE.connectionClosed,
+]);
+
+/**
+ * True only when the failure proves the request was *not* admitted.
+ *
+ * Fail-safe by construction: an unrecognised value answers `false`, so a caller
+ * that branches on this treats the unknown case as ambiguous rather than as a
+ * clean rejection.
+ */
+export function isAuthoritativeRejection(error: unknown): boolean {
+  if (!(error instanceof ProviderRejection)) return false;
+  const code = error.agentError.providerCode;
+  return code !== undefined && AUTHORITATIVE_CODES.has(code);
+}
+
 /** Why the client stopped. Reported once. */
 export type CodexClientEnd = {
   readonly end: CodexTransportEnd;
@@ -141,6 +186,9 @@ export function createCodexClient(
           end === 'eof'
             ? 'the codex app-server connection ended before answering'
             : `the codex app-server connection failed (${cause ?? 'unknown'})`,
+          // Deliberately *not* an authoritative rejection: a request that was
+          // already written may have been admitted before the stream died.
+          { providerCode: CODEX_REQUEST_FAILURE.connectionLost },
         ),
       ),
     );
@@ -211,8 +259,13 @@ export function createCodexClient(
   return {
     request(method: string, params?: JsonValue): Promise<unknown> {
       if (ended) {
+        // Nothing is written, so this one really is authoritative.
         return Promise.reject(
-          new ProviderRejection(agentError('provider_unavailable', 'the codex app-server connection has ended')),
+          new ProviderRejection(
+            agentError('provider_unavailable', 'the codex app-server connection has ended', {
+              providerCode: CODEX_REQUEST_FAILURE.connectionClosed,
+            }),
+          ),
         );
       }
       const id = nextId;
@@ -225,7 +278,7 @@ export function createCodexClient(
             reject(
               new ProviderRejection(
                 agentError('provider_unavailable', `codex did not answer \`${method}\` within the request deadline`, {
-                  providerCode: 'request_timeout',
+                  providerCode: CODEX_REQUEST_FAILURE.timeout,
                 }),
               ),
             );

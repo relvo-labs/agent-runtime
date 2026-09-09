@@ -39,8 +39,8 @@ import {
   type ProviderSessionInit,
 } from '@relvo-labs/agent-provider';
 
-import { createCodexClient, type CodexClient, type CodexClientEnd } from './client.ts';
-import { CODEX_METHOD, CODEX_NOTIFICATION, asId, asRecord } from './protocol.ts';
+import { createCodexClient, isAuthoritativeRejection, type CodexClient, type CodexClientEnd } from './client.ts';
+import { CODEX_METHOD, CODEX_NOTIFICATION, CODEX_SERVER_REQUEST, asId, asRecord } from './protocol.ts';
 import { CodexSessionOptionsSchema, type CodexProviderOptions, type CodexSessionOptions } from './options.ts';
 import { CODEX_APP_SERVER_VERSION, createCodexStdioTransport } from './transport.ts';
 import {
@@ -70,14 +70,40 @@ const DISPOSED_REASON = 'codex provider session disposed';
  * response is read, so early frames are held by thread and replayed once the
  * turn id is known. The bound exists so a producer that never answers cannot
  * grow this without limit.
+ *
+ * Streamed output is what this bounds. A *terminal* frame is never counted
+ * against it and never dropped to make room — see `MAX_PENDING_TERMINALS`.
+ * Losing output degrades a run; losing the frame that ends the turn hangs it,
+ * and those are not the same failure.
  */
 const MAX_BUFFERED_FRAMES = 512;
+
+/**
+ * Distinct terminal frames that may be held before the turn id is known.
+ *
+ * One is the normal case: this run's own `turn/completed`, arriving before its
+ * `turn/start` reply. A handful more can be legitimate on a busy thread. A
+ * flood of terminal frames for turns nobody started is a producer this adapter
+ * cannot reason about, so at that point the run fails closed and the session is
+ * fenced rather than continuing to guess.
+ */
+const MAX_PENDING_TERMINALS = 16;
 
 /** How many settled turn ids a session remembers, to recognise their late tail. */
 const MAX_RETIRED_TURNS = 64;
 
-function rejection(code: Parameters<typeof agentError>[0], message: string, details?: JsonObject): never {
-  throw new ProviderRejection(agentError(code, message, details === undefined ? {} : { details }));
+function rejection(
+  code: Parameters<typeof agentError>[0],
+  message: string,
+  details?: JsonObject,
+  providerCode?: string,
+): never {
+  throw new ProviderRejection(
+    agentError(code, message, {
+      ...(details === undefined ? {} : { details }),
+      ...(providerCode === undefined ? {} : { providerCode }),
+    }),
+  );
 }
 
 function parseSessionOptions(options: JsonObject): CodexSessionOptions {
@@ -112,7 +138,13 @@ function promptTextFor(input: TurnInput): string {
   return texts.join(PART_SEPARATOR);
 }
 
-type BufferedFrame = { readonly method: string; readonly params: unknown; readonly correlation: TurnCorrelation };
+type BufferedFrame = {
+  readonly method: string;
+  readonly params: unknown;
+  readonly correlation: TurnCorrelation;
+  /** A frame that ends a turn. Held under its own bound, never dropped. */
+  readonly terminal: boolean;
+};
 
 type ActiveRun = {
   readonly request: ProviderRunRequest;
@@ -127,6 +159,8 @@ type ActiveRun = {
   interruptAttempt: Promise<void> | undefined;
   buffered: BufferedFrame[];
   bufferOverflowed: boolean;
+  /** Distinct terminal frames currently held for this run. */
+  bufferedTerminals: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +182,12 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
   let disposed = false;
   let teardown: Promise<void> | undefined;
   let announcedForeignTurn = false;
+  /**
+   * Set once this session may be holding a native turn it can no longer
+   * account for. Admission closes permanently: the only safe next step is
+   * disposal, which really does end the connection and the native work with it.
+   */
+  let fencedReason: string | undefined;
 
   /**
    * Native turn ids this session has already settled.
@@ -197,6 +237,27 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     if (run.terminated || run.concluded) return;
     run.concluded = true;
     finalize(run, termination);
+  }
+
+  /**
+   * Close admission because a native turn's state is unknown.
+   *
+   * This is the deliberate answer to "a lost reply is not a rejection". If a
+   * `turn/start` may have been admitted, a second run on the same thread could
+   * *steer* that first turn (pinned `v2/TurnStartParams.ts`), which would
+   * attribute one native turn's work to two Runtime runs. Refusing is the only
+   * honest option left, and the refusal is visible rather than silent.
+   */
+  function fence(reason: string): void {
+    if (fencedReason !== undefined) return;
+    fencedReason = reason;
+    sink.emit({
+      payload: {
+        type: 'diagnostic',
+        level: 'warning',
+        message: `codex left a turn in an unknown state (${reason}); this session accepts no further runs and must be disposed`,
+      },
+    });
   }
 
   function noteForeignTraffic(): void {
@@ -284,11 +345,7 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       // `turn/start` has not answered yet. Hold the frame by thread and decide
       // ownership once the turn id is known, rather than guessing from arrival
       // order.
-      if (run.buffered.length >= MAX_BUFFERED_FRAMES) {
-        run.bufferOverflowed = true;
-        return;
-      }
-      run.buffered.push({ method, params, correlation });
+      bufferEarlyFrame(run, method, params, correlation);
       return;
     }
 
@@ -299,15 +356,77 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     applyFrame(run, method, params);
   }
 
+  /**
+   * Hold one frame that arrived before its turn id was known.
+   *
+   * The bound protects memory against a producer that never answers
+   * `turn/start`. Applying it uniformly, though, means a burst of ordinary
+   * deltas can push out the single frame that ends the turn — and a run whose
+   * terminal frame was dropped never settles at all. So the bound applies to
+   * streamed output, and a terminal frame is admitted by evicting output
+   * instead, under its own much smaller cap.
+   */
+  function bufferEarlyFrame(run: ActiveRun, method: string, params: unknown, correlation: TurnCorrelation): void {
+    const terminal = method === CODEX_NOTIFICATION.turnCompleted;
+    if (!terminal) {
+      if (run.buffered.length >= MAX_BUFFERED_FRAMES) {
+        run.bufferOverflowed = true;
+        return;
+      }
+      run.buffered.push({ method, params, correlation, terminal });
+      return;
+    }
+
+    if (run.bufferedTerminals >= MAX_PENDING_TERMINALS) {
+      failUnattributable(run);
+      return;
+    }
+    if (run.buffered.length >= MAX_BUFFERED_FRAMES) {
+      // Make room by discarding the oldest *output* frame. Terminal frames are
+      // never evicted, and the loss is disclosed on bind.
+      const index = run.buffered.findIndex((frame) => !frame.terminal);
+      if (index === -1) {
+        failUnattributable(run);
+        return;
+      }
+      run.buffered.splice(index, 1);
+      run.bufferOverflowed = true;
+    }
+    run.bufferedTerminals += 1;
+    run.buffered.push({ method, params, correlation, terminal });
+  }
+
+  /**
+   * Give up on a run whose pre-binding traffic cannot be reasoned about.
+   *
+   * Failing closed is the point: the alternative is to keep dropping frames and
+   * hope the right one survives, which is how an admitted run ends up waiting
+   * forever. The native turn may well be running, so the session is fenced too,
+   * and `beginRun` interrupts the turn once its id is finally known.
+   */
+  function failUnattributable(run: ActiveRun): void {
+    fence('unattributable_terminal_overflow');
+    finalize(run, {
+      outcome: 'failed',
+      error: agentError(
+        'provider_contract_violation',
+        'codex produced more unattributable terminal turn traffic than this adapter can hold',
+        { providerCode: 'pre_binding_terminal_overflow' },
+      ),
+    });
+  }
+
   function bindTurn(run: ActiveRun, correlation: TurnCorrelation): void {
     run.correlation = correlation;
     const held = run.buffered.splice(0, run.buffered.length);
+    run.bufferedTerminals = 0;
     if (run.bufferOverflowed) {
       sink.emit({
         payload: {
           type: 'diagnostic',
           level: 'warning',
-          message: 'codex produced more early turn traffic than this adapter buffers; some output was dropped',
+          message:
+            'codex produced more early turn traffic than this adapter buffers; some streamed output was dropped, but no turn outcome was',
         },
       });
     }
@@ -348,11 +467,19 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     onServerRequest(method: string): void {
       // Declined by the client layer already; recorded so a host can see that
       // an unimplemented interaction was requested and refused.
+      //
+      // The method name is republished only when it is one of the pinned stable
+      // `ServerRequest` methods. Anything else is a string chosen by another
+      // process, and a durable neutral event is not the place to find out what
+      // it can carry — a custom or malformed request could otherwise write
+      // native identifiers, paths or credentials straight into the event log.
       sink.emit({
         payload: {
           type: 'diagnostic',
           level: 'warning',
-          message: `codex requested an interaction this adapter does not implement (${method}); it was declined`,
+          message: CODEX_SERVER_REQUEST.has(method)
+            ? `codex requested an interaction this adapter does not implement (${method}); it was declined`
+            : 'codex sent an unrecognised request this adapter does not implement; it was declined',
         },
       });
     },
@@ -388,6 +515,14 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     // Admission closes the moment disposal starts: the connection is already
     // closing by then, so an admitted run could never produce a result.
     if (disposed || disposing) rejection('session_closed', 'codex provider session is disposed');
+    if (fencedReason !== undefined) {
+      rejection(
+        'illegal_state_transition',
+        `the codex adapter cannot start another turn: a previous turn's native state is unresolved (${fencedReason}). Dispose this session`,
+        undefined,
+        'session_fenced',
+      );
+    }
     if (streamEnded || client.ended) rejection('provider_unavailable', 'the codex app-server connection has ended');
     if (active !== undefined) {
       rejection('illegal_state_transition', 'the codex adapter runs one turn per session at a time');
@@ -409,6 +544,7 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       interruptAttempt: undefined,
       buffered: [],
       bufferOverflowed: false,
+      bufferedTerminals: 0,
     };
     // Registered before the request is sent, so notifications that race the
     // `turn/start` response are buffered rather than discarded.
@@ -421,9 +557,13 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
         input: [{ type: 'text', text }],
       });
     } catch (error) {
-      // Nothing was admitted: drop the registration so the session stays usable
-      // and the caller sees why the turn never started.
       if (active === run) active = undefined;
+      // A server error frame naming this request proves the turn was never
+      // started, so the session stays usable. A deadline, a dead stream, or
+      // anything unclassifiable proves nothing: the turn may be running right
+      // now, and admitting a second run against it could steer or misattribute
+      // it. Those close admission instead.
+      if (!isAuthoritativeRejection(error)) fence('turn_start_unacknowledged');
       throw error instanceof ProviderRejection
         ? error
         : new ProviderRejection(
@@ -434,9 +574,24 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     const returnedTurnId = asId(asRecord(asRecord(result)?.turn)?.id);
     if (returnedTurnId === undefined) {
       if (active === run) active = undefined;
+      // A malformed success is the worst case of all: the server accepted the
+      // turn and this adapter cannot name it, so it can neither correlate its
+      // frames nor interrupt it.
+      fence('turn_start_unusable_id');
       rejection('provider_contract_violation', 'codex accepted the turn without returning a usable turn id');
     }
     const turnId: string = returnedTurnId;
+
+    if (run.terminated) {
+      // The run was already failed closed while `turn/start` was in flight (see
+      // `failUnattributable`). Now that the turn has a name, ask the server to
+      // stop it rather than leaving native work running unobserved, and
+      // remember it so its tail cannot be attributed to anything later.
+      retire(turnId);
+      void Promise.resolve(client.request(CODEX_METHOD.turnInterrupt, { threadId, turnId })).catch(() => undefined);
+      return { completion, interrupt: () => Promise.resolve() };
+    }
+
     bindTurn(run, { threadId, turnId });
 
     async function deliverInterrupt(): Promise<void> {
@@ -648,13 +803,74 @@ type SessionRuntimeBox = {
 // ---------------------------------------------------------------------------
 
 /**
+ * What one sweep of `releaseAbandonedConnections()` actually did.
+ *
+ * `attempted` counts the connections the sweep started with, `released` the
+ * ones it managed to close, and `pending` what is still tracked afterwards. A
+ * successful sweep always reports `pending: 0`; a sweep that could not finish
+ * rejects instead of returning a report that says so quietly.
+ */
+export type CodexAbandonedConnectionReport = {
+  readonly attempted: number;
+  readonly released: number;
+  readonly pending: number;
+};
+
+/**
+ * The Codex adapter, plus the cleanup ownership its own failure modes need.
+ *
+ * A `createSession()` that rejects hands the caller no session, so there is
+ * nothing to `dispose()`. Almost always that is fine, because the adapter tears
+ * the half-open connection down itself. When *that* fails too, the connection
+ * would be unreachable — a child process with no owner — so it is retained here
+ * instead, on the one object that outlives the failed call and that the host
+ * already holds.
+ *
+ * This is deliberately adapter-specific. The neutral SPI is unchanged: a
+ * runtime keeps seeing an ordinary `AgentProvider`.
+ */
+export type CodexProvider = AgentProvider & {
+  /**
+   * Retry teardown of every connection abandoned by a failed handshake.
+   *
+   * Attempt-all, never fail-fast: one connection that still cannot be closed
+   * must not prevent the others from being released. Successes are forgotten;
+   * failures stay tracked and retryable. Concurrent callers share one sweep.
+   *
+   * Resolves with what happened, or rejects with a typed
+   * `provider_unavailable` when anything is still pending — with an
+   * `AggregateError` cause carrying each individual failure.
+   */
+  releaseAbandonedConnections(): Promise<CodexAbandonedConnectionReport>;
+
+  /** How many connections are still awaiting teardown. `0` in normal operation. */
+  readonly abandonedConnectionCount: number;
+};
+
+/**
+ * Close a transport without letting it fail in two different ways.
+ *
+ * `close()` is specified to return a promise, but a faulty or hostile
+ * implementation can throw synchronously instead. Both are captured here so a
+ * caller has exactly one failure path to reason about.
+ */
+async function closeQuietly(transport: CodexTransport): Promise<{ ok: true } | { ok: false; cause: unknown }> {
+  try {
+    await transport.close();
+    return { ok: true };
+  } catch (cause) {
+    return { ok: false, cause };
+  }
+}
+
+/**
  * Create the Codex provider adapter.
  *
  * Register it with a runtime by id; the runtime never imports this package.
  * Omit `options.transport` to spawn `codex app-server --stdio`, or pass one to
  * run against a host-managed connection or a deterministic double.
  */
-export function createCodexProvider(options: CodexProviderOptions = {}): AgentProvider {
+export function createCodexProvider(options: CodexProviderOptions = {}): CodexProvider {
   const descriptor = defineProviderDescriptor({
     providerId: CODEX_PROVIDER_ID,
     providerVersion: CODEX_ADAPTER_VERSION,
@@ -717,8 +933,68 @@ export function createCodexProvider(options: CodexProviderOptions = {}): AgentPr
     },
   });
 
+  /**
+   * Connections whose handshake failed *and* whose teardown then failed.
+   *
+   * Empty in normal operation, including when a handshake fails cleanly.
+   */
+  const abandoned = new Set<CodexTransport>();
+  let sweep: Promise<CodexAbandonedConnectionReport> | undefined;
+
+  function releaseAbandonedConnections(): Promise<CodexAbandonedConnectionReport> {
+    if (sweep !== undefined) return sweep;
+    const attempt = (async (): Promise<CodexAbandonedConnectionReport> => {
+      // Yield first, so a caller that arrives during this turn of the loop
+      // joins the same sweep rather than starting a second one.
+      await Promise.resolve();
+      try {
+        const snapshot = [...abandoned];
+        const failures: unknown[] = [];
+        let released = 0;
+        for (const transport of snapshot) {
+          const result = await closeQuietly(transport);
+          if (result.ok) {
+            abandoned.delete(transport);
+            released += 1;
+          } else {
+            // Stays tracked: a later sweep still owns it.
+            failures.push(result.cause);
+          }
+        }
+        const report: CodexAbandonedConnectionReport = {
+          attempted: snapshot.length,
+          released,
+          pending: abandoned.size,
+        };
+        if (failures.length > 0) {
+          const failure = new ProviderRejection(
+            agentError(
+              'provider_unavailable',
+              `codex could not release ${String(report.pending)} abandoned app-server connection(s)`,
+              { providerCode: 'abandoned_connection_pending', details: { ...report } },
+            ),
+          );
+          failure.cause = new AggregateError(failures, 'codex abandoned connection teardown failed');
+          throw failure;
+        }
+        return report;
+      } finally {
+        sweep = undefined;
+      }
+    })();
+    sweep = attempt;
+    return attempt;
+  }
+
   return {
     describe: () => descriptor,
+
+    releaseAbandonedConnections,
+
+    get abandonedConnectionCount(): number {
+      return abandoned.size;
+    },
+
     async createSession(init: ProviderSessionInit): Promise<ProviderSession> {
       const overrides = parseSessionOptions(init.options);
       if (init.workspace.root === '' || !isAbsolute(init.workspace.root)) {
@@ -741,17 +1017,41 @@ export function createCodexProvider(options: CodexProviderOptions = {}): AgentPr
       try {
         opened = await openConnection(transport, options, overrides, init.workspace.root);
       } catch (error) {
-        // A handshake that never completed owns nothing: tear the connection
-        // down rather than leaking a child process behind a rejected session.
-        await transport.close().catch(() => undefined);
-        throw error instanceof ProviderRejection
-          ? error
-          : new ProviderRejection(
-              agentError(
-                'provider_unavailable',
-                `the codex app-server could not be initialized (${classifyThrown(error)})`,
-              ),
-            );
+        // A handshake that never completed owns nothing the caller can reach:
+        // there is no session to dispose, so this is the only chance to tear the
+        // connection down.
+        const cleanup = await closeQuietly(transport);
+        const handshake =
+          error instanceof ProviderRejection
+            ? error
+            : new ProviderRejection(
+                agentError(
+                  'provider_unavailable',
+                  `the codex app-server could not be initialized (${classifyThrown(error)})`,
+                ),
+              );
+        if (cleanup.ok) throw handshake;
+
+        // Teardown failed too. Swallowing that would strand a child process
+        // with no owner and no evidence, so the connection is retained here and
+        // the caller is told plainly that cleanup is outstanding.
+        abandoned.add(transport);
+        const pending = new ProviderRejection(
+          agentError(
+            'provider_unavailable',
+            'the codex app-server could not be initialized and its connection could not be torn down; retry `releaseAbandonedConnections()` on this provider',
+            {
+              providerCode: 'handshake_cleanup_pending',
+              details: {
+                handshakeCode: handshake.agentError.code,
+                teardown: classifyThrown(cleanup.cause),
+                abandonedConnections: abandoned.size,
+              },
+            },
+          ),
+        );
+        pending.cause = new AggregateError([handshake, cleanup.cause], 'codex handshake and teardown both failed');
+        throw pending;
       }
 
       const session = createSessionFor(

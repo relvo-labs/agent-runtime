@@ -249,6 +249,29 @@ export const CODEX_NOTIFICATION = {
 } as const;
 
 /**
+ * Every server-initiated request in the pinned stable surface
+ * (`typescript-stable/ServerRequest.ts`, codex-cli 0.153.4).
+ *
+ * This adapter implements none of them and declines them all. The set exists so
+ * a *recognised* method can be named in a diagnostic without republishing an
+ * arbitrary server-controlled string: anything not listed here is reported by a
+ * constant instead. A method name is metadata from another process, and a
+ * durable event is the wrong place to discover what it can contain.
+ */
+export const CODEX_SERVER_REQUEST: ReadonlySet<string> = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/tool/requestUserInput',
+  'mcpServer/elicitation/request',
+  'item/permissions/requestApproval',
+  'item/tool/call',
+  'account/chatgptAuthTokens/refresh',
+  'attestation/generate',
+  'applyPatchApproval',
+  'execCommandApproval',
+]);
+
+/**
  * JSON-RPC code used when declining a server-initiated request.
  *
  * -32601 (method not found) is the honest classification: this adapter

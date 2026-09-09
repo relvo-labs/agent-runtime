@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { isProviderRejection } from '@relvo-labs/agent-provider';
 
-import { classifyWireError, createCodexClient, type CodexClientEnd } from '../src/client.ts';
+import { classifyWireError, createCodexClient, isAuthoritativeRejection, type CodexClientEnd } from '../src/client.ts';
 import { FIXTURE_BEARER, createFakeTransport, flush } from './fake-transport.ts';
 
 type Recorder = {
@@ -291,6 +291,74 @@ describe('stream end settles everything', () => {
     await flush();
 
     expect(() => client.notify('initialized')).not.toThrow();
+  });
+});
+
+/**
+ * R2 — "the server said no" and "we never heard back" are different facts.
+ *
+ * Only the first proves nothing was admitted. Everything else, including
+ * anything this layer cannot classify at all, must fail safe as uncertain.
+ */
+describe('authoritative rejection versus uncertain admission', () => {
+  it('classifies a server error reply as authoritative', async () => {
+    const fake = createFakeTransport({ responders: {} });
+    const { handlers } = recorder();
+    const client = createCodexClient(fake.transport, handlers);
+
+    const pending = client.request('turn/start');
+    await flush();
+    fake.respondWithError('turn/start', -32600, 'ownership');
+
+    const error = await pending.catch((reason: unknown) => reason);
+    expect(isProviderRejection(error)).toBe(true);
+    expect(isAuthoritativeRejection(error)).toBe(true);
+  });
+
+  it('classifies an unanswered request as uncertain', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const fake = createFakeTransport({ responders: {} });
+      const { handlers } = recorder();
+      const client = createCodexClient(fake.transport, handlers, { requestTimeoutMs: 1000 });
+
+      const pending = client.request('turn/start');
+      const settled = pending.catch((reason: unknown) => reason);
+      await vi.advanceTimersByTimeAsync(1001);
+
+      expect(isAuthoritativeRejection(await settled)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('classifies a connection that died mid-request as uncertain', async () => {
+    const fake = createFakeTransport({ responders: {} });
+    const { handlers } = recorder();
+    const client = createCodexClient(fake.transport, handlers);
+
+    const pending = client.request('turn/start');
+    await flush();
+    fake.end();
+
+    expect(isAuthoritativeRejection(await pending.catch((reason: unknown) => reason))).toBe(false);
+  });
+
+  it('classifies a request refused before it was ever written as authoritative', async () => {
+    const fake = createFakeTransport({ responders: {} });
+    const { handlers } = recorder();
+    const client = createCodexClient(fake.transport, handlers);
+
+    fake.end();
+    await flush();
+
+    const error = await client.request('turn/start').catch((reason: unknown) => reason);
+    expect(isAuthoritativeRejection(error)).toBe(true);
+  });
+
+  it('treats an unrecognised thrown value as uncertain rather than assuming rejection', () => {
+    expect(isAuthoritativeRejection(new Error('who knows'))).toBe(false);
+    expect(isAuthoritativeRejection(undefined)).toBe(false);
   });
 });
 

@@ -46,7 +46,9 @@ import {
   CodexSessionOptionsSchema,
   createCodexProvider,
   createCodexStdioTransport,
+  type CodexAbandonedConnectionReport,
   type CodexClientMessage,
+  type CodexProvider,
   type CodexProviderFactory,
   type CodexProviderOptions,
   type CodexRequestId,
@@ -152,6 +154,16 @@ const codexOptions: CodexProviderOptions = {
 };
 const codexFactory: CodexProviderFactory = createCodexProvider;
 const codex: AgentProvider = codexFactory(codexOptions);
+// The factory type still yields the neutral SPI, but the concrete adapter also
+// exposes its own cleanup ownership: a handshake whose teardown failed leaves a
+// connection that only this object can still release.
+const codexAdapter: CodexProvider = createCodexProvider(codexOptions);
+const abandonedCodexConnections: number = codexAdapter.abandonedConnectionCount;
+
+async function releaseAbandonedCodexConnections(): Promise<CodexAbandonedConnectionReport> {
+  const report: CodexAbandonedConnectionReport = await codexAdapter.releaseAbandonedConnections();
+  return report;
+}
 const codexRuntime: AgentExecutor = createAgentRuntime({ workspaces, providers: [codex] });
 const codexSessionOptions: CodexSessionOptions = CodexSessionOptionsSchema.parse({ sandboxMode: 'workspace-write' });
 const codexSandboxMode: CodexSandboxMode = CodexSandboxModeSchema.parse('read-only');
@@ -198,6 +210,8 @@ void codexRequestId;
 void codexWireError;
 void openCodexTransport;
 void runCodexTurn;
+void abandonedCodexConnections;
+void releaseAbandonedCodexConnections;
 void CLAUDE_ADAPTER_STATUS;
 void CLAUDE_ADAPTER_VERSION;
 void CLAUDE_AGENT_SDK_PACKAGE;

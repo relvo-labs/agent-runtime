@@ -88,9 +88,47 @@ This adapter neither reads, manages, nor forwards credentials. The child inherit
 | session   | One app-server connection and **one** thread: `initialize` → `initialized` → a single ephemeral `thread/start` bound to the workspace root, reused by every run in the session.                            |
 | run       | Exactly one `turn/start` on that thread, correlated by the `(threadId, turnId)` pair it returns, until `turn/completed`. The conversation is never reset per run, and no process is respawned per run.     |
 | interrupt | `turn/interrupt`. Its `{}` reply acknowledges the _request_; the run settles on the `turn/completed` that follows, which the server marks `interrupted`. Output queued before the stop is still delivered. |
-| dispose   | Close stdin, then escalate SIGTERM → SIGKILL, then settle. Idempotent, and a failed attempt keeps its retry ownership rather than reporting success.                                                       |
+| dispose   | Close stdin, escalate SIGTERM → SIGKILL, then verify the owned process group is empty before reporting success. Idempotent, and a failed attempt keeps its retry ownership rather than reporting success.  |
 
 A run settles exactly once, from whichever of these happens first: its own `turn/completed`, connection EOF, child exit, transport failure, disposal, or a per-request deadline. Success and interruption are never _inferred_ from EOF.
+
+Stream end, process exit and resource cleanup are three separate facts:
+
+- **stdout EOF** ends the inbound stream immediately, even while the process lives — it can never send another frame, so waiting is a hang rather than patience.
+- **leader exit** also ends the inbound stream, after a bounded drain (`exitDrainMs`, default 250 ms) so buffered final frames are not truncated. The drain exists because a descendant that inherited the pipe can hold it open indefinitely; the leader is gone, so nothing further can legitimately arrive either way.
+- **cleanup** is neither of those. `close()` reports success only once the leader has exited _and_ the process group it owned is verifiably empty.
+
+### Descendants: what is verified, and what is not
+
+The child is spawned into its own process group, so commands and MCP servers it starts are torn down with it. Membership is only ever recorded from evidence gathered while the group provably belonged to this transport:
+
+| Moment                                         | Why the group id is still ours                                                                                                                                                   |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| While the leader is alive (start of `close()`) | The leader holds its PID, so the group id cannot have been reused. Unconditional.                                                                                                |
+| Synchronously as the leader is reaped          | The one ambiguous instant. Used only when the leader's own start time is known, so members that predate it are excluded — and never as the sole basis for claiming completeness. |
+| During the drain                               | A process group id cannot be recycled while any member of it exists, so one living member proves the group is the same one.                                                      |
+
+Each member is recorded as an exact `(PID, start time)` pair, and that identity is **re-read immediately before every signal**. A PID whose start time no longer matches is not signalled: the process this transport owned has exited, and the number now belongs to something else. A PID whose state cannot be read is not signalled either.
+
+> **The residual race is real and is not claimed away.** The identity check and the signal are two separate system calls. A process that exits between them could in principle have its PID reused before the signal lands. That window cannot be closed with `process.kill`, and this adapter does not pretend otherwise — it narrows it to a single stat/kill pair and never widens it by signalling a group id or acting on a stale scan.
+
+**Unknown is never treated as empty.** Evidence is tri-state: an `ENOENT`/`ESRCH` read means the process is genuinely gone; an entry owned by a different uid provably is not ours; anything else — denied, unparsable, or an unreadable listing — is _unknown_. Unknown evidence fails the teardown with `group_cleanup_unverified`, leaving `closed` false so a later attempt still owns it and can succeed once the evidence is readable again. A member still alive after SIGKILL fails with `process_group_did_not_exit` on the same terms.
+
+**Portability, stated plainly.** Attribution needs `/proc`, so it is Linux-only today. Elsewhere — and when `useProcessGroup` is off — the group is still signalled as a group _while the leader is alive_, but there is **no post-exit sweep and no descendant-containment claim at all**: this adapter will not signal a PID it cannot attribute. A descendant that deliberately detaches into its own group leaves the group and is outside the guarantee on every platform.
+
+### When a turn's fate is unknown
+
+A `turn/start` that is _rejected_ by the server admitted nothing, so the session stays usable. A `turn/start` that simply never answers — a deadline, a connection that died mid-request, or a success whose turn id is unusable — proves nothing: the turn may be running. Since a second `turn/start` on the same thread can steer an already-active turn, admitting another run could attribute one native turn to two Runtime runs. The session is therefore **fenced**: a diagnostic is emitted, further `startRun` calls are refused with `providerCode: 'session_fenced'`, and disposal — which really does end the connection and the native work with it — is the way out.
+
+### Connections abandoned by a failed handshake
+
+`createSession()` returns no session when the handshake fails, so there is nothing for a caller to dispose. The adapter tears the half-open connection down itself; if that _also_ fails, the connection would be unreachable, so it is retained on the provider instead and the rejection says so (`providerCode: 'handshake_cleanup_pending'`). `provider.releaseAbandonedConnections()` retries every retained connection — attempt-all, never fail-fast — and `provider.abandonedConnectionCount` reports how many are still outstanding. Both live on the concrete `CodexProvider`; the neutral SPI is unchanged.
+
+```ts
+const provider = createCodexProvider();
+// …later, or in a host's shutdown path:
+if (provider.abandonedConnectionCount > 0) await provider.releaseAbandonedConnections();
+```
 
 Traffic that cannot be attributed to the active `(threadId, turnId)` pair — another thread, a background turn, a late frame after the terminal one, a duplicate terminal frame, a reply naming no pending request, or a malformed frame — is dropped with a diagnostic. None of it settles a run, and none of it is treated as a fatal error for the run that _is_ active: an unknown notification method is simply ignored, because a newer server is expected to send methods this adapter does not know.
 

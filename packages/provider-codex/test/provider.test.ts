@@ -6,7 +6,7 @@
  * another turn's output can never complete this one.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { ProviderEventInputSchema, type JsonObject, type ProviderEventInput } from '@relvo-labs/agent-protocol';
 import { isProviderRejection, type ProviderRun, type ProviderSession } from '@relvo-labs/agent-provider';
@@ -1029,5 +1029,331 @@ describe('interactions', () => {
       .catch((error: unknown) => {
         expect(JSON.stringify(error)).not.toContain(FIXTURE_BEARER);
       });
+  });
+
+  // R3 — a server-controlled method string is metadata, not publishable prose.
+  it('never copies an unrecognised server-request method into a durable diagnostic', async () => {
+    const { fake, session, sessionSink } = await openSession();
+    await startRun(session, createSink());
+    const marker = `unsupported/${FIXTURE_BEARER}`;
+
+    fake.push({ id: 78, method: marker, params: { threadId: FAKE_THREAD_ID } });
+    await flush();
+
+    // Still declined, exactly once, so the server is never left waiting.
+    expect(fake.sent.find((message) => 'id' in message && message.id === 78)).toMatchObject({
+      id: 78,
+      error: { code: -32601 },
+    });
+    // …but nothing the server chose reaches the event log.
+    expect(JSON.stringify(sessionSink.events)).not.toContain(FIXTURE_BEARER);
+    expect(JSON.stringify(sessionSink.events)).not.toContain('unsupported/');
+    const declined = sessionSink
+      .ofType('diagnostic')
+      .filter((event) => (event.payload as { message: string }).message.includes('declined'));
+    expect(declined).toHaveLength(1);
+    expect((declined[0]?.payload as { message: string }).message).toContain('unrecognised request');
+  });
+
+  it('names a server-request method that is on the pinned stable allowlist', async () => {
+    const { fake, session, sessionSink } = await openSession();
+    await startRun(session, createSink());
+
+    fake.push({ id: 79, method: 'item/tool/requestUserInput', params: { threadId: FAKE_THREAD_ID } });
+    await flush();
+
+    const declined = sessionSink
+      .ofType('diagnostic')
+      .filter((event) => (event.payload as { message: string }).message.includes('declined'));
+    expect((declined[0]?.payload as { message: string }).message).toContain('item/tool/requestUserInput');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R1 — pre-binding buffering must never lose the only terminal frame
+// ---------------------------------------------------------------------------
+
+describe('early turn traffic that overflows the pre-binding buffer', () => {
+  /** Hold `turn/start` unanswered so every frame below arrives pre-binding. */
+  async function heldTurnStart(): Promise<Opened & { readonly runSink: Sink }> {
+    const responders = defaultResponders();
+    delete responders['turn/start'];
+    const opened = await openSession({}, responders);
+    return { ...opened, runSink: createSink() };
+  }
+
+  it('keeps the terminal frame, so an admitted run still settles', async () => {
+    const { fake, session, sessionSink, runSink } = await heldTurnStart();
+    const starting = startRun(session, runSink);
+    await flush();
+
+    // Far more early output than the adapter buffers, then the one frame that
+    // actually ends the turn.
+    for (let index = 0; index < 600; index += 1) fake.push(agentMessageDelta(`chunk-${String(index)}`));
+    fake.push(turnCompleted('completed'));
+    await flush();
+
+    fake.respond('turn/start', {
+      turn: { id: FAKE_TURN_ID, items: [], itemsView: 'complete', status: 'inProgress', error: null },
+    });
+    const run = await starting;
+
+    await expect(run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    // Lossy output is disclosed rather than silent.
+    expect(
+      sessionSink
+        .ofType('diagnostic')
+        .some((event) => (event.payload as { message: string }).message.includes('dropped')),
+    ).toBe(true);
+  });
+
+  it('still settles when the terminal frame arrives after the buffer is already full', async () => {
+    const { fake, session, runSink } = await heldTurnStart();
+    const starting = startRun(session, runSink);
+    await flush();
+
+    for (let index = 0; index < 512; index += 1) fake.push(agentMessageDelta('x'));
+    await flush();
+    fake.push(turnCompleted('interrupted'));
+    await flush();
+
+    fake.respond('turn/start', {
+      turn: { id: FAKE_TURN_ID, items: [], itemsView: 'complete', status: 'inProgress', error: null },
+    });
+    const run = await starting;
+
+    await expect(run.completion).resolves.toMatchObject({ outcome: 'interrupted' });
+  });
+
+  it('fails closed and fences the session when unattributable terminal frames flood it', async () => {
+    const { fake, session, sessionSink, runSink } = await heldTurnStart();
+    const starting = startRun(session, runSink);
+    await flush();
+
+    // Terminal frames for turns this session never started. They cannot settle
+    // the admitted run, and they must not be able to consume the bound either.
+    for (let index = 0; index < 40; index += 1) {
+      fake.push(turnCompleted('completed', { turnId: `turn-foreign-${String(index)}` }));
+    }
+    await flush();
+
+    fake.respond('turn/start', {
+      turn: { id: FAKE_TURN_ID, items: [], itemsView: 'complete', status: 'inProgress', error: null },
+    });
+    const run = await starting;
+
+    await expect(run.completion).resolves.toMatchObject({
+      outcome: 'failed',
+      error: { code: 'provider_contract_violation' },
+    });
+    // The native turn may still be running, so admission stays closed.
+    await expect(startRun(session, createSink())).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.providerCode === 'session_fenced',
+    );
+    expect(
+      sessionSink
+        .ofType('diagnostic')
+        .some((event) => (event.payload as { message: string }).message.includes('accepts no further runs')),
+    ).toBe(true);
+    // Observable cleanup of the ambiguous native work was attempted.
+    expect(fake.requests('turn/interrupt')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — an uncertain `turn/start` must not reopen admission
+// ---------------------------------------------------------------------------
+
+describe('uncertain turn admission', () => {
+  /** Fake timers, but `setImmediate` stays real so `flush()` still works. */
+  function withTimeout(): void {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  }
+
+  it('fences the session when `turn/start` never answers, rather than retrying the same native turn', async () => {
+    withTimeout();
+    try {
+      const responders = defaultResponders();
+      delete responders['turn/start'];
+      const { fake, session, sessionSink } = await openSession({ requestTimeoutMs: 1000 }, responders);
+
+      const first = startRun(session, createSink());
+      const firstAssertion = expect(first).rejects.toSatisfy(
+        (error: unknown) => isProviderRejection(error) && error.agentError.providerCode === 'request_timeout',
+      );
+      await vi.advanceTimersByTimeAsync(1001);
+      await firstAssertion;
+
+      // A lost response is not a server rejection: the first native turn may be
+      // running right now, so a second run must not be admitted against it.
+      await expect(startRun(session, createSink())).rejects.toSatisfy(
+        (error: unknown) => isProviderRejection(error) && error.agentError.providerCode === 'session_fenced',
+      );
+      expect(fake.requests('turn/start')).toHaveLength(1);
+      expect(
+        sessionSink
+          .ofType('diagnostic')
+          .some((event) => (event.payload as { message: string }).message.includes('unknown state')),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the session usable when the server authoritatively rejects the turn', async () => {
+    const responders = defaultResponders();
+    delete responders['turn/start'];
+    const { fake, session } = await openSession({}, responders);
+
+    const rejected = startRun(session, createSink());
+    await flush();
+    fake.respondWithError('turn/start', -32600, 'no');
+    await expect(rejected).rejects.toThrow();
+
+    // The server said no. Nothing was admitted, so the session is still good.
+    fake.setResponder('turn/start', () => ({
+      turn: { id: FAKE_TURN_ID, items: [], itemsView: 'complete', status: 'inProgress', error: null },
+    }));
+    const second = await startRun(session, createSink());
+    fake.push(turnCompleted('completed'));
+    await expect(second.completion).resolves.toEqual({ outcome: 'succeeded' });
+    expect(fake.requests('turn/start')).toHaveLength(2);
+  });
+
+  it('fences the session when the server accepts a turn without a usable turn id', async () => {
+    const responders = defaultResponders();
+    responders['turn/start'] = () => ({ turn: { items: [], status: 'inProgress' } });
+    const { fake, session } = await openSession({}, responders);
+
+    await expect(startRun(session, createSink())).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'provider_contract_violation',
+    );
+    // The turn may exist natively even though its id is unusable.
+    await expect(startRun(session, createSink())).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.providerCode === 'session_fenced',
+    );
+    expect(fake.requests('turn/start')).toHaveLength(1);
+  });
+
+  it('leaves disposal available and honest on a fenced session', async () => {
+    const responders = defaultResponders();
+    responders['turn/start'] = () => ({ turn: { items: [] } });
+    const { fake, session } = await openSession({}, responders);
+    await expect(startRun(session, createSink())).rejects.toThrow();
+
+    await session.dispose();
+    expect(fake.closeCalls).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4 — a failed handshake whose teardown also fails keeps a callable owner
+// ---------------------------------------------------------------------------
+
+describe('abandoned connections', () => {
+  /** A provider whose handshake always fails at `thread/start`. */
+  function brokenHandshake(): {
+    readonly fake: FakeTransport;
+    readonly provider: ReturnType<typeof createCodexProvider>;
+  } {
+    const responders = defaultResponders();
+    responders['thread/start'] = () => undefined;
+    const fake = createFakeTransport({ responders });
+    return { fake, provider: createCodexProvider({ transport: () => fake.transport }) };
+  }
+
+  async function failHandshake(
+    fake: FakeTransport,
+    provider: ReturnType<typeof createCodexProvider>,
+  ): Promise<unknown> {
+    const opening = provider.createSession({
+      options: {},
+      workspace: { root: '/workspace', ownership: 'borrowed' },
+      sink: createSink().sink,
+    });
+    const caught = opening.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await flush();
+    fake.respondWithError('thread/start', -32603, 'nope');
+    return await caught;
+  }
+
+  it('tracks the connection and reports the failure truthfully when teardown rejects', async () => {
+    const { fake, provider } = brokenHandshake();
+    fake.failNextClose(new Error('close failed'));
+
+    const error = await failHandshake(fake, provider);
+    expect(isProviderRejection(error) && error.agentError.providerCode).toBe('handshake_cleanup_pending');
+    expect(fake.closeCalls).toBe(1);
+    expect(provider.abandonedConnectionCount).toBe(1);
+
+    await expect(provider.releaseAbandonedConnections()).resolves.toEqual({
+      attempted: 1,
+      released: 1,
+      pending: 0,
+    });
+    expect(fake.closeCalls).toBe(2);
+    expect(provider.abandonedConnectionCount).toBe(0);
+  });
+
+  it('treats a synchronous close throw the same way as a rejection', async () => {
+    const { fake, provider } = brokenHandshake();
+    fake.throwOnNextClose(new Error('close threw'));
+
+    const error = await failHandshake(fake, provider);
+    expect(isProviderRejection(error) && error.agentError.providerCode).toBe('handshake_cleanup_pending');
+    expect(provider.abandonedConnectionCount).toBe(1);
+
+    await expect(provider.releaseAbandonedConnections()).resolves.toMatchObject({ released: 1, pending: 0 });
+  });
+
+  it('keeps a connection tracked while it still cannot be released', async () => {
+    const { fake, provider } = brokenHandshake();
+    fake.failNextClose(new Error('close failed'));
+    await failHandshake(fake, provider);
+
+    fake.failNextClose(new Error('still failing'));
+    await expect(provider.releaseAbandonedConnections()).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'provider_unavailable',
+    );
+    expect(provider.abandonedConnectionCount).toBe(1);
+
+    // A later attempt still owns it, and succeeds.
+    await expect(provider.releaseAbandonedConnections()).resolves.toMatchObject({ released: 1, pending: 0 });
+    expect(provider.abandonedConnectionCount).toBe(0);
+  });
+
+  it('shares one sweep between concurrent retries, so nothing is closed twice', async () => {
+    const { fake, provider } = brokenHandshake();
+    fake.failNextClose(new Error('close failed'));
+    await failHandshake(fake, provider);
+    const closesAfterHandshake = fake.closeCalls;
+
+    const releaseHeld = fake.holdNextClose();
+    const first = provider.releaseAbandonedConnections();
+    const second = provider.releaseAbandonedConnections();
+    await flush();
+    releaseHeld();
+
+    expect(await first).toEqual(await second);
+    expect(fake.closeCalls).toBe(closesAfterHandshake + 1);
+    expect(provider.abandonedConnectionCount).toBe(0);
+  });
+
+  it('tracks nothing when a failed handshake tears its connection down cleanly', async () => {
+    const { fake, provider } = brokenHandshake();
+
+    const error = await failHandshake(fake, provider);
+    // The original typed handshake failure survives; no cleanup claim is added.
+    expect(isProviderRejection(error) && error.agentError.providerCode).not.toBe('handshake_cleanup_pending');
+    expect(fake.closeCalls).toBe(1);
+    expect(provider.abandonedConnectionCount).toBe(0);
+    await expect(provider.releaseAbandonedConnections()).resolves.toEqual({
+      attempted: 0,
+      released: 0,
+      pending: 0,
+    });
   });
 });
