@@ -4,20 +4,16 @@
   "compilerOptions": {
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "rewriteRelativeImportExtensions": true,
-    // Dev-time typecheck resolves the SDK to SOURCE, exactly like the root
-    // workspace typecheck, so this app can be worked on without a prior
-    // `pnpm build`. Published-artifact resolution is proven separately by
-    // `pnpm artifacts:check` (see docs/adr referenced from the skill), which
-    // installs this app against packed tarballs instead.
-    "paths": {
-      "@relvo-labs/agent-protocol": ["../../packages/protocol/src/index.ts"],
-      "@relvo-labs/agent-executor": ["../../packages/executor/src/index.ts"],
-      "@relvo-labs/agent-provider": ["../../packages/provider/src/index.ts"],
-      "@relvo-labs/agent-provider/testing": ["../../packages/provider/src/testing/index.ts"],
-      "@relvo-labs/agent-workspace": ["../../packages/workspace/src/index.ts"],
-      "@relvo-labs/agent-runtime": ["../../packages/runtime/src/index.ts"]
-    }
+    "rewriteRelativeImportExtensions": true
+    // Deliberately NO `paths` entry for any `@relvo-labs/*` package. This app
+    // is a consumer, not a workspace package proving its own SPI: issue #14
+    // explicitly forbids "TS path aliases to SDK source" and "workspace-link-
+    // only proof" for this application. Every `@relvo-labs/*` import here
+    // resolves the same way it would in an external project — through the
+    // real `node_modules` symlink pnpm creates from this package's declared
+    // `dependencies`, to that package's published `exports` map, to its BUILT
+    // `dist/index.d.ts`. That means `pnpm build` (repository root) must run
+    // before this app's own `typecheck`/`build` — see `README.md`.
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

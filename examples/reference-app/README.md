@@ -10,7 +10,10 @@ produced by the real SDK — nothing here fabricates an event or injects a fake 
 > (the credential-free scripted lane, end to end). The opt-in real Codex/Claude profiles,
 > the full adversarial test matrix, and packaging integration are tracked as pending follow-up
 > work — see the note at the bottom of this file and `progress.md` in the issue's control
-> directory for the exact remaining checklist.
+> directory for the exact remaining checklist. A first reconciliation pass removed a TS `paths`
+> alias into SDK source that the initial checkpoint had used for this app's own dev typecheck —
+> issue #14 explicitly forbids that for this application; see `reconciled-checkpoint.md` in the
+> issue's control directory for what changed and why.
 
 ## Quick start
 
@@ -37,16 +40,37 @@ Configuration is environment-driven (see `src/config.ts`); useful for developmen
 REFERENCE_APP_PORT=0 pnpm --filter @relvo-labs/reference-app start   # ephemeral port
 ```
 
-### Running the tests
+### Running the tests, typecheck, and build
 
 ```bash
 pnpm --filter @relvo-labs/reference-app test        # this app's own tests
 pnpm test                                            # root gate step; picks these up too
+
+pnpm build                                           # required first — see below
 pnpm --filter @relvo-labs/reference-app typecheck
+pnpm --filter @relvo-labs/reference-app build
 ```
 
 The test suite spins up this app's real HTTP server on an ephemeral loopback port and drives
 it with `fetch`, exactly like a browser would — no fake transport, no injected provider.
+
+This app's own `typecheck` and `build` resolve every `@relvo-labs/*` import through the real
+`node_modules` package resolution pnpm sets up from this app's declared `dependencies` — the
+same path an external consumer's own project would take, through each package's published
+`exports` map to its **built** `dist/*.d.ts`/`dist/*.js`. There is deliberately no TypeScript
+`paths` alias into any package's `src/`: issue #14 explicitly forbids "TS path aliases to SDK
+source" and "workspace-link-only proof" for this application, precisely so that a type error
+only visible in a package's _published_ declarations (a missing export, a masked type) cannot
+be hidden by a shortcut that reads the source tree instead. This means **`pnpm build` at the
+repository root must run before either command** — without it, `node_modules/@relvo-labs/*`
+resolves to a package whose `dist/` does not exist yet, and both commands fail with a
+"Cannot find module" error. `pnpm --filter @relvo-labs/reference-app build` is a genuine
+compile (`tsc -p tsconfig.build.json`, `noEmit: false`) that emits runnable JS to a local,
+git-ignored `dist/` — not merely an alias for `typecheck` — proving this app's TypeScript
+actually compiles against the SDK's real, published shape. Running the app (`pnpm start`)
+still executes the `.ts` sources directly under Node's own native TypeScript support (see
+[Packaging](#packaging) below); `dist/` from `pnpm build` is a correctness proof, not what
+`start` runs.
 
 ## What this app is (and is not)
 
@@ -117,6 +141,8 @@ src/
   server.ts            process entry point (env config, SIGINT/SIGTERM → clean shutdown)
 test/
   reference-app.test.ts  end-to-end HTTP/SSE contract test against the real server
+tsconfig.json         typecheck project (noEmit); no `paths` — resolves via real node_modules
+tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsconfig.json
 ```
 
 ### Integration walkthrough (what the code actually does)
@@ -202,12 +228,27 @@ See the root [`SECURITY.md`](../../SECURITY.md) for the SDK-wide security model 
 
 This app is **private** (`"private": true`, no `publishConfig`) and is never built or packed by
 the root `pnpm build` script (which filters to `./packages/*` only) or included in any SDK
-tarball. Its own typecheck (`pnpm --filter @relvo-labs/reference-app typecheck`) resolves the
-SDK to source via a local `paths` map — exactly like the root workspace typecheck — so it can
-be developed without a prior `pnpm build`; running the app for real (`pnpm start`) resolves the
-SDK through real `node_modules` and therefore does require `pnpm build` first. Proving this app
-against **packed tarballs** (extending `tools/repo/check-artifacts.ts`, per the issue's
-acceptance criteria) is tracked as pending follow-up work, not yet wired.
+tarball. `pnpm start`/`pnpm dev` run the `.ts` sources under Node's own native TypeScript
+support directly (no bundler, no separate compile step needed to execute) — this is accurate
+and intentional for a small app with no declaration to publish, and is documented here rather
+than left implicit. This app's own `typecheck` and `build` scripts are a **separate, real**
+compile step (see [above](#running-the-tests-typecheck-and-build)) that proves the source
+compiles against the SDK's actual installed, built declarations — never a source-tree shortcut.
+
+Neither of the above is the same as the issue's stronger packaging acceptance item: installing
+this app into an **isolated consumer** — a clean pnpm store, transitive dependencies resolved
+only from packed tarballs, no workspace resolution (built _or_ source) at all — the way
+`tools/repo/check-artifacts.ts` already does for `examples/consumer-smoke`. That is tracked as
+pending follow-up work and is **not** wired yet.
+
+This app's own **test suite** (`pnpm --filter @relvo-labs/reference-app test`) is a different
+case again: it runs under Vitest, which — like every package's own `test/` suite in this
+monorepo (`packages/*/test`) — resolves workspace dependencies to source via the shared root
+`vitest.config.ts` `resolve.alias`, for fast iteration. That alias is repository-wide
+infrastructure this app does not own or extend, and using it for this app's _own_ tests follows
+the same convention every other package's tests already use; it is not the "TS path alias to
+SDK source" the issue prohibits for this app's _consumer-facing_ typecheck/build, which now
+resolves exclusively through real package installs as documented above.
 
 ## What's next (tracked, not yet in this checkpoint)
 

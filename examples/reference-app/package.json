@@ -9,7 +9,8 @@
     "start": "node src/server.ts",
     "dev": "node src/server.ts",
     "test": "vitest run test",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
     "@relvo-labs/agent-protocol": "workspace:^",
