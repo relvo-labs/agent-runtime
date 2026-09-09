@@ -354,12 +354,17 @@ export function spawnCodexStdioTransport(
    */
   const owned = new Map<number, string>();
   /**
-   * Why ownership evidence is incomplete for the current teardown attempt.
+   * Why the group has not been fully accounted for.
    *
-   * Reset per attempt, so a retry that can see again can still succeed. While
-   * it is set, no teardown may claim the group is empty.
+   * This is deliberately **not** per-attempt state. A scan that could not be
+   * completed leaves a real question — is something still running? — and
+   * starting another `close()` does not answer it. Forgetting the doubt at the
+   * top of an attempt is exactly how an empty retained-identity map turns into
+   * a false claim of emptiness. It is therefore cleared by one thing only: a
+   * later scan that actually reads the group and attributes everything it
+   * finds.
    */
-  let evidenceLost: string | undefined;
+  let discoveryIncomplete: string | undefined;
 
   /**
    * Re-read one owned member and decide what to do with it.
@@ -393,58 +398,107 @@ export function spawnCodexStdioTransport(
     return false;
   }
 
+  /** What one scan of the group established. */
+  type Discovery = {
+    /** Every candidate was readable, so the listing can be believed. */
+    readonly complete: boolean;
+    /** Processes in this group id that could not be attributed to us. */
+    readonly unattributable: number;
+  };
+
   /**
-   * Record group members from a scan.
+   * Look at the group, and record only the members that are provably ours.
    *
-   * Provenance is the whole point, so each call states why the group id it is
-   * matching on is still ours:
+   * **Looking and adopting are different rights.** Looking is always allowed:
+   * finding *nothing* in the group id is a sound conclusion however that id
+   * came to be free, and it is what lets a later attempt resolve an earlier
+   * doubt. Adopting — taking responsibility for a PID, and therefore being
+   * willing to signal it — needs a reason to believe the group id is still
+   * ours, and only these are accepted:
    *
    *   - `leader_alive` — the leader still holds its PID, so the group id it
-   *     names cannot have been reused by anything. This is unconditional
-   *     evidence and needs no further corroboration.
+   *     names cannot have been reused by anything. Unconditional.
    *   - `group_continuous` — at least one member recorded earlier is still
    *     alive. A process group id cannot be recycled while any member of it
    *     exists, so the group is provably the same one.
-   *   - `leader_exiting` — taken synchronously as the leader is reaped, which
-   *     is the one moment where the group id could in principle already have
-   *     been freed. Only used when the leader's own start time is known, so
-   *     members that predate it can be excluded, and never as the sole basis
-   *     for a claim of completeness.
+   *   - `leader_exiting` — the synchronous reap window, and only that window.
+   *     The leader has just gone, so the id has had no realistic opportunity to
+   *     be reissued; its start time additionally excludes anything older.
+   *
+   * `post_exit_probe` — an arbitrary later attempt — is deliberately **not** on
+   * that list. By then the group id may have been released and reissued, and a
+   * process in a recycled group is newer than our leader too, so a start-time
+   * filter cannot tell the two apart. Such a scan therefore observes without
+   * adopting: anything it finds is counted unattributable, which keeps the
+   * teardown unverified rather than signalling a stranger.
    */
-  function scanGroup(provenance: 'leader_alive' | 'group_continuous' | 'leader_exiting'): void {
+  function discoverGroup(
+    provenance: 'leader_alive' | 'group_continuous' | 'leader_exiting' | 'post_exit_probe',
+  ): Discovery | undefined {
     // `groupClaimed` already established that the leader PID is known.
-    if (!groupClaimed) return;
-    // Adopting a stranger at the one ambiguous moment needs the extra filter;
-    // without it, this scan is skipped rather than guessed at.
-    if (provenance === 'leader_exiting' && leaderStarttime === undefined) return;
+    if (!groupClaimed) return undefined;
     // Continuity is a claim about the present, so it is checked here rather
     // than trusted from the call site: without a living member, the group id
     // could already have been released and reused.
-    if (provenance === 'group_continuous' && !hasLivingMember()) return;
+    if (provenance === 'group_continuous' && !hasLivingMember()) return undefined;
 
     const listing = probe.listPids();
-    if (listing.kind === 'unknown') {
-      evidenceLost ??= `pid_listing_${listing.reason}`;
-      return;
-    }
+    if (listing.kind === 'unknown') return { complete: false, unattributable: 0 };
+
     const leaderStarted = leaderStarttime === undefined ? undefined : Number(leaderStarttime);
+    // Adoption rights, per the provenance rules above. The reap window still
+    // needs the leader's start time to exclude anything older than the group.
+    const mayAdopt =
+      provenance === 'leader_alive' ||
+      provenance === 'group_continuous' ||
+      (provenance === 'leader_exiting' && leaderStarted !== undefined);
+
+    let complete = true;
+    let unattributable = 0;
     for (const pid of listing.pids) {
+      // An already-owned member is accounted for by `owned`, not by this scan.
       if (pid === leaderPid || pid === process.pid || owned.has(pid)) continue;
       const evidence = probe.statOf(pid);
       if (evidence.kind === 'gone' || evidence.kind === 'foreign') continue;
       if (evidence.kind === 'unknown') {
-        // Cannot prove this is not one of ours, so the sweep may not later
-        // claim the group is empty.
-        evidenceLost ??= `member_stat_${evidence.reason}`;
+        // Cannot prove this is not one of ours, so nothing may later claim the
+        // group is empty on the strength of this scan.
+        complete = false;
         continue;
       }
       if (evidence.pgid !== leaderPid) continue;
-      // A member cannot predate its own group leader.
+      if (!mayAdopt) {
+        unattributable += 1;
+        continue;
+      }
+      // A member cannot predate its own group leader; one that does belongs to
+      // a recycled group id, so it is neither adopted nor signalled — but its
+      // presence still means this group is not provably empty.
       if (leaderStarted !== undefined && Number.isFinite(leaderStarted) && Number(evidence.starttime) < leaderStarted) {
+        unattributable += 1;
         continue;
       }
       owned.set(pid, evidence.starttime);
     }
+    return { complete, unattributable };
+  }
+
+  /**
+   * Fold one scan into the standing question of whether the group is accounted
+   * for.
+   *
+   * Only a scan that read everything *and* attributed everything it found may
+   * clear the doubt. A scan that was skipped changes nothing, and an incomplete
+   * one keeps — or creates — the doubt for every later attempt.
+   */
+  function scanGroup(provenance: 'leader_alive' | 'group_continuous' | 'leader_exiting' | 'post_exit_probe'): void {
+    const result = discoverGroup(provenance);
+    if (result === undefined) return;
+    if (result.complete && result.unattributable === 0) {
+      discoveryIncomplete = undefined;
+      return;
+    }
+    discoveryIncomplete ??= result.complete ? `${provenance}_unattributable` : `${provenance}_unreadable`;
   }
 
   child.stdout?.setEncoding('utf8');
@@ -490,7 +544,8 @@ export function spawnCodexStdioTransport(
   // depend on it.
   child.on('exit', () => {
     exited = true;
-    // Taken synchronously, while the group id is as fresh as it will ever be.
+    // Taken synchronously, inside the reap window: the one moment after the
+    // leader is gone where adopting what is still in its group is sound.
     scanGroup('leader_exiting');
     if (finished || failure !== undefined) return;
     // Buffered stdout is still worth reading: a child that answered and then
@@ -565,8 +620,9 @@ export function spawnCodexStdioTransport(
         continue;
       }
       if (state === 'unknown') {
+        // Still owned, still unreadable: the attempt cannot succeed, and the
+        // member stays in `owned` so a later attempt rechecks it.
         unresolved += 1;
-        evidenceLost ??= 'member_recheck_unknown';
         continue;
       }
       alive += 1;
@@ -598,7 +654,8 @@ export function spawnCodexStdioTransport(
         continue;
       }
       if (state === 'unknown') {
-        evidenceLost ??= 'member_signal_unknown';
+        // Never signal what cannot be identified. The survey that follows
+        // counts it as unresolved, so the attempt still fails.
         continue;
       }
       try {
@@ -635,6 +692,17 @@ export function spawnCodexStdioTransport(
    */
   async function sweepOwnedGroup(killGraceMs: number): Promise<void> {
     if (!groupClaimed) return;
+
+    // Fresh discovery, every attempt. An empty retained-identity map only means
+    // the group is gone if a scan actually looked — and succeeded — now. A
+    // previous attempt's blindness is resolved by reading again, never by
+    // starting a new attempt.
+    //
+    // Once the leader has gone this is evidence only. Continuity-based adoption
+    // still happens, but through `surveyOwned`, which first proves a retained
+    // member is alive.
+    scanGroup(exited ? 'post_exit_probe' : 'leader_alive');
+
     let state = surveyOwned();
     if (state.alive > 0) {
       signalOwned('SIGTERM');
@@ -645,7 +713,7 @@ export function spawnCodexStdioTransport(
       state = await drainOwned(killGraceMs);
     }
     if (state.alive > 0) throw new CodexTransportError('process_group_did_not_exit');
-    if (state.unresolved > 0 || evidenceLost !== undefined) {
+    if (state.unresolved > 0 || discoveryIncomplete !== undefined) {
       throw new CodexTransportError('group_cleanup_unverified');
     }
   }
@@ -705,9 +773,6 @@ export function spawnCodexStdioTransport(
         await Promise.resolve();
         const killGraceMs = config.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
         try {
-          // A retry gets a clean slate: the previous attempt's blindness is not
-          // a permanent verdict about what is running now.
-          evidenceLost = undefined;
           // The strongest provenance available: the leader still holds its PID,
           // so the group id names our group and nothing else. Anything already
           // running is recorded here, before that certainty is lost.

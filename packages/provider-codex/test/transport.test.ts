@@ -111,6 +111,11 @@ if (MODE === 'orphan-pipe-child') {
   descendant('inherit');
   setTimeout(() => process.exit(0), 50);
 }
+if (MODE === 'exit-soon') {
+  // Exits by itself shortly after start, creating nothing. Used to reach the
+  // post-exit state before close() is ever called.
+  setTimeout(() => process.exit(0), 50);
+}
 if (MODE === 'eof-alive') {
   // A live process with a closed output stream: it can never send another
   // frame, but it has not exited and holds no pipe of ours open.
@@ -205,6 +210,24 @@ afterAll(() => {
   // could not account for; this is the backstop that makes that visible.
   expect(leakedFixtures).toEqual([]);
 });
+
+/**
+ * Wait for a condition, bounded and without a fixed sleep.
+ *
+ * Used where an observable side effect is driven by a process event — stdout
+ * EOF and `exit` are separate events and can arrive in either order — so the
+ * test waits for the fact it needs instead of assuming an ordering.
+ */
+async function waitFor(condition: () => boolean, label: string, ms = 2_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10);
+      timer.unref();
+    });
+  }
+}
 
 function methodOf(value: unknown): string | undefined {
   return typeof value === 'object' && value !== null && 'method' in value
@@ -652,11 +675,21 @@ type FakeMember = {
 type ProbeScript = {
   /** Answers for `listPids`, in order; the last repeats. */
   readonly listings?: readonly CodexPidListing[];
+  /**
+   * A listing answer computed per call. Takes precedence over `listings`, and
+   * is the right choice whenever a test wants to control *when* the evidence
+   * becomes readable rather than after how many reads.
+   */
+  readonly listing?: () => CodexPidListing;
   readonly members?: Readonly<Record<number, FakeMember>>;
 };
 
 type ScriptedProbe = CodexProcessProbe & {
   readonly kills: readonly { readonly pid: number; readonly signal: string }[];
+  /** How many times the transport has asked for a PID listing. */
+  readonly listingCalls: number;
+  /** How many times it has asked about a member (the leader excluded). */
+  readonly memberStats: number;
 };
 
 const LEADER_START = '1000';
@@ -674,6 +707,7 @@ function scriptedProbe(script: ProbeScript): ScriptedProbe {
   const looks = new Map<number, number>();
   const dead = new Set<number>();
   let listingCalls = 0;
+  let memberStats = 0;
   let leaderPid: number | undefined;
 
   function memberEvidence(pid: number, member: FakeMember): CodexProcessEvidence {
@@ -695,7 +729,17 @@ function scriptedProbe(script: ProbeScript): ScriptedProbe {
     get kills() {
       return kills;
     },
+    get listingCalls() {
+      return listingCalls;
+    },
+    get memberStats() {
+      return memberStats;
+    },
     listPids(): CodexPidListing {
+      if (script.listing !== undefined) {
+        listingCalls += 1;
+        return script.listing();
+      }
       const scripted = script.listings?.[Math.min(listingCalls, script.listings.length - 1)];
       listingCalls += 1;
       if (scripted !== undefined) return scripted;
@@ -709,6 +753,7 @@ function scriptedProbe(script: ProbeScript): ScriptedProbe {
       // it; that call is what tells this fixture which PID the leader has.
       leaderPid ??= pid;
       if (pid === leaderPid) return { kind: 'stat', pgid: pid, starttime: LEADER_START };
+      memberStats += 1;
       const member = script.members?.[pid];
       return member === undefined ? { kind: 'gone' } : memberEvidence(pid, member);
     },
@@ -740,17 +785,132 @@ describe('ownership evidence and signalling safety', () => {
     'lets a retry succeed once the evidence is readable again',
     async () => {
       await withFixture(async (fixture) => {
+        // Unreadable until the test says otherwise, so the first attempt cannot
+        // stumble into a readable answer however many times it looks.
+        let readable = false;
         const probe = scriptedProbe({
-          listings: [
-            { kind: 'unknown', reason: 'EACCES' },
-            { kind: 'pids', pids: [] },
-          ],
+          listing: () => (readable ? { kind: 'pids', pids: [] } : { kind: 'unknown', reason: 'EACCES' }),
         });
         const transport = fixture.spawnWith(probe);
         fixture.onCleanup(() => transport.close());
 
         await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        const readsAfterFirst = probe.listingCalls;
+
+        readable = true;
         await expect(fixture.close(transport.close())).resolves.toBeUndefined();
+        // Success came from reading the group again, not from an empty map.
+        expect(probe.listingCalls).toBeGreaterThan(readsAfterFirst);
+      });
+    },
+    TEST_MS,
+  );
+
+  // R5 — unresolved discovery must survive an attempt, and only fresh evidence
+  // may resolve it. An empty retained-identity map proves nothing on its own.
+
+  it(
+    'keeps failing while the PID listing stays unreadable, rather than succeeding blindly on retry',
+    async () => {
+      await withFixture(async (fixture) => {
+        // One entry, so every look repeats it: the evidence never becomes readable.
+        const probe = scriptedProbe({ listings: [{ kind: 'unknown', reason: 'EACCES' }] });
+        const transport = fixture.spawnWith(probe);
+        fixture.onCleanup(() => transport.close());
+
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        const readsAfterFirst = probe.listingCalls;
+
+        // The leader has exited by now and no identity was ever recorded, so the
+        // retry has an empty owned map. That must not read as "nothing is there".
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        expect(probe.listingCalls).toBeGreaterThan(readsAfterFirst);
+        expect(probe.kills).toEqual([]);
+      });
+    },
+    TEST_MS,
+  );
+
+  it(
+    'keeps failing while a member stays unidentifiable, rather than forgetting it on retry',
+    async () => {
+      await withFixture(async (fixture) => {
+        const probe = scriptedProbe({ members: { 424250: { evidence: { kind: 'unknown', reason: 'EPERM' } } } });
+        const transport = fixture.spawnWith(probe);
+        fixture.onCleanup(() => transport.close());
+
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        const statsAfterFirst = probe.memberStats;
+
+        // The member could never be attributed, so it was never adopted. The
+        // retry must look again rather than conclude the group is empty.
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        expect(probe.memberStats).toBeGreaterThan(statsAfterFirst);
+        expect(probe.kills).toEqual([]);
+      });
+    },
+    TEST_MS,
+  );
+
+  it(
+    'never adopts or signals a newer member of a possibly-recycled group on a later attempt',
+    async () => {
+      await withFixture(async (fixture) => {
+        const RECYCLED_PID = 424251;
+        let phase: 'blind' | 'recycled' | 'empty' = 'blind';
+        const probe = scriptedProbe({
+          listing: () => {
+            if (phase === 'blind') return { kind: 'unknown', reason: 'EACCES' };
+            if (phase === 'recycled') return { kind: 'pids', pids: [RECYCLED_PID] };
+            return { kind: 'pids', pids: [] };
+          },
+          // Started long after the leader, so a start-time filter alone would
+          // happily accept it. It never dies, so any signal would be visible.
+          members: { [RECYCLED_PID]: { group: 'ours', starttime: '9000' } },
+        });
+        const transport = fixture.spawnWith(probe);
+        fixture.onCleanup(() => transport.close());
+
+        // Nothing readable: the transport stays unretired and the leader exits,
+        // so the reap window is over before anything else happens.
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+
+        // A process now occupies the old group id and is newer than the leader —
+        // exactly what a recycled PGID looks like. No retained member is alive to
+        // prove continuity, so this must be neither adopted nor signalled.
+        phase = 'recycled';
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        expect(probe.kills).toEqual([]);
+
+        // Evidence-only observation still lets a genuinely empty group resolve.
+        phase = 'empty';
+        await expect(fixture.close(transport.close())).resolves.toBeUndefined();
+        expect(probe.kills).toEqual([]);
+      });
+    },
+    TEST_MS,
+  );
+
+  it(
+    'does not let the first close erase uncertainty recorded as the leader exited',
+    async () => {
+      await withFixture(async (fixture) => {
+        const probe = scriptedProbe({ listings: [{ kind: 'unknown', reason: 'EACCES' }] });
+        // The leader exits on its own, so the exit-time scan runs before any
+        // close, and it cannot read the listing.
+        const transport = fixture.spawnWith(probe, { env: { FAKE_MODE: 'exit-soon' } });
+        fixture.onCleanup(() => transport.close());
+
+        // Bounded: the inbound stream ends when the leader exits. stdout EOF and
+        // the exit event are separate, so wait for the exit-time scan itself.
+        await fixture.read(transport);
+        await waitFor(() => probe.listingCalls > 0, 'the exit-time group scan');
+        const readsAtExit = probe.listingCalls;
+
+        // The first close must not treat that uncertainty as cleared simply
+        // because it is the attempt that started.
+        await expect(fixture.close(transport.close())).rejects.toMatchObject({ code: 'group_cleanup_unverified' });
+        expect(probe.listingCalls).toBeGreaterThan(readsAtExit);
       });
     },
     TEST_MS,
