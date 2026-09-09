@@ -45,16 +45,6 @@ for (const file of files) {
 // Adapter boundaries
 // ---------------------------------------------------------------------------
 //
-// The Codex package is still an explicit scaffold: it must contain no live
-// integration behaviour at all.
-
-for (const packageName of ['provider-codex']) {
-  const source = readFileSync(resolve(repoRoot, `packages/${packageName}/src/index.ts`), 'utf8');
-  if (/node:child_process|\bfetch\s*\(|spawn\s*\(|exec\s*\(/u.test(source)) {
-    problems.push(`packages/${packageName}: scaffold contains live integration behavior`);
-  }
-}
-
 // The Claude package is live, so the assertion changes shape rather than
 // disappearing. Two invariants keep it honest:
 //
@@ -148,6 +138,102 @@ if (pinned === undefined) {
 }
 
 // ---------------------------------------------------------------------------
+// Codex adapter boundaries
+// ---------------------------------------------------------------------------
+//
+// The Codex package was an explicit scaffold, asserted here to contain no live
+// integration at all. Issue #11 activated it, so the assertion is re-pointed
+// rather than removed: an adapter that really does spawn a child process needs
+// *more* structural policing than a scaffold, not less.
+//
+//   1. It drives a structured protocol. No PTY, no ANSI scraping.
+//   2. It spawns without a shell. A shell would make every argument a parsing
+//      surface for prompt text, a workspace path or an option value; an argv
+//      vector has no such surface. `exec`/`execSync` take a command *string*
+//      and are therefore banned outright, as is `shell: true`.
+//   3. Process spawning is confined to the single transport module, so the
+//      no-shell property can be reviewed by reading one file.
+//   4. The Codex CLI never becomes an npm dependency: the seam is
+//      hand-authored, so the published closure stays small and permissive.
+
+const CODEX_SRC = 'packages/provider-codex/src/';
+const CODEX_SPAWN_MODULE = `${CODEX_SRC}transport.ts`;
+
+/** Shell-bearing process APIs. `spawn` with an argv array is not one of them. */
+const shellProcessApi = /\b(?:exec|execSync|execFile|execFileSync|fork)\s*\(/u;
+const shellOption = /shell\s*:\s*(?:true|['"])/u;
+const ptyModule = /(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](?:node-pty|@lydell\/node-pty)['"]/u;
+const childProcessModule = /(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](?:node:)?child_process['"]/u;
+const ansiEscape = /\\u001[bB]\[|\\x1[bB]\[/u;
+
+// The Codex detectors are probed too, for the same reason the Claude one is.
+const CODEX_PROBES: readonly { readonly source: string; readonly pattern: RegExp; readonly detected: boolean }[] = [
+  { source: "const out = exec('codex ' + prompt);", pattern: shellProcessApi, detected: true },
+  { source: 'execFileSync(bin, argv);', pattern: shellProcessApi, detected: true },
+  { source: "spawn(bin, ['app-server', '--stdio'], { shell: false });", pattern: shellProcessApi, detected: false },
+  { source: 'spawn(bin, argv, { shell: true });', pattern: shellOption, detected: true },
+  { source: "spawn(bin, argv, { shell: '/bin/sh' });", pattern: shellOption, detected: true },
+  { source: 'spawn(bin, argv, { shell: false });', pattern: shellOption, detected: false },
+  { source: "import pty from 'node-pty';", pattern: ptyModule, detected: true },
+  { source: "import { spawn } from 'node:child_process';", pattern: childProcessModule, detected: true },
+  { source: "import { isAbsolute } from 'node:path';", pattern: childProcessModule, detected: false },
+];
+for (const probe of CODEX_PROBES) {
+  if (probe.pattern.test(probe.source) !== probe.detected) {
+    problems.push(
+      `codex boundary detector regressed: \`${probe.source}\` should ${probe.detected ? '' : 'not '}be detected`,
+    );
+  }
+}
+
+let codexSpawnModuleSeen = false;
+for (const file of files.filter((path) => path.startsWith(CODEX_SRC))) {
+  const source = readFileSync(resolve(repoRoot, file), 'utf8');
+  if (ptyModule.test(source) || ansiEscape.test(source)) {
+    problems.push(`${file}: codex adapter must drive the app-server protocol, not a terminal`);
+  }
+  if (shellProcessApi.test(source)) {
+    problems.push(`${file}: codex adapter must not use a shell-bearing process API`);
+  }
+  if (shellOption.test(source)) {
+    problems.push(`${file}: codex adapter must spawn with an argv vector, never through a shell`);
+  }
+  if (childProcessModule.test(source)) {
+    if (file !== CODEX_SPAWN_MODULE) {
+      problems.push(`${file}: codex process spawning belongs in ${CODEX_SPAWN_MODULE} only`);
+    } else {
+      codexSpawnModuleSeen = true;
+      if (!/shell:\s*false/u.test(source)) {
+        problems.push(`${file}: the codex spawn must state \`shell: false\` explicitly`);
+      }
+    }
+  }
+}
+if (!codexSpawnModuleSeen) {
+  problems.push(`${CODEX_SPAWN_MODULE}: the codex production transport must spawn the app-server`);
+}
+
+const codexManifest = JSON.parse(readFileSync(resolve(repoRoot, 'packages/provider-codex/package.json'), 'utf8')) as {
+  dependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
+};
+for (const field of ['dependencies', 'peerDependencies'] as const) {
+  for (const name of Object.keys(codexManifest[field] ?? {})) {
+    if (/codex|^@openai\//u.test(name)) {
+      problems.push(
+        `packages/provider-codex: ${name} must not be a ${field} of the adapter; the seam is hand-authored`,
+      );
+    }
+  }
+}
+
+// The adapter documents the app-server release its hand-authored seam was
+// derived from. A version claim nobody re-checked is worse than none.
+if (!/CODEX_APP_SERVER_VERSION = '\d+\.\d+\.\d+'/u.test(readFileSync(resolve(repoRoot, CODEX_SPAWN_MODULE), 'utf8'))) {
+  problems.push(`${CODEX_SPAWN_MODULE}: CODEX_APP_SERVER_VERSION must pin an exact app-server release`);
+}
+
+// ---------------------------------------------------------------------------
 // Package-filtered tests must actually run
 // ---------------------------------------------------------------------------
 //
@@ -214,6 +300,7 @@ if (problems.length > 0) {
   process.exit(1);
 }
 process.stdout.write(
-  `static: OK — ${String(files.length)} candidate files scanned; the codex scaffold remains non-live, ` +
-    'the claude adapter stays structured with an optional SDK peer; every package test script is executable\n',
+  `static: OK — ${String(files.length)} candidate files scanned; the claude adapter stays structured with an ` +
+    'optional SDK peer, the codex adapter spawns only from its transport module and only without a shell; ' +
+    'every package test script is executable\n',
 );

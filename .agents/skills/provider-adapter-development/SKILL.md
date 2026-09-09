@@ -1,7 +1,7 @@
 ---
 name: provider-adapter-development
 description: Implement or change an AgentProvider against the neutral SPI, including capability descriptors, run handles, interaction settlement and the in-process trust boundary.
-version: 1.1.0
+version: 1.2.0
 stability: stable
 tags: [spi, provider, capabilities, trust-boundary]
 ---
@@ -28,8 +28,8 @@ Do not use this skill when:
 - the work is workspace acquisition or cleanup — use `workspace-lifecycle`
 - you are adding a **new** production adapter package — that is a scoped,
   reviewed milestone; open an issue first. `@relvo-labs/agent-provider-claude`
-  is live and in scope for this skill; `@relvo-labs/agent-provider-codex` is
-  still an explicit scaffold and must stay non-live until its own issue lands
+  and `@relvo-labs/agent-provider-codex` are both live and in scope for this
+  skill
 
 ## Owns
 
@@ -111,10 +111,18 @@ Do not use this skill when:
    against it. Permission descriptors express _provider-declared intent_ for UX, not an
    enforced security control. See `docs/adr/ADR-0009-provider-trust-boundary.md`.
 
-7. **No PTY.** Control paths are structured. Do not add terminal scraping, ANSI parsing
-   or pseudo-terminal emulation to core or the SPI. `tools/repo/check-static.ts` enforces
-   this for live adapter source by matching the module specifier, not the call site, so an
-   alias (`import { exec as run } from 'child_process'`) cannot slip past it.
+7. **No PTY, and no shell.** Control paths are structured. Do not add terminal scraping,
+   ANSI parsing or pseudo-terminal emulation to core or the SPI.
+   `tools/repo/check-static.ts` enforces this for live adapter source by matching the
+   module specifier, not the call site, so an alias
+   (`import { exec as run } from 'child_process'`) cannot slip past it.
+
+   An adapter that legitimately spawns a subprocess — as the Codex adapter does — is held
+   to a stricter form of the same rule rather than exempted from it: an argv **vector**
+   and never a command string, `shell: false` stated explicitly, no `exec`/`execSync`, and
+   spawning confined to one named module so the property can be reviewed by reading a
+   single file. A command string is a parsing surface for prompt text and workspace paths;
+   an argv vector is not.
 
 8. **Correlate before you settle.** A long-lived provider connection carries more than the
    run in front of you: background, scheduled and already-retired turns share the same
@@ -147,7 +155,10 @@ double used to test the _runtime_ against the SPI. It is not a conformance suite
 adapter, and there is no exported adapter conformance suite yet: an adapter proves itself
 with its own deterministic tests that validate every emitted `ProviderEventInput` against
 the protocol schema and cover the failure, interrupt, disposal and correlation paths, with
-no credentials and no network. `packages/provider-claude/test` is the worked example.
+no credentials and no network. `packages/provider-claude/test` and
+`packages/provider-codex/test` are the worked examples; the latter also shows how an
+adapter that spawns a subprocess proves its spawning, framing, EOF and signal-escalation
+paths against a local stand-in server without a credential or a network.
 Extracting the shared parts into a real exported suite is open work; do not cite one that
 does not exist.
 
