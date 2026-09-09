@@ -22,6 +22,19 @@ export type ReferenceAppConfig = {
   readonly workspaceBaseDirectory: string;
   /** Maximum accepted JSON request body, in bytes. */
   readonly maxRequestBodyBytes: number;
+  /**
+   * Opt-in real provider profiles. Both default to disabled: the canonical
+   * gate and the default first run stay credential-free. Enabling one here
+   * does not supply a credential — it only registers the adapter so
+   * `open_session` can attempt it; authentication remains entirely host-side
+   * (see `providers/codex.ts` / `providers/claude.ts`).
+   */
+  readonly enableCodex?: boolean;
+  readonly enableClaude?: boolean;
+  /** Overrides the `codex` executable resolved from `PATH`. */
+  readonly codexExecutable?: string | undefined;
+  /** Overrides the default Claude model id. */
+  readonly claudeModel?: string | undefined;
 };
 
 function readPort(value: string | undefined, fallback: number): number {
@@ -52,5 +65,9 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Referen
     workspaceBaseDirectory:
       env.REFERENCE_APP_WORKSPACE_BASE ?? join(tmpdir(), 'relvo-reference-app', String(process.pid)),
     maxRequestBodyBytes: 64 * 1024,
+    enableCodex: env.REFERENCE_APP_ENABLE_CODEX === '1',
+    enableClaude: env.REFERENCE_APP_ENABLE_CLAUDE === '1',
+    codexExecutable: env.CODEX_EXECUTABLE,
+    claudeModel: env.REFERENCE_APP_CLAUDE_MODEL,
   };
 }

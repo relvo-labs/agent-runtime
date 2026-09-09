@@ -92,6 +92,20 @@ const scriptedClaudeQuery: ClaudeQuery = (params: ClaudeQueryParams): ClaudeQuer
     void params.options.cwd;
     // Correlate the reply with the message the adapter submitted, exactly as
     // the SDK does. `uuid` is optional on the wire, so narrow it first.
+    //
+    // WARNING — do not copy this `for await` into a runnable walkthrough or a
+    // real interactive session. This fixture exists only so the compiler can
+    // check `ClaudeQuery`'s shape here; it is never actually iterated by this
+    // file (see `tools/repo/check-artifacts.ts`, which only typechecks this
+    // example). Draining `params.prompt` to completion before replying is
+    // safe ONLY because that iterable happens to end after one message in
+    // this fixture. A real streaming-input session's prompt iterable stays
+    // open across every subsequent turn and does not end until the session
+    // itself closes — awaiting its end before the FIRST reply would hang a
+    // real multi-turn session forever. A real query implementation must
+    // reply per received message instead, exactly as the official Claude
+    // Agent SDK's own `query()` does (the default this app binds by omitting
+    // `query` — see `examples/reference-app`).
     const submitted: ClaudePromptMessage[] = [];
     for await (const message of params.prompt) submitted.push(message);
     const uuid: ClaudeMessageUuid | undefined = submitted[0]?.uuid;

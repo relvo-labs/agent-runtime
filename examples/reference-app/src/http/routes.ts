@@ -3,19 +3,28 @@
  *
  * Every mutating route builds its command from named, individually validated
  * fields (`../commands.ts`) plus this app's own fixed policy — never from the
- * raw request body. Every route answers through `AgentExecutor`/`AgentRuntime`
- * methods directly, so the receipt, snapshot, or event page a caller sees is
- * exactly what the SDK produced, not a shape this app invented.
+ * raw request body, and never tolerating an unrecognised field silently (see
+ * `readKnownFields`). Every route answers through `AgentExecutor`/
+ * `AgentRuntime` methods directly, so the receipt, snapshot, or event page a
+ * caller sees is exactly what the SDK produced, not a shape this app invented.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { SequenceSchema, SessionIdSchema, type SessionId } from '@relvo-labs/agent-protocol';
+import {
+  isAgentRuntimeError,
+  RunIdSchema,
+  SequenceSchema,
+  SessionIdSchema,
+  type SessionId,
+} from '@relvo-labs/agent-protocol';
 import type { EventSubscription } from '@relvo-labs/agent-runtime';
 
 import type { ReferenceAppRuntime } from '../runtime-factory.ts';
+import { SCRIPTED_FAILURE_TRIGGER_TEXT } from '../providers/scripted.ts';
 import {
   readCommandId,
   readIfRunActive,
+  readKnownFields,
   readOptionalReason,
   readPathSegment,
   readProviderId,
@@ -24,13 +33,44 @@ import {
 } from '../commands.ts';
 import { readJsonBody } from './json-body.ts';
 import { pipeSubscriptionToSse } from './sse.ts';
+import { parseStrictEnum, parseStrictNonNegativeInt } from './query.ts';
 import { isStaticAssetPath, readStaticAsset } from './static-assets.ts';
-import { checkTransport, CSRF_HEADER_NAME } from './security.ts';
+import { applyBaselineHeaders, checkTransport, CSRF_HEADER_NAME } from './security.ts';
 
 export type RouteContext = {
   readonly app: ReferenceAppRuntime;
   readonly maxRequestBodyBytes: number;
+  /** This server's own actual bound port (read back after `listen()`). */
+  readonly expectedPort: () => number;
+  /** Registers an in-flight SSE pipe's completion promise (see `app.ts`). */
+  readonly trackSseStream: (promise: Promise<void>) => void;
 };
+
+/**
+ * Some `AgentExecutor` commands (`closeSession`, when cleanup fails) reject
+ * their *promise* rather than returning a `disposition: "rejected"` receipt —
+ * that is how the SDK distinguishes "no receipt was ever persisted, retry the
+ * same commandId" from an ordinary business rejection. This app still owes
+ * the caller a bounded, typed JSON answer either way: a thrown
+ * `AgentRuntimeError` is this app's own generic-500 fallback otherwise, which
+ * would incorrectly imply an unexpected bug rather than a named, possibly
+ * retryable SDK-level failure.
+ */
+async function callRuntimeCommand<T>(
+  response: ServerResponse,
+  run: () => Promise<T>,
+): Promise<{ readonly value: T } | undefined> {
+  try {
+    return { value: await run() };
+  } catch (error) {
+    if (isAgentRuntimeError(error)) {
+      const status = error.error.retryable ? 503 : 500;
+      sendJson(response, status, { error: error.error });
+      return undefined;
+    }
+    throw error;
+  }
+}
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
@@ -59,6 +99,15 @@ function readField<T>(response: ServerResponse, result: FieldResult<T>): T | typ
     return FIELD_FAILED;
   }
   return result.value;
+}
+
+/** Enforces the strict field allowlist before any individual field is read. */
+function requireKnownFields(
+  response: ServerResponse,
+  body: unknown,
+  allowed: readonly string[],
+): Record<string, unknown> | typeof FIELD_FAILED {
+  return readField(response, readKnownFields(body, allowed));
 }
 
 async function readBodyOrRespond(
@@ -98,19 +147,53 @@ async function handleOpenSession(
 ): Promise<void> {
   const body = await readBodyOrRespond(request, response, context.maxRequestBodyBytes);
   if (body === undefined) return;
-  const commandId = readField(response, readCommandId(body));
+  const fields = requireKnownFields(response, body, ['commandId', 'providerId']);
+  if (fields === FIELD_FAILED) return;
+  const commandId = readField(response, readCommandId(fields));
   if (commandId === FIELD_FAILED) return;
-  const providerId = readField(response, readProviderId(body));
+  const providerId = readField(response, readProviderId(fields));
   if (providerId === FIELD_FAILED) return;
 
-  const receipt = await context.app.runtime.openSession({
-    type: 'open_session',
-    commandId,
-    providerId,
-    // This app always owns a fresh, disposable managed workspace. A browser
-    // can never name a path or borrow an existing directory (see SECURITY.md).
-    workspace: { kind: 'managed' },
-  });
+  // Self-heal before evaluating admission: a session that failed or was
+  // closed by a path other than this route (runtime-driven failure, or
+  // `shutdown()`) must not permanently pin the one-session slot.
+  await context.app.sessionAdmission.refresh((id) => context.app.runtime.getSession(id));
+
+  const admission = context.app.sessionAdmission.beginOpen(commandId);
+  if (!admission.ok) {
+    if (admission.reason === 'session_already_open') {
+      sendError(
+        response,
+        409,
+        'session_already_open',
+        `this app allows only one active session at a time (\`${admission.sessionId ?? ''}\` is open); close it before opening another`,
+      );
+    } else {
+      sendError(response, 409, 'open_in_flight', 'another open_session attempt is already in flight');
+    }
+    return;
+  }
+
+  let receipt;
+  try {
+    receipt = await context.app.runtime.openSession({
+      type: 'open_session',
+      commandId,
+      providerId,
+      // This app always owns a fresh, disposable managed workspace. A browser
+      // can never name a path or borrow an existing directory (see SECURITY.md).
+      workspace: { kind: 'managed' },
+    });
+  } catch (error) {
+    context.app.sessionAdmission.settleOpen(commandId, undefined);
+    throw error;
+  }
+
+  if (receipt.disposition !== 'rejected' && receipt.result?.type === 'session_opened') {
+    context.app.sessionAdmission.settleOpen(commandId, { sessionId: receipt.result.sessionId });
+  } else {
+    context.app.sessionAdmission.settleOpen(commandId, undefined);
+  }
   sendJson(response, 200, { receipt });
 }
 
@@ -129,15 +212,26 @@ async function handleReadEvents(
   url: URL,
   response: ServerResponse,
 ): Promise<void> {
-  const fromParam = url.searchParams.get('fromSequence') ?? '0';
-  const fromParsed = SequenceSchema.safeParse(Number.parseInt(fromParam, 10));
-  if (!fromParsed.success) {
+  const fromParsed = parseStrictNonNegativeInt(url.searchParams.get('fromSequence'), 0);
+  if (!fromParsed.ok) {
+    sendError(response, 400, 'invalid_request', `fromSequence: ${fromParsed.message}`);
+    return;
+  }
+  const fromSequence = SequenceSchema.safeParse(fromParsed.value);
+  if (!fromSequence.success) {
     sendError(response, 400, 'invalid_request', 'fromSequence must be a non-negative integer');
     return;
   }
-  const page = await context.app.runtime.readEvents(sessionId, fromParsed.data);
+  const snapshot = await context.app.runtime.getSession(sessionId);
+  if (snapshot === undefined) {
+    sendError(response, 404, 'unknown_session', `no session \`${sessionId}\``);
+    return;
+  }
+  const page = await context.app.runtime.readEvents(sessionId, fromSequence.data);
   sendJson(response, 200, { page });
 }
+
+const OVERFLOW_POLICIES = ['signal_and_close', 'signal_and_skip'] as const;
 
 async function handleSubscribe(
   context: RouteContext,
@@ -150,20 +244,46 @@ async function handleSubscribe(
     sendError(response, 404, 'unknown_session', `no session \`${sessionId}\``);
     return;
   }
-  const fromParam = url.searchParams.get('fromSequence') ?? '0';
-  const fromParsed = SequenceSchema.safeParse(Number.parseInt(fromParam, 10));
-  if (!fromParsed.success) {
+  const fromParsed = parseStrictNonNegativeInt(url.searchParams.get('fromSequence'), 0);
+  if (!fromParsed.ok) {
+    sendError(response, 400, 'invalid_request', `fromSequence: ${fromParsed.message}`);
+    return;
+  }
+  const fromSequence = SequenceSchema.safeParse(fromParsed.value);
+  if (!fromSequence.success) {
     sendError(response, 400, 'invalid_request', 'fromSequence must be a non-negative integer');
     return;
   }
+  const bufferSizeParsed = parseStrictNonNegativeInt(url.searchParams.get('bufferSize'), 1024);
+  if (!bufferSizeParsed.ok || bufferSizeParsed.value < 8 || bufferSizeParsed.value > 65_536) {
+    sendError(response, 400, 'invalid_request', 'bufferSize must be an integer in [8, 65536]');
+    return;
+  }
+  const overflowPolicyParsed = parseStrictEnum(
+    url.searchParams.get('overflowPolicy'),
+    OVERFLOW_POLICIES,
+    'signal_and_close',
+  );
+  if (!overflowPolicyParsed.ok) {
+    sendError(response, 400, 'invalid_request', `overflowPolicy: ${overflowPolicyParsed.message}`);
+    return;
+  }
+
   let subscription: EventSubscription;
   try {
-    subscription = context.app.runtime.subscribe({ sessionId, fromSequence: fromParsed.data });
+    subscription = context.app.runtime.subscribe({
+      sessionId,
+      fromSequence: fromSequence.data,
+      bufferSize: bufferSizeParsed.value,
+      overflowPolicy: overflowPolicyParsed.value,
+    });
   } catch {
     sendError(response, 400, 'invalid_request', 'could not open a subscription for this session');
     return;
   }
-  await pipeSubscriptionToSse(subscription, response);
+  const pipe = pipeSubscriptionToSse(subscription, response);
+  context.trackSseStream(pipe);
+  await pipe;
 }
 
 async function handleSubmitTurn(
@@ -174,9 +294,11 @@ async function handleSubmitTurn(
 ): Promise<void> {
   const body = await readBodyOrRespond(request, response, context.maxRequestBodyBytes);
   if (body === undefined) return;
-  const commandId = readField(response, readCommandId(body));
+  const fields = requireKnownFields(response, body, ['commandId', 'text']);
+  if (fields === FIELD_FAILED) return;
+  const commandId = readField(response, readCommandId(fields));
   if (commandId === FIELD_FAILED) return;
-  const text = readField(response, readTurnText(body));
+  const text = readField(response, readTurnText(fields));
   if (text === FIELD_FAILED) return;
 
   const receipt = await context.app.runtime.submitTurn({
@@ -185,35 +307,61 @@ async function handleSubmitTurn(
     sessionId,
     input: { parts: [{ type: 'text', text }] },
   });
-  // The scripted-demo lane never advances on its own (see runtime-factory.ts).
-  // A real provider profile paces itself and this call is then a no-op.
-  await context.app.advanceScriptedProviders();
+  // Deliberately no automatic `advanceScriptedDemo()` call here — see its
+  // doc comment in `runtime-factory.ts`. The run genuinely stays in flight
+  // (state `running`, undrained) until an explicit "advance script" request
+  // or an `interrupt_run` reaches it, both through this same HTTP transport.
   sendJson(response, 200, { receipt });
 }
 
 async function handleInterruptRun(
   context: RouteContext,
   sessionId: SessionId,
-  runIdRaw: string,
+  runId: string,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
   const body = await readBodyOrRespond(request, response, context.maxRequestBodyBytes);
   if (body === undefined) return;
-  const commandId = readField(response, readCommandId(body));
+  const fields = requireKnownFields(response, body, ['commandId', 'reason']);
+  if (fields === FIELD_FAILED) return;
+  const commandId = readField(response, readCommandId(fields));
   if (commandId === FIELD_FAILED) return;
-  const reason = readField(response, readOptionalReason(body));
+  const reason = readField(response, readOptionalReason(fields));
   if (reason === FIELD_FAILED) return;
 
   const receipt = await context.app.runtime.interruptRun({
     type: 'interrupt_run',
     commandId,
     sessionId,
-    runId: runIdRaw,
+    runId,
     ...(reason === undefined ? {} : { reason }),
   });
-  await context.app.advanceScriptedProviders();
   sendJson(response, 200, { receipt });
+}
+
+async function handleAdvanceScript(
+  context: RouteContext,
+  sessionId: SessionId,
+  response: ServerResponse,
+): Promise<void> {
+  const snapshot = await context.app.runtime.getSession(sessionId);
+  if (snapshot === undefined) {
+    sendError(response, 404, 'unknown_session', `no session \`${sessionId}\``);
+    return;
+  }
+  if (snapshot.session.providerId !== context.app.scriptedDemoProviderId) {
+    sendError(
+      response,
+      400,
+      'not_scripted_provider',
+      'this session is not using the scripted-demo provider, which is the only one this endpoint paces',
+    );
+    return;
+  }
+  await context.app.advanceScriptedDemo();
+  const refreshed = await context.app.runtime.getSession(sessionId);
+  sendJson(response, 200, { snapshot: refreshed });
 }
 
 async function handleCloseSession(
@@ -224,17 +372,25 @@ async function handleCloseSession(
 ): Promise<void> {
   const body = await readBodyOrRespond(request, response, context.maxRequestBodyBytes);
   if (body === undefined) return;
-  const commandId = readField(response, readCommandId(body));
+  const fields = requireKnownFields(response, body, ['commandId', 'ifRunActive']);
+  if (fields === FIELD_FAILED) return;
+  const commandId = readField(response, readCommandId(fields));
   if (commandId === FIELD_FAILED) return;
-  const ifRunActive = readField(response, readIfRunActive(body));
+  const ifRunActive = readField(response, readIfRunActive(fields));
   if (ifRunActive === FIELD_FAILED) return;
 
-  const receipt = await context.app.runtime.closeSession({
-    type: 'close_session',
-    commandId,
-    sessionId,
-    ...(ifRunActive === undefined ? {} : { ifRunActive }),
-  });
+  const outcome = await callRuntimeCommand(response, () =>
+    context.app.runtime.closeSession({
+      type: 'close_session',
+      commandId,
+      sessionId,
+      ...(ifRunActive === undefined ? {} : { ifRunActive }),
+    }),
+  );
+  if (outcome === undefined) return; // a retryable/typed failure was already answered
+  const receipt = outcome.value;
+  const closed = receipt.disposition !== 'rejected' && receipt.result?.type === 'session_closed';
+  context.app.sessionAdmission.noteCloseOutcome(sessionId, closed);
   sendJson(response, 200, { receipt });
 }
 
@@ -247,7 +403,13 @@ const EVENTS_PATH = /^\/api\/sessions\/([^/]+)\/events$/u;
 const SUBSCRIBE_PATH = /^\/api\/sessions\/([^/]+)\/subscribe$/u;
 const TURNS_PATH = /^\/api\/sessions\/([^/]+)\/turns$/u;
 const INTERRUPT_PATH = /^\/api\/sessions\/([^/]+)\/runs\/([^/]+)\/interrupt$/u;
+const ADVANCE_SCRIPT_PATH = /^\/api\/sessions\/([^/]+)\/advance-script$/u;
 const CLOSE_PATH = /^\/api\/sessions\/([^/]+)\/close$/u;
+
+/** This module's one convenience export for the UI (avoids a magic string). */
+export { SCRIPTED_FAILURE_TRIGGER_TEXT };
+
+const MAX_URL_LENGTH = 2048;
 
 export async function handleRequest(
   context: RouteContext,
@@ -255,7 +417,12 @@ export async function handleRequest(
   response: ServerResponse,
 ): Promise<void> {
   const method = request.method ?? 'GET';
-  const url = new URL(request.url ?? '/', 'http://reference-app.internal');
+  const rawUrl = request.url ?? '/';
+  if (rawUrl.length > MAX_URL_LENGTH) {
+    sendError(response, 414, 'uri_too_long', 'request URI exceeds this app’s bound');
+    return;
+  }
+  const url = new URL(rawUrl, 'http://reference-app.internal');
   const pathname = url.pathname;
 
   const isApiRoute = pathname.startsWith('/api/');
@@ -263,6 +430,7 @@ export async function handleRequest(
     host: request.headers.host,
     origin: request.headers.origin,
     csrf: request.headers[CSRF_HEADER_NAME],
+    expectedPort: context.expectedPort(),
     // Static assets are reachable by a plain browser navigation, which cannot
     // set a custom header; every data-bearing API route requires it.
     requireCsrf: isApiRoute,
@@ -271,6 +439,7 @@ export async function handleRequest(
     sendError(response, security.status, security.code, security.message);
     return;
   }
+  applyBaselineHeaders(response);
 
   if (!isApiRoute) {
     if (method !== 'GET' && method !== 'HEAD') {
@@ -333,6 +502,15 @@ export async function handleRequest(
     return handleSubmitTurn(context, sessionId, request, response);
   }
 
+  const advanceMatch = ADVANCE_SCRIPT_PATH.exec(pathname);
+  if (method === 'POST' && advanceMatch) {
+    const segment = readPathSegment(advanceMatch[1], 'sessionId');
+    if (!segment.ok) return sendError(response, segment.error.status, 'invalid_request', segment.error.message);
+    const sessionId = parseSessionId(segment.value, response);
+    if (sessionId === undefined) return;
+    return handleAdvanceScript(context, sessionId, response);
+  }
+
   const interruptMatch = INTERRUPT_PATH.exec(pathname);
   if (method === 'POST' && interruptMatch) {
     const sessionSegment = readPathSegment(interruptMatch[1], 'sessionId');
@@ -344,7 +522,9 @@ export async function handleRequest(
       return sendError(response, runSegment.error.status, 'invalid_request', runSegment.error.message);
     const sessionId = parseSessionId(sessionSegment.value, response);
     if (sessionId === undefined) return;
-    return handleInterruptRun(context, sessionId, runSegment.value, request, response);
+    const runId = RunIdSchema.safeParse(runSegment.value);
+    if (!runId.success) return sendError(response, 400, 'invalid_request', 'malformed run id');
+    return handleInterruptRun(context, sessionId, runId.data, request, response);
   }
 
   const closeMatch = CLOSE_PATH.exec(pathname);

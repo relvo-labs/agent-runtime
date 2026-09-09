@@ -6,14 +6,11 @@ SSE backend that owns a single `AgentExecutor`, and one plain (no-framework) bro
 drives it. Every command, receipt, snapshot, and streamed event you see in the browser is
 produced by the real SDK — nothing here fabricates an event or injects a fake transport.
 
-> **Status:** this README documents the checkpoint slice that is implemented and tested today
-> (the credential-free scripted lane, end to end). The opt-in real Codex/Claude profiles,
-> the full adversarial test matrix, and packaging integration are tracked as pending follow-up
-> work — see the note at the bottom of this file and `progress.md` in the issue's control
-> directory for the exact remaining checklist. A first reconciliation pass removed a TS `paths`
-> alias into SDK source that the initial checkpoint had used for this app's own dev typecheck —
-> issue #14 explicitly forbids that for this application; see `reconciled-checkpoint.md` in the
-> issue's control directory for what changed and why.
+> **Manual real-provider evidence matrix.** This README documents what this app _implements and
+> automatically tests_. Whether the opt-in Codex/Claude profiles actually succeed against a live,
+> credentialed model is a separate, manually-run, separately-authorized evidence matrix — see
+> [Opt-in real Codex / Claude profiles](#2-opt-in-real-codex--claude-profiles) — never counted
+> from this app's own (credential-free) automated tests.
 
 ## Quick start
 
@@ -28,11 +25,12 @@ pnpm --filter @relvo-labs/reference-app start
 
 Then open **http://127.0.0.1:4173** in a browser. Pick the `scripted-demo` provider (the only
 one registered by default — see [Lanes](#two-lanes) below), click **Open session**, type a
-message, and click **Send turn**. Watch the transcript, the receipt/event inspector, and the
-session/run state badges update from real streamed events. Click **Interrupt run** or
-**Close session** to exercise the rest of the lifecycle. Stop the server with <kbd>Ctrl-C</kbd>
-— it shuts the runtime down cleanly (releases the provider session and deletes the managed
-workspace directory) before exiting.
+message, and click **Send turn**. Nothing happens yet — click **Advance script** to actually
+progress it (see why below), watch the transcript, receipt/event inspector, and session/run
+state badges update from real streamed events, then try **Interrupt run** _before_ advancing to
+see a genuine in-flight interrupt. Click **Close session** when done. Stop the server with
+<kbd>Ctrl-C</kbd> — it shuts the runtime down cleanly (releases the provider session and deletes
+the managed workspace directory) before exiting.
 
 Configuration is environment-driven (see `src/config.ts`); useful for development:
 
@@ -43,7 +41,7 @@ REFERENCE_APP_PORT=0 pnpm --filter @relvo-labs/reference-app start   # ephemeral
 ### Running the tests, typecheck, and build
 
 ```bash
-pnpm --filter @relvo-labs/reference-app test        # this app's own tests
+pnpm --filter @relvo-labs/reference-app test        # this app's own tests (34+ cases, 5 files)
 pnpm test                                            # root gate step; picks these up too
 
 pnpm build                                           # required first — see below
@@ -51,96 +49,174 @@ pnpm --filter @relvo-labs/reference-app typecheck
 pnpm --filter @relvo-labs/reference-app build
 ```
 
-The test suite spins up this app's real HTTP server on an ephemeral loopback port and drives
-it with `fetch`, exactly like a browser would — no fake transport, no injected provider.
+The test suite spins up this app's real HTTP server on an ephemeral loopback port and drives it
+with `fetch`, exactly like a browser would — no fake transport, no injected provider, no
+credential.
 
 This app's own `typecheck` and `build` resolve every `@relvo-labs/*` import through the real
-`node_modules` package resolution pnpm sets up from this app's declared `dependencies` — the
-same path an external consumer's own project would take, through each package's published
-`exports` map to its **built** `dist/*.d.ts`/`dist/*.js`. There is deliberately no TypeScript
-`paths` alias into any package's `src/`: issue #14 explicitly forbids "TS path aliases to SDK
-source" and "workspace-link-only proof" for this application, precisely so that a type error
-only visible in a package's _published_ declarations (a missing export, a masked type) cannot
-be hidden by a shortcut that reads the source tree instead. This means **`pnpm build` at the
-repository root must run before either command** — without it, `node_modules/@relvo-labs/*`
-resolves to a package whose `dist/` does not exist yet, and both commands fail with a
-"Cannot find module" error. `pnpm --filter @relvo-labs/reference-app build` is a genuine
-compile (`tsc -p tsconfig.build.json`, `noEmit: false`) that emits runnable JS to a local,
-git-ignored `dist/` — not merely an alias for `typecheck` — proving this app's TypeScript
-actually compiles against the SDK's real, published shape. Running the app (`pnpm start`)
+`node_modules` package resolution pnpm sets up from this app's declared `dependencies` — the same
+path an external consumer's own project would take, through each package's published `exports`
+map to its **built** `dist/*.d.ts`/`dist/*.js`. There is deliberately no TypeScript `paths` alias
+into any package's `src/`: issue #14 explicitly forbids "TS path aliases to SDK source" and
+"workspace-link-only proof" for this application. This means **`pnpm build` at the repository
+root must run before either command** — without it, `node_modules/@relvo-labs/*` resolves to a
+package whose `dist/` does not exist yet, and both commands fail with a clear "Cannot find
+module" error, not a silent fallback to source. `pnpm --filter @relvo-labs/reference-app build`
+is a genuine compile (`tsc -p tsconfig.build.json`, `noEmit: false`) that emits runnable JS to a
+local, git-ignored `dist/` — not merely an alias for `typecheck`. Running the app (`pnpm start`)
 still executes the `.ts` sources directly under Node's own native TypeScript support (see
-[Packaging](#packaging) below); `dist/` from `pnpm build` is a correctness proof, not what
-`start` runs.
+[Packaging](#packaging) below); `dist/` from `pnpm build` is a correctness proof, not what `start`
+runs.
+
+### Packed-tarball installation proof
+
+```bash
+pnpm app-pack:check    # tools/repo/check-app-pack.ts
+```
+
+Packs all eight SDK packages, copies this app's `src/`/`public/` (never a workspace symlink) into
+an isolated scratch consumer whose `node_modules` resolves every `@relvo-labs/*` import to those
+tarballs with a clean pnpm store, typechecks and builds it there, then starts the built app for
+real and drives a full scripted `open → turn → advance-script → close` HTTP lifecycle against it.
+This is wired into `pnpm gate` (step `app-pack`, after `build`/`app-build`/`artifacts`).
+
+### Real-browser check (not part of the canonical gate)
+
+```bash
+PLAYWRIGHT_CHROMIUM_EXECUTABLE=/path/to/chrome pnpm --filter @relvo-labs/reference-app browser-check
+```
+
+Drives a genuinely running instance of this app with `playwright-core` (a devDependency; no
+browser download — see the `pnpm-workspace.yaml` catalog comment) against a **host-supplied**
+Chromium/Chrome executable. Asserts, in a real browser: hostile prompt text renders as literal
+text and never executes or becomes an element (a real XSS check, not a unit-test approximation);
+**Close session** is reachable and activatable by keyboard alone; the page has no horizontal
+overflow at a 375×812 mobile viewport. Missing the executable path is a clear, immediate failure,
+never a silent skip — this check is intentionally **not** part of `pnpm gate` (a browser binary
+is not something this workspace installs, and the canonical gate must stay deterministic and
+environment-independent; see `.agents/skills/local-ci-parity/SKILL.md`). The coordinator's own
+independent desktop/mobile browser pass is separate from, and does not depend on, this command.
 
 ## What this app is (and is not)
 
-- One active session and one active run at a time, exactly as `AgentExecutor` models it.
+- **One active session at a time**, enforced server-side (`src/session-admission.ts`): a second,
+  distinct `open_session` attempt is rejected with `409 session_already_open` while one is open;
+  an exact retry of the same in-flight or already-open attempt is still admitted (the runtime's
+  own idempotent receipt handling answers it, unaffected by this app's admission policy). The
+  slot self-heals — a session that fails or is closed by any path frees it for the next open.
   Multiple sequential turns on the same session retain the provider conversation.
-- A **consumer-owned** transport: the HTTP/JSON/SSE server in `src/` is this app's own code,
-  not an SDK package. A consumer is free to replace it with gRPC, WebSockets, or whatever
-  fits their stack — the only requirement the SDK itself imposes is calling
-  `AgentExecutor`'s command/read/subscribe methods correctly.
-- Not a file browser, code editor, terminal, scheduler, workflow builder, or multi-tenant
-  admin surface. It is intentionally minimal.
+- A **consumer-owned** transport: the HTTP/JSON/SSE server in `src/` is this app's own code, not
+  an SDK package. A consumer is free to replace it with gRPC, WebSockets, or whatever fits their
+  stack — the only requirement the SDK itself imposes is calling `AgentExecutor`'s
+  command/read/subscribe methods correctly.
+- Not a file browser, code editor, terminal, scheduler, workflow builder, or multi-tenant admin
+  surface. It is intentionally minimal.
 
 ## Two lanes
 
-### 1. Credential-free scripted demo (default, and the only lane implemented so far)
+### 1. Credential-free scripted demo (default)
 
 `providerId: "scripted-demo"` is the SDK's own public deterministic test double
-(`createScriptedProvider` from `@relvo-labs/agent-provider/testing`), run through the exact
-same `AgentExecutor`/`AgentRuntime` and the exact same HTTP/SSE transport as any other
-provider would be. It proves **this application and the runtime are wired together
-correctly** — command → receipt → event → projection → cleanup — end to end. It does **not**
-prove anything about a real model provider: there is no network call, no model, and no
-meaningful cancellation semantics (the response is a canned, deterministic script). The UI
-labels this lane accordingly, and the provider's capability descriptor reports
-`approval`/`question`/`recovery` as unsupported so the UI never offers a control the demo
-cannot honour.
+(`createScriptedProvider` from `@relvo-labs/agent-provider/testing`), run through the exact same
+`AgentExecutor`/`AgentRuntime` and the exact same HTTP/SSE transport as any other provider would
+be. It proves **this application and the runtime are wired together correctly** — command →
+receipt → event → projection → cleanup — end to end. It does **not** prove anything about a real
+model provider: there is no network call, no model. The UI labels this lane accordingly, and the
+provider's capability descriptor reports `approval`/`question`/`recovery` as unsupported so the
+UI never offers a control the demo cannot honour.
 
-The scripted provider never advances on its own — that is the point of a deterministic
-double for testing. This app's backend calls the provider's public `controller.drain()`
-exactly once, right after a command that could make a run progress (`submit_turn`,
-`interrupt_run`). Because the default script is short, a run typically reaches its terminal
-state before the HTTP response for `submit_turn` even returns; clicking **Interrupt run**
-against this lane will usually — truthfully — report `delivered: false` (the run was already
-over). Genuinely _in-flight_ interruption is real runtime behaviour, exercised directly
-against the scripted controller in this app's test suite (bypassing the auto-drain a human
-clicking the UI would experience) rather than as a friendly UI demo — see `progress.md` for
-the adversarial-test follow-up that expands this.
+**The scripted provider never paces itself.** This app's backend never calls the provider's
+public `controller.drain()` automatically after `submit_turn`/`interrupt_run` — doing so would
+let a run reach a terminal state before an HTTP response even returns, making genuine in-flight
+interruption impossible to demonstrate through the transport. Instead, `POST
+/api/sessions/:id/advance-script` (the UI's **Advance script** button, shown only when the open
+session is using this provider) is the one, clearly-labelled affordance that calls `drain()`. This
+means:
 
-### 2. Opt-in real Codex / Claude profiles — not implemented yet
+- Right after **Send turn**, the run genuinely sits in `running` — undrained, no events yet — for
+  as long as you like. **Interrupt run** against it is a real, `delivered: true` in-flight
+  interrupt, not the `delivered: false` "it was already over" you get from interrupting an
+  already-terminal run (also demonstrable: interrupt again after the run finished).
+- **Send a message that fails (scripted demo)** submits a fixed trigger phrase
+  (`SCRIPTED_FAILURE_TRIGGER_TEXT` in `src/providers/scripted.ts`) whose script ends in a real
+  `fail` step — clicking **Advance script** afterwards drives it to a genuine `run.finished`
+  failure with a real, specific error, never an invented envelope.
+- A subsequent turn on the same session works immediately after an interrupt — interrupting a run
+  never ends the session.
 
-The full issue asks for both an opt-in Codex profile (host-installed `codex-cli`, read-only
-sandbox) and an opt-in Claude profile (host-installed `@anthropic-ai/claude-agent-sdk` optional
-peer, `plan` permission mode), sharing this same UI and transport, each requiring separately
-supplied host credentials/authentication and each making the setup-vs-real distinction
-explicit (no silent fallback to the scripted lane on a real-provider error). **This checkpoint
-does not yet wire either profile.** `src/runtime-factory.ts` registers only the scripted-demo
-provider today; adding a provider is registering it alongside the scripted one and giving the
-UI a way to select it — the transport and UI code already treat `providerId` and its
-capability descriptor generically. This is tracked as the next stage of this work.
+### 2. Opt-in real Codex / Claude profiles
+
+Both are **opt-in and off by default** — the canonical gate and this app's default first run stay
+credential-free. Enabling one only _registers_ the adapter; it supplies no credential and reads
+none itself (see `src/providers/codex.ts` / `src/providers/claude.ts`). Authentication is entirely
+host-side, resolved by the adapter/SDK itself from the process environment — this app never
+guesses, stores, or forwards one:
+
+- **Codex** — `REFERENCE_APP_ENABLE_CODEX=1`, optionally `CODEX_EXECUTABLE=/path/to/codex`
+  (defaults to `codex` on `PATH`). Sandbox mode is fixed at the conservative `read-only`. The
+  spawned `codex app-server --stdio` process inherits this Node process's environment, so
+  whatever the host already configured — an interactive `codex login` session under `CODEX_HOME`
+  (default `~/.codex`), or `CODEX_API_KEY`/`CODEX_ACCESS_TOKEN` for non-interactive use — is what
+  Codex itself resolves. Compatibility baseline: **codex-cli 0.153.4**. Live docs read during
+  implementation: <https://developers.openai.com/codex/auth>,
+  <https://developers.openai.com/codex/environment-variables>.
+- **Claude** — `REFERENCE_APP_ENABLE_CLAUDE=1`, optionally `REFERENCE_APP_CLAUDE_MODEL=<model id>`
+  (defaults to `claude-sonnet-4-6`, this repository's own documented example model). Permission
+  mode is fixed at the conservative `plan` — never `acceptEdits`/`bypassPermissions`. Requires the
+  host-installed optional peer `@anthropic-ai/claude-agent-sdk@0.3.259`
+  (`pnpm add @anthropic-ai/claude-agent-sdk@0.3.259`); without it, `open_session` rejects with a
+  retryable `provider_unavailable` naming the package — never a silent fallback to the scripted
+  lane. The SDK itself reads `ANTHROPIC_API_KEY` (or an alternative provider's env flags — Bedrock,
+  the Claude Platform on AWS, Vertex, Foundry) from this process's environment; this app never
+  touches it. Live docs read during implementation:
+  <https://code.claude.com/docs/en/agent-sdk/quickstart>.
+
+```bash
+REFERENCE_APP_ENABLE_CODEX=1 REFERENCE_APP_ENABLE_CLAUDE=1 pnpm --filter @relvo-labs/reference-app start
+```
+
+Both adapters share this app's UI/transport unchanged: `providerId` and its capability descriptor
+are handled generically (see `updateCapabilitySummary` in `public/app.js`), so the UI never fakes
+symmetry — the **Advance script** button, for example, is hidden for a real profile because a real
+adapter paces itself. A missing executable/peer is a clean, retryable `open_session` rejection,
+proven in `test/reference-app-cleanup.test.ts` without any credential (a nonexistent
+`codexExecutable` override; the Claude peer's genuine absence from this workspace's own
+`node_modules`, which the repository's own `check-static.ts` already keeps enforced — see
+`.agents/skills/provider-adapter-development/SKILL.md`). **Actually completing a turn against a
+live, credentialed model is a separate, manually-authorized exercise, outside this app's automated
+tests and outside the canonical gate** — record that evidence (exact SDK/app commit, CLI/SDK
+version, provider, success/failure/interrupt/cleanup observations, platform limits) in a matrix
+kept outside this repository; mark any unrun lane **not verified**, never pass.
 
 ## Architecture
 
 ```
 public/            plain HTML + CSS + vanilla JS browser UI (no build step, no framework)
 src/
-  config.ts          environment → typed config (loopback host, port, workspace base dir, body cap)
-  runtime-factory.ts  composition root: createLocalWorkspaceProvider + createAgentRuntime + providers
+  config.ts             environment → typed config (loopback host/port, workspace base, real-profile opt-in)
+  runtime-factory.ts     composition root: createLocalWorkspaceProvider + createAgentRuntime + providers
+  session-admission.ts   server-side "one active session" enforcement, retry-safe
   providers/
-    scripted.ts        the scripted-demo provider's fixed script and identity
-  commands.ts          narrow, typed extraction of the few fields this app accepts from a request body
+    scripted.ts            the scripted-demo provider's fixed scripts (default, failure, burst-for-tests) and identity
+    codex.ts, claude.ts     opt-in real-profile wrappers (conservative defaults; no auth logic)
+  commands.ts            narrow, typed, strict-allowlist extraction of request-body fields
   http/
-    routes.ts            the one place an HTTP request becomes an AgentExecutor call
-    security.ts           Host/Origin/anti-CSRF checks (see Security below)
-    json-body.ts          bounded, content-type-checked JSON body reading
-    sse.ts                 SubscriptionMessage → `data: <json>\n\n` framing, disconnect handling
-    static-assets.ts       fixed allowlist of exact pathnames → files (no path-traversal surface)
-  app.ts               wires config + runtime + HTTP server into one start/stop object
+    routes.ts               the one place an HTTP request becomes an AgentExecutor call
+    security.ts             Host(+port)/Origin/anti-CSRF checks + baseline response headers
+    json-body.ts             bounded, content-type-checked JSON body reading
+    query.ts                 strict (non-truncating) query-parameter parsing
+    sse.ts                   SubscriptionMessage → `data: <json>\n\n` framing, backpressure, deadline, disconnect handling
+    static-assets.ts         fixed allowlist of exact pathnames → files (no path-traversal surface)
+  app.ts               wires config + runtime + HTTP server into one start/stop object; graceful SSE-aware shutdown
   server.ts            process entry point (env config, SIGINT/SIGTERM → clean shutdown)
+scripts/
+  browser-check.ts     real-browser Playwright check (see above; not part of `pnpm gate`)
 test/
-  reference-app.test.ts  end-to-end HTTP/SSE contract test against the real server
+  helpers.ts                        shared real-HTTP/SSE test harness
+  reference-app.test.ts             core lifecycle, admission, strict-field/security matrix
+  reference-app-interrupt.test.ts   genuine in-flight interrupt, subsequent turn, scripted failure
+  reference-app-reconnect.test.ts   overflow + backfill, reconnect-without-replay, disconnect-vs-cancel
+  reference-app-cleanup.test.ts     cleanup-failure retry, shutdown+open-SSE, missing-provider setup failure
 tsconfig.json         typecheck project (noEmit); no `paths` — resolves via real node_modules
 tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsconfig.json
 ```
@@ -148,113 +224,125 @@ tsconfig.build.json    build project (emits to dist/, git-ignored); extends tsco
 ### Integration walkthrough (what the code actually does)
 
 1. **Compose.** `runtime-factory.ts` builds a `WorkspaceProvider` via `createLocalWorkspaceProvider`
-   (owning a base directory this app controls) and an `AgentRuntime` via `createAgentRuntime`,
-   registering the scripted-demo provider. `@relvo-labs/agent-runtime` never imports a concrete
-   provider — this file is where composition happens, exactly as the SDK's package boundaries
-   require.
+   and an `AgentRuntime` via `createAgentRuntime`, registering the scripted-demo provider plus any
+   opt-in real profile. `@relvo-labs/agent-runtime` never imports a concrete provider — this file
+   is where composition happens.
 2. **`listProviders()`** — `GET /api/providers` — returns each registered provider's capability
-   descriptor verbatim, so the UI can show an honest capability summary rather than assuming
-   symmetry between providers.
-3. **`openSession`** — `POST /api/sessions { commandId, providerId }` — the browser supplies only
-   a caller-generated `commandId` and a `providerId` from the allowlist above; this app always
-   supplies `workspace: { kind: "managed" }` itself (a browser can never name a path or borrow
-   an existing directory) and forwards no `providerOptions` from the request body.
-4. **`subscribe`** — `GET /api/sessions/:id/subscribe?fromSequence=0` — replay-then-live, framed
-   as SSE. The browser does not use `EventSource` (it cannot attach the anti-CSRF header this
-   transport requires); it reads the identical wire format from a `fetch()` response body.
-   Disconnecting (closing the tab, `AbortController.abort()`) triggers this app's own
-   `request.on('close', …)` handler, which calls `subscription.close()` — releasing the
-   runtime's bounded per-subscriber buffer without touching the run itself.
-5. **`submitTurn`** — `POST /api/sessions/:id/turns { commandId, text }` — the one piece of free
-   text this app ever accepts. The receipt's `turnId`/`runId` and every subsequent event are
-   the SDK's own identifiers; this app never mints or fabricates one.
-6. **`interruptRun`** — `POST /api/sessions/:id/runs/:runId/interrupt` — reports whatever the SDK
-   reports, including a truthful `delivered: false` for an already-terminal run (see
-   [Lanes](#two-lanes)).
-7. **`closeSession`** — `POST /api/sessions/:id/close` — disposes the provider session and
-   releases the managed workspace lease; a failed cleanup is retryable with the same
-   `commandId` and is never hidden behind a false success.
-8. **`getSession` / `readEvents`** — `GET /api/sessions/:id` and `GET /api/sessions/:id/events` —
+   descriptor verbatim.
+3. **`openSession`** — `POST /api/sessions { commandId, providerId }` — strictly only these two
+   fields (`src/commands.ts#readKnownFields`; an extra `workspace`/`providerOptions` key is
+   rejected outright, not silently dropped). Blocked with `409` while another session is open
+   (see [above](#what-this-app-is-and-is-not)). This app always supplies
+   `workspace: { kind: "managed" }` itself.
+4. **`subscribe`** — `GET /api/sessions/:id/subscribe?fromSequence=&bufferSize=&overflowPolicy=`
+   — replay-then-live SSE. The browser does not use `EventSource` (it cannot attach the anti-CSRF
+   header this transport requires); it reads the identical wire format from a `fetch()` response
+   body, applying real backpressure (never pulling the next event until the previous write has
+   actually drained, bounded by a write deadline). An `overflow` message is backfilled via
+   `readEvents(fromSequence)` and the stream is reopened from the client's own last-consumed
+   sequence — never from 0, so nothing is duplicated. **Disconnect stream**/**Reconnect stream**
+   let you demonstrate this deliberately; disconnecting never cancels the run. A 404 (e.g. after a
+   backend restart) resets the UI visibly rather than hanging — reconnect is not durable provider
+   resume.
+5. **`submitTurn`** — `POST /api/sessions/:id/turns { commandId, text }`.
+6. **`POST /api/sessions/:id/advance-script`** — the scripted lane's explicit pacing affordance
+   (see [Lane 1](#1-credential-free-scripted-demo-default)); `400` if the session's provider isn't
+   the scripted one.
+7. **`interruptRun`** — `POST /api/sessions/:id/runs/:runId/interrupt` — reports whatever the SDK
+   reports, including a truthful `delivered: false` for an already-terminal run and `true` for a
+   genuine in-flight one.
+8. **`closeSession`** — `POST /api/sessions/:id/close` — disposes the provider session and
+   releases the managed workspace lease. `closeSession` **rejects its promise** (not a
+   `disposition: "rejected"` receipt) when cleanup fails, exactly so the same `commandId` retries
+   the same logical attempt; this app answers that as a typed `503` JSON error naming the real,
+   retryable cause (never a silent 200, never a generic 500) — see `callRuntimeCommand` in
+   `src/http/routes.ts`.
+9. **`getSession` / `readEvents`** — `GET /api/sessions/:id` and `GET /api/sessions/:id/events` —
    the same projections and durable history any consumer can read independent of a live
-   subscription.
-9. **Process shutdown** (`Ctrl-C`) calls `AgentRuntime#shutdown()`, which stops new admissions,
-   drains in-flight commands, closes every open session (interrupting any active run per its
-   `ifRunActive` policy), and only then releases the HTTP server.
+   subscription. Query values (`fromSequence`, `bufferSize`) are parsed strictly — `"1junk"` or
+   `"1.5"` are rejected outright, never silently truncated to `1` the way `Number.parseInt` would.
+10. **Process shutdown** (`Ctrl-C`, or `app.close()` in tests) calls `AgentRuntime#shutdown()`
+    first, then gives every open SSE pipe a bounded grace period to end its own response normally
+    (never destroying a live stream out from under its own cleanup), before closing the server.
 
-Every command sent to the runtime includes an explicit `type` field and a caller-generated,
-unique `commandId` — see `src/commands.ts` and `src/http/routes.ts`. A retried `commandId` with
-the same payload returns the original `disposition: "duplicate"` receipt; a retried `commandId`
-with a different payload returns `disposition: "rejected"`, `error.code: "command_id_conflict"`
-— never a silent second effect. This app's own test suite exercises both cases against the
-real runtime.
+Every command sent to the runtime includes an explicit `type` field and a caller-generated, unique
+`commandId`. A retried `commandId` with the same payload returns the original
+`disposition: "duplicate"` receipt; a retried `commandId` with a different payload returns
+`disposition: "rejected"`, `error.code: "command_id_conflict"` — never a silent second effect.
 
 ## Security
 
-This app binds **loopback only** (`127.0.0.1`, never `0.0.0.0`) and treats "it's on localhost"
-as necessary, not sufficient. Every request is checked, in order:
+This app binds **loopback only** (`127.0.0.1`, never `0.0.0.0`) and treats "it's on localhost" as
+necessary, not sufficient. Every request is checked, in order:
 
-1. **Host allowlist** — the `Host` header must name `127.0.0.1`, `localhost`, or `::1`.
-   Rejects DNS rebinding: a public name that resolves to the loopback address still fails
-   this check, because its `Host` header does not match.
+1. **Host allowlist + exact port** — the `Host` header's hostname must be `127.0.0.1`,
+   `localhost`, or `::1`, **and** its port must equal this server's own actual bound port (read
+   back after `listen()`, not the requested configuration value — `port: 0` picks an ephemeral
+   one). Checking only the hostname would accept a request whose `Host` header names a different
+   port than the one actually serving it.
 2. **Origin equality** — when an `Origin` header is present, it must equal `http://` + the
-   request's own `Host` header exactly. Rejects a cross-origin page's `fetch` even though it
-   reached the right address.
+   request's own `Host` header exactly.
 3. **Anti-CSRF header** — every `/api/*` request (including the SSE stream, since prompt/output
    text is treated as potentially sensitive) must carry a fixed custom header
    (`x-relvo-reference-app: 1`). A cross-origin `fetch` cannot add this header without a CORS
-   preflight this server never grants (no `Access-Control-Allow-Origin` response header is
-   ever sent); a plain HTML form or navigation cannot add a custom header at all.
+   preflight this server never grants (no `Access-Control-Allow-Origin` response header is ever
+   sent); a plain HTML form or navigation cannot add a custom header at all.
 
 Additional server-side controls, independent of the above:
 
-- **Bounded request bodies** (`REFERENCE_APP_...` default 64 KiB; the test suite configures a
-  smaller cap and asserts `413` past it) and a `content-type: application/json` check.
-- **No arbitrary workspace path, executable, or unrestricted `providerOptions` from the
-  browser** — `workspace` is always `{ kind: "managed" }`, decided by this app, never by the
-  request body (see `src/http/routes.ts`).
-- **Safe rendering** — the browser UI only ever assigns untrusted text (prompts, assistant
-  output, tool names, error messages) via `Node.textContent` / `Text.data`. Nothing is ever
-  parsed or inserted as HTML.
-- **No secrets in the browser** — this checkpoint's only lane never holds a credential in the
-  first place. When the real provider profiles are added, credentials remain host-side only
-  (environment / provider-native config), never sent to or readable from the browser.
-- **Static assets served from a fixed allowlist** of exact pathnames (`src/http/static-assets.ts`)
-  — never by joining a request path onto a directory, so there is no path-traversal surface to
-  get wrong.
+- **Strict, allowlisted request bodies** — an unrecognised field (e.g. a client attempting to
+  smuggle `workspace`/`providerOptions`/an executable path) is rejected outright with `400`, never
+  silently ignored (`readKnownFields` in `src/commands.ts`). Path parameters (`sessionId`,
+  `runId`) are validated against the SDK's own `SessionIdSchema`/`RunIdSchema` before ever
+  reaching the runtime.
+- **Strict, non-truncating numeric parsing** for every query value (`src/http/query.ts`) —
+  `Number.parseInt` is never used in this app.
+- **Bounded request bodies** (default 64 KiB; the test suite configures a smaller cap and asserts
+  `413` past it), a `content-type: application/json` check, and a bounded request URI length.
+- **Baseline response headers** on every answer: `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a restrictive
+  `Content-Security-Policy`. Never a wildcard or reflected CORS header.
+- **Bounded SSE transport**: real backpressure (never buffering unboundedly ahead of a slow
+  client) and a write deadline (a genuinely dead peer is released, not waited on forever); release
+  tied to the _response_'s own lifecycle (`response.on('close')`), not the request's.
+- **No arbitrary workspace path, executable, or unrestricted `providerOptions` from the browser** —
+  `workspace` is always `{ kind: "managed" }`, decided by this app, never by the request body.
+- **Safe rendering** — the browser UI only ever assigns untrusted text (prompts, assistant output,
+  tool names, error messages) via `Node.textContent` / `Text.data`. Verified in a real browser by
+  `scripts/browser-check.ts`, not only asserted in a unit test.
+- **No secrets in the browser, ever** — the scripted lane never holds a credential; the real
+  profiles' credentials are resolved by the adapter/SDK directly from the host environment and are
+  never read, stored, or forwarded by this app, let alone sent to the browser.
+- **Static assets served from a fixed allowlist** of exact pathnames — never by joining a request
+  path onto a directory.
 
 See the root [`SECURITY.md`](../../SECURITY.md) for the SDK-wide security model this app builds on.
 
 ## Packaging
 
-This app is **private** (`"private": true`, no `publishConfig`) and is never built or packed by
-the root `pnpm build` script (which filters to `./packages/*` only) or included in any SDK
-tarball. `pnpm start`/`pnpm dev` run the `.ts` sources under Node's own native TypeScript
-support directly (no bundler, no separate compile step needed to execute) — this is accurate
-and intentional for a small app with no declaration to publish, and is documented here rather
-than left implicit. This app's own `typecheck` and `build` scripts are a **separate, real**
-compile step (see [above](#running-the-tests-typecheck-and-build)) that proves the source
-compiles against the SDK's actual installed, built declarations — never a source-tree shortcut.
+This app is **private** (`"private": true`, no `publishConfig`) and is never built or packed by the
+root `pnpm build` script (which filters to `./packages/*` only) or included in any SDK tarball.
+`pnpm start`/`pnpm dev` run the `.ts` sources under Node's own native TypeScript support directly
+(no bundler, no separate compile step needed to execute). This app's own `typecheck`/`build`
+scripts and `pnpm app-pack:check` (see [above](#packed-tarball-installation-proof)) are the
+progressively stronger proofs that this app's TypeScript compiles, and runs, against the SDK's
+real, published, packed shape — never a source-tree shortcut.
 
-Neither of the above is the same as the issue's stronger packaging acceptance item: installing
-this app into an **isolated consumer** — a clean pnpm store, transitive dependencies resolved
-only from packed tarballs, no workspace resolution (built _or_ source) at all — the way
-`tools/repo/check-artifacts.ts` already does for `examples/consumer-smoke`. That is tracked as
-pending follow-up work and is **not** wired yet.
-
-This app's own **test suite** (`pnpm --filter @relvo-labs/reference-app test`) is a different
-case again: it runs under Vitest, which — like every package's own `test/` suite in this
-monorepo (`packages/*/test`) — resolves workspace dependencies to source via the shared root
+This app's own **test suite** (`pnpm --filter @relvo-labs/reference-app test`) is a different case
+again: it runs under Vitest, which — like every package's own `test/` suite in this monorepo
+(`packages/*/test`) — resolves workspace dependencies to source via the shared root
 `vitest.config.ts` `resolve.alias`, for fast iteration. That alias is repository-wide
-infrastructure this app does not own or extend, and using it for this app's _own_ tests follows
-the same convention every other package's tests already use; it is not the "TS path alias to
-SDK source" the issue prohibits for this app's _consumer-facing_ typecheck/build, which now
-resolves exclusively through real package installs as documented above.
+infrastructure this app does not own or extend, and using it for this app's _own_ tests follows the
+same convention every other package's tests already use; it is not the "TS path alias to SDK
+source" the issue prohibits for this app's _consumer-facing_ typecheck/build.
 
-## What's next (tracked, not yet in this checkpoint)
+## Known limits (by design)
 
-See `progress.md` in the issue's control directory for the exact list. In short: opt-in
-Codex/Claude profiles; the full adversarial test matrix (duplicate/conflict edge cases beyond
-the one already covered, controlled in-flight interrupt via the scripted controller directly,
-reconnect/replay/overflow-backfill, missing-provider and cleanup-failure-retry paths, the full
-Host/Origin/CSRF/shape/size negative matrix); packed-tarball installation proof; a scripted
-end-to-end browser test command; and a manual real-provider evidence matrix.
+- Default in-memory history survives a browser reconnect only while the same backend process
+  lives; a backend restart loses it (a fresh `open_session` starts over) — this is not durable
+  provider resume.
+- `awaiting_interaction` is not exercised: neither the scripted lane (approval/question disabled
+  on purpose) nor Codex/Claude support interaction bridging today, so there is no
+  `respond_to_interaction` route.
+- One session, one active run at a time, by this app's own product policy — the SDK itself does
+  not impose that limit.

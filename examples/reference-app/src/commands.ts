@@ -30,6 +30,24 @@ function asRecord(body: unknown): Record<string, unknown> | undefined {
 }
 
 /**
+ * Strict allowlist: a request body containing any key outside `allowed` is
+ * rejected outright, rather than having the unrecognised key silently
+ * discarded. A silently-ignored `workspace`, `providerOptions`, `executable`
+ * or similar key is exactly the shape a client would use to *probe* for an
+ * escalation this app does not intend to grant; failing loudly on the first
+ * probe is the point, not merely tolerating it harmlessly.
+ */
+export function readKnownFields(body: unknown, allowed: readonly string[]): FieldResult<Record<string, unknown>> {
+  const record = asRecord(body);
+  if (record === undefined) return err('request body must be a JSON object');
+  const extra = Object.keys(record).filter((key) => !allowed.includes(key));
+  if (extra.length > 0) {
+    return err(`request body contains unexpected field(s): ${extra.join(', ')}`);
+  }
+  return ok(record);
+}
+
+/**
  * Caller-generated command identity. Validated against the SDK's own schema
  * so this app's notion of "a valid command id" can never drift from the
  * runtime's — the alternative is a second regex quietly going stale.

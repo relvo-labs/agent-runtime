@@ -8,12 +8,21 @@
 const CSRF_HEADER_NAME = 'x-relvo-reference-app';
 const CSRF_HEADER_VALUE = '1';
 
-/** @type {{ sessionId: string | null, currentRunId: string | null, abortController: AbortController | null, assistantNode: Text | null }} */
+// Must match `SCRIPTED_FAILURE_TRIGGER_TEXT` in `src/providers/scripted.ts`.
+// Duplicated rather than fetched: it is demo-only convenience text, not a
+// protocol value, and this keeps the browser shell dependency-free.
+const SCRIPTED_FAILURE_TRIGGER_TEXT = 'trigger scripted failure';
+
 const state = {
   sessionId: null,
+  providerId: null,
   currentRunId: null,
+  currentRunState: null,
+  lastConsumedSequence: 0,
   abortController: null,
   assistantNode: null,
+  /** key -> { commandId, fingerprint } — see `submitCommand` below. */
+  pendingCommands: new Map(),
 };
 
 const el = {
@@ -28,8 +37,12 @@ const el = {
   connectionError: document.getElementById('connection-error'),
   turnInput: document.getElementById('turn-input'),
   sendTurnButton: document.getElementById('send-turn-button'),
+  sendFailingTurnButton: document.getElementById('send-failing-turn-button'),
+  advanceScriptButton: document.getElementById('advance-script-button'),
   interruptButton: document.getElementById('interrupt-button'),
   closeSessionButton: document.getElementById('close-session-button'),
+  disconnectButton: document.getElementById('disconnect-button'),
+  reconnectButton: document.getElementById('reconnect-button'),
   transcript: document.getElementById('transcript'),
   inspectorPanel: document.getElementById('inspector-panel'),
   inspectorLog: document.getElementById('inspector-log'),
@@ -84,6 +97,11 @@ function appendAssistantDelta(text) {
   el.transcript.scrollTop = el.transcript.scrollHeight;
 }
 
+/**
+ * Bare HTTP wrapper. Throws on a genuine transport failure (network error,
+ * abort); a well-formed HTTP response of any status is always returned, never
+ * thrown, because a 4xx/5xx JSON body is this app answering, not failing to.
+ */
 async function api(path, options = {}) {
   const headers = { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE, ...(options.headers ?? {}) };
   if (options.body !== undefined) headers['content-type'] = 'application/json';
@@ -96,6 +114,33 @@ async function api(path, options = {}) {
     body = { error: { code: 'invalid_response', message: 'the server sent a response this page could not parse' } };
   }
   return { status: response.status, body };
+}
+
+/**
+ * Issues one *command* (open/turn/interrupt/close), preserving the same
+ * caller-generated `commandId` across a retry of the *same* payload — an
+ * ambiguous transport failure (this function throwing) must be retryable
+ * without risking a second effect — while a *changed* payload (different
+ * text, different target) always gets a fresh id, because that is a new
+ * intent, not a retry of the old one. The id is retired the moment any
+ * definite HTTP response comes back (even a rejected receipt): only a
+ * genuine network failure leaves it pending for a caller-triggered retry.
+ */
+async function submitCommand(key, payload, send) {
+  const fingerprint = JSON.stringify(payload);
+  const existing = state.pendingCommands.get(key);
+  const commandId = existing && existing.fingerprint === fingerprint ? existing.commandId : genCommandId(key);
+  state.pendingCommands.set(key, { commandId, fingerprint });
+  try {
+    const result = await send(commandId);
+    state.pendingCommands.delete(key);
+    return result;
+  } catch (error) {
+    // Left in place on purpose: a caller-triggered retry of this exact
+    // intent will reuse `commandId`. Cleared explicitly by `retry()` below
+    // only once the caller gives up.
+    throw error;
+  }
 }
 
 function runIsActive(runState) {
@@ -145,52 +190,90 @@ function updateCapabilitySummary(descriptor) {
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
+function resetSessionUi() {
+  state.sessionId = null;
+  state.providerId = null;
+  state.currentRunId = null;
+  state.currentRunState = null;
+  state.lastConsumedSequence = 0;
+  state.assistantNode = null;
+  state.abortController?.abort();
+  state.abortController = null;
+  el.sessionPanel.hidden = true;
+  el.transcript.textContent = '';
+  el.sessionIdBadge.textContent = '—';
+  el.sessionStateBadge.textContent = '—';
+  el.runStateBadge.hidden = true;
+  showBanner(el.connectionError, null);
+  el.openSessionButton.disabled = false;
+  el.advanceScriptButton.hidden = true;
+}
+
 async function openSession() {
   showBanner(el.setupError, null);
   el.openSessionButton.disabled = true;
   try {
-    const commandId = genCommandId('open');
     const providerId = el.providerSelect.value;
-    const { body } = await api('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({ commandId, providerId }),
-    });
+    const { status, body } = await submitCommand('open', { providerId }, (commandId) =>
+      api('/api/sessions', { method: 'POST', body: JSON.stringify({ commandId, providerId }) }),
+    );
+    if (status === 409) {
+      showBanner(el.setupError, body.error?.message ?? 'a session is already open');
+      el.openSessionButton.disabled = false;
+      return;
+    }
     appendInspectorEntry('receipt open_session', body.receipt ?? body);
     const receipt = body.receipt;
     if (receipt === undefined || receipt.disposition === 'rejected') {
       showBanner(el.setupError, receipt?.error?.message ?? body.error?.message ?? 'could not open a session');
+      el.openSessionButton.disabled = false;
       return;
     }
     state.sessionId = receipt.result.sessionId;
+    state.providerId = providerId;
     el.sessionIdBadge.textContent = state.sessionId;
     el.sessionStateBadge.textContent = 'opening';
     el.sessionPanel.hidden = false;
-    startSubscription(state.sessionId);
-  } finally {
+    el.advanceScriptButton.hidden = providerId !== 'scripted-demo';
+    setSessionControlsEnabled(true);
+    startSubscription(state.sessionId, 0);
+  } catch {
+    showBanner(el.setupError, 'could not reach the server — check your connection and try again');
     el.openSessionButton.disabled = false;
   }
 }
 
-function startSubscription(sessionId) {
+function startSubscription(sessionId, fromSequence) {
   state.abortController?.abort();
   const controller = new AbortController();
   state.abortController = controller;
-  void pumpSubscription(sessionId, controller.signal);
+  void pumpSubscription(sessionId, fromSequence, controller.signal);
 }
 
-async function pumpSubscription(sessionId, signal) {
+async function pumpSubscription(sessionId, fromSequence, signal) {
   let response;
   try {
-    response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subscribe?fromSequence=0`, {
-      headers: { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE },
-      signal,
-    });
-  } catch (error) {
+    response = await fetch(
+      `/api/sessions/${encodeURIComponent(sessionId)}/subscribe?fromSequence=${String(fromSequence)}`,
+      { headers: { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE }, signal },
+    );
+  } catch {
     if (signal.aborted) return;
     showBanner(el.connectionError, 'could not connect to the event stream');
     return;
   }
-  if (response.body === null) return;
+  if (response.status === 404) {
+    // The backend no longer knows this session id — most likely it restarted
+    // since this page loaded. Reconnect is NOT durable provider resume; be
+    // visible about it rather than hanging.
+    showBanner(el.setupError, 'this backend no longer recognises the open session (did it restart?) — open a new one.');
+    resetSessionUi();
+    return;
+  }
+  if (response.status !== 200 || response.body === null) {
+    showBanner(el.connectionError, 'could not open the event stream');
+    return;
+  }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -207,7 +290,7 @@ async function pumpSubscription(sessionId, signal) {
         for (const line of frame.split('\n')) {
           if (!line.startsWith('data:')) continue;
           const message = JSON.parse(line.slice('data:'.length).trim());
-          handleSubscriptionMessage(message);
+          await handleSubscriptionMessage(message);
         }
       }
     }
@@ -216,15 +299,14 @@ async function pumpSubscription(sessionId, signal) {
   }
 }
 
-function handleSubscriptionMessage(message) {
+async function handleSubscriptionMessage(message) {
   appendInspectorEntry(message.type, message);
-  if (message.type === 'caught_up') return;
+  if (message.type === 'caught_up') {
+    state.lastConsumedSequence = message.sequence;
+    return;
+  }
   if (message.type === 'overflow') {
-    showBanner(
-      el.connectionError,
-      `this subscription fell behind and lost ${String(message.undeliveredCount)} event(s) on the wire ` +
-        '(nothing was lost server-side — reopen the session to resume from the durable log).',
-    );
+    await backfillAfterOverflow(message);
     return;
   }
   if (message.type === 'closed') {
@@ -233,7 +315,13 @@ function handleSubscriptionMessage(message) {
     return;
   }
   // message.type === 'event'
-  const payload = message.event.payload;
+  applyEvent(message.event);
+}
+
+/** Renders one real event. Shared by live delivery and overflow backfill. */
+function applyEvent(event) {
+  state.lastConsumedSequence = Math.max(state.lastConsumedSequence, event.sequence);
+  const payload = event.payload;
   switch (payload.type) {
     case 'session.state_changed':
       el.sessionStateBadge.textContent = payload.to;
@@ -249,11 +337,10 @@ function handleSubscriptionMessage(message) {
       state.assistantNode = null;
       break;
     case 'run.state_changed':
+      state.currentRunState = payload.to;
       el.runStateBadge.hidden = false;
       el.runStateBadge.textContent = payload.to;
       el.interruptButton.disabled = !runIsActive(payload.to);
-      if (payload.to === 'running' || payload.to === 'starting')
-        state.currentRunId = message.event.runId ?? state.currentRunId;
       break;
     case 'run.message_delta':
       appendAssistantDelta(payload.text);
@@ -277,62 +364,157 @@ function handleSubscriptionMessage(message) {
     default:
       break;
   }
-  if (message.event.runId) state.currentRunId = message.event.runId;
+  if (event.runId) state.currentRunId = event.runId;
+}
+
+/**
+ * An `overflow` message means this stream fell behind and ended (the default
+ * policy). Nothing was lost server-side — the durable log still has every
+ * event — so this backfills exactly the missed range via `readEvents`, then
+ * reopens the subscription from where the backfill left off. No duplicated
+ * transcript: the backfilled range starts exactly at `droppedFromSequence`
+ * and nothing already rendered live is re-applied.
+ */
+async function backfillAfterOverflow(overflow) {
+  showBanner(
+    el.connectionError,
+    `this subscription fell behind and lost ${String(overflow.undeliveredCount)} event(s) on the wire ` +
+      '(nothing was lost server-side) — backfilling now…',
+  );
+  const { body } = await api(
+    `/api/sessions/${encodeURIComponent(state.sessionId)}/events?fromSequence=${String(overflow.droppedFromSequence - 1)}`,
+  );
+  for (const event of body.page?.events ?? []) applyEvent(event);
+  showBanner(el.connectionError, null);
+  startSubscription(state.sessionId, state.lastConsumedSequence);
 }
 
 function setSessionControlsEnabled(enabled) {
   el.sendTurnButton.disabled = !enabled;
+  el.sendFailingTurnButton.disabled = !enabled;
   el.turnInput.disabled = !enabled;
   el.closeSessionButton.disabled = !enabled;
+  el.disconnectButton.disabled = !enabled;
+  el.reconnectButton.disabled = enabled; // reconnect only makes sense once disconnected
   if (!enabled) el.interruptButton.disabled = true;
 }
 
-async function sendTurn() {
-  const text = el.turnInput.value.trim();
+async function sendTurnText(text) {
   if (text.length === 0 || state.sessionId === null) return;
-  const commandId = genCommandId('turn');
-  const { body } = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/turns`, {
-    method: 'POST',
-    body: JSON.stringify({ commandId, text }),
-  });
-  appendInspectorEntry('receipt submit_turn', body.receipt ?? body);
-  const receipt = body.receipt;
-  if (receipt?.disposition === 'rejected') {
-    showBanner(el.connectionError, receipt.error?.message ?? 'the turn was rejected');
-    return;
+  try {
+    const { body } = await submitCommand('turn', { sessionId: state.sessionId, text }, (commandId) =>
+      api(`/api/sessions/${encodeURIComponent(state.sessionId)}/turns`, {
+        method: 'POST',
+        body: JSON.stringify({ commandId, text }),
+      }),
+    );
+    appendInspectorEntry('receipt submit_turn', body.receipt ?? body);
+    const receipt = body.receipt;
+    if (receipt?.disposition === 'rejected') {
+      showBanner(el.connectionError, receipt.error?.message ?? 'the turn was rejected');
+      return;
+    }
+    showBanner(el.connectionError, null);
+    el.turnInput.value = '';
+    if (receipt?.result?.runId) state.currentRunId = receipt.result.runId;
+  } catch {
+    showBanner(el.connectionError, 'could not reach the server — the message was not sent. Try again.');
   }
-  showBanner(el.connectionError, null);
-  el.turnInput.value = '';
-  if (receipt?.result?.runId) state.currentRunId = receipt.result.runId;
+}
+
+async function sendTurn() {
+  await sendTurnText(el.turnInput.value.trim());
+}
+
+async function sendFailingTurn() {
+  await sendTurnText(SCRIPTED_FAILURE_TRIGGER_TEXT);
+}
+
+async function advanceScript() {
+  if (state.sessionId === null) return;
+  const { body } = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/advance-script`, { method: 'POST' });
+  appendInspectorEntry('advance-script', body.snapshot ?? body);
 }
 
 async function interruptRun() {
   if (state.sessionId === null || state.currentRunId === null) return;
-  const commandId = genCommandId('interrupt');
-  const { body } = await api(
-    `/api/sessions/${encodeURIComponent(state.sessionId)}/runs/${encodeURIComponent(state.currentRunId)}/interrupt`,
-    { method: 'POST', body: JSON.stringify({ commandId }) },
-  );
-  appendInspectorEntry('receipt interrupt_run', body.receipt ?? body);
+  try {
+    const { body } = await submitCommand(
+      'interrupt',
+      { sessionId: state.sessionId, runId: state.currentRunId },
+      (commandId) =>
+        api(
+          `/api/sessions/${encodeURIComponent(state.sessionId)}/runs/${encodeURIComponent(state.currentRunId)}/interrupt`,
+          {
+            method: 'POST',
+            body: JSON.stringify({ commandId }),
+          },
+        ),
+    );
+    appendInspectorEntry('receipt interrupt_run', body.receipt ?? body);
+  } catch {
+    showBanner(el.connectionError, 'could not reach the server — interrupt may not have been delivered. Try again.');
+  }
 }
 
 async function closeSession() {
   if (state.sessionId === null) return;
-  const commandId = genCommandId('close');
-  const { body } = await api(`/api/sessions/${encodeURIComponent(state.sessionId)}/close`, {
-    method: 'POST',
-    body: JSON.stringify({ commandId }),
-  });
-  appendInspectorEntry('receipt close_session', body.receipt ?? body);
-  setSessionControlsEnabled(false);
+  const sessionId = state.sessionId;
+  try {
+    const { status, body } = await submitCommand('close', { sessionId }, (commandId) =>
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/close`, {
+        method: 'POST',
+        body: JSON.stringify({ commandId }),
+      }),
+    );
+    if (status === 503) {
+      // A retryable cleanup failure. `closeSession` rejects its *promise*
+      // rather than persisting a receipt exactly for this case (see
+      // `callRuntimeCommand` in `src/http/routes.ts`), so no commandId was
+      // ever recorded server-side either way; a fresh click (a new
+      // commandId, already the case since `submitCommand` clears its own
+      // record on any definite HTTP answer, including this one) retries the
+      // same close cleanly.
+      appendInspectorEntry('close_session error', body.error ?? body);
+      showBanner(el.connectionError, `close failed and can be retried: ${body.error?.message ?? 'unknown error'}`);
+      return;
+    }
+    appendInspectorEntry('receipt close_session', body.receipt ?? body);
+    setSessionControlsEnabled(false);
+    resetSessionUi();
+  } catch {
+    showBanner(el.connectionError, 'could not reach the server — close may not have completed. Try again.');
+  }
+}
+
+function disconnectStream() {
+  state.abortController?.abort();
+  el.disconnectButton.disabled = true;
+  el.reconnectButton.disabled = false;
+  showBanner(
+    el.connectionError,
+    'disconnected from the event stream (the run itself is unaffected — reconnect any time).',
+  );
+}
+
+function reconnectStream() {
+  if (state.sessionId === null) return;
+  showBanner(el.connectionError, null);
+  el.disconnectButton.disabled = false;
+  el.reconnectButton.disabled = true;
+  startSubscription(state.sessionId, state.lastConsumedSequence);
 }
 
 window.addEventListener('beforeunload', () => state.abortController?.abort());
 
 el.openSessionButton.addEventListener('click', () => void openSession());
 el.sendTurnButton.addEventListener('click', () => void sendTurn());
+el.sendFailingTurnButton.addEventListener('click', () => void sendFailingTurn());
+el.advanceScriptButton.addEventListener('click', () => void advanceScript());
 el.interruptButton.addEventListener('click', () => void interruptRun());
 el.closeSessionButton.addEventListener('click', () => void closeSession());
+el.disconnectButton.addEventListener('click', disconnectStream);
+el.reconnectButton.addEventListener('click', reconnectStream);
 el.turnInput.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
@@ -340,4 +522,5 @@ el.turnInput.addEventListener('keydown', (event) => {
   }
 });
 
+setSessionControlsEnabled(false);
 void loadProviders();

@@ -18,9 +18,12 @@ export const GATE_STEPS: readonly GateStep[] = [
   { id: 'static', command: ['pnpm', 'static:check'] },
   { id: 'supply-chain', command: ['pnpm', 'supply-chain:check'] },
   { id: 'licenses', command: ['pnpm', 'licenses:check'] },
-  { id: 'tests', command: ['pnpm', 'test'] },
+  { id: 'tests', command: ['pnpm', 'test'] }, // includes examples/reference-app/test via vitest.config.ts's include glob
   { id: 'build', command: ['pnpm', 'build'] },
+  { id: 'app-typecheck', command: ['pnpm', 'app:typecheck'] }, // needs `build` first: no source alias (see its tsconfig.json)
+  { id: 'app-build', command: ['pnpm', 'app:build'] },
   { id: 'artifacts', command: ['pnpm', 'artifacts:check'] },
+  { id: 'app-pack', command: ['pnpm', 'app-pack:check'] }, // packs + installs examples/reference-app against tarballs too
   { id: 'changesets', command: ['pnpm', 'changeset:status'] },
   { id: 'audit', command: ['pnpm', 'audit', '--prod', '--audit-level=high'] },
 ];

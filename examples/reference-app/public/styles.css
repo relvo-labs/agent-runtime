@@ -84,6 +84,11 @@ select {
   border: 1px solid var(--border);
   border-radius: 0.35rem;
   padding: 0.4rem 0.6rem;
+  /* Same flex min-width issue as `.button-row button`: a `<select>`'s
+     intrinsic width is driven by its longest `<option>` text (a provider's
+     display name), which can exceed a narrow viewport's available width. */
+  min-width: 0;
+  max-width: 100%;
 }
 
 #turn-input {
@@ -120,6 +125,19 @@ a:focus-visible {
   flex-wrap: wrap;
   gap: 0.5rem;
   margin: 0.75rem 0;
+}
+
+.button-row button {
+  /* Flex items default to `min-width: auto` — their own content's natural
+     width wins even when wrapped alone onto a narrow line, which is exactly
+     how a long button label (e.g. "Send a message that fails (scripted
+     demo)") causes horizontal overflow on a narrow viewport. Allowing the
+     button to shrink and its own label to wrap keeps every control reachable
+     without a horizontal scrollbar at any width this app supports. */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
 }
 
 .badges {
@@ -196,4 +214,12 @@ a:focus-visible {
 .app-footer {
   color: var(--muted);
   font-size: 0.85rem;
+}
+
+@media (max-width: 30rem) {
+  /* Below ~480px, a fixed 16rem minimum textarea width no longer fits
+     alongside its label; let it shrink to the available width instead. */
+  #turn-input {
+    min-width: 0;
+  }
 }

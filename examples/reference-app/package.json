@@ -10,13 +10,19 @@
     "dev": "node src/server.ts",
     "test": "vitest run test",
     "typecheck": "tsc -p tsconfig.json",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "browser-check": "node scripts/browser-check.ts"
   },
   "dependencies": {
     "@relvo-labs/agent-protocol": "workspace:^",
     "@relvo-labs/agent-provider": "workspace:^",
+    "@relvo-labs/agent-provider-claude": "workspace:^",
+    "@relvo-labs/agent-provider-codex": "workspace:^",
     "@relvo-labs/agent-runtime": "workspace:^",
     "@relvo-labs/agent-workspace": "workspace:^"
+  },
+  "devDependencies": {
+    "playwright-core": "catalog:"
   },
   "repository": {
     "type": "git",

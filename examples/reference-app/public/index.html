@@ -45,6 +45,25 @@
           <button id="interrupt-button" type="button" disabled>Interrupt run</button>
           <button id="close-session-button" type="button">Close session</button>
         </div>
+        <div class="button-row">
+          <button id="send-failing-turn-button" type="button">Send a message that fails (scripted demo)</button>
+          <button id="advance-script-button" type="button" hidden>Advance script</button>
+        </div>
+        <p class="capability-summary" role="note">
+          The scripted-demo provider never paces itself — nothing happens after <strong>Send turn</strong> until you
+          click <strong>Advance script</strong> (its own public test controller), so a run genuinely stays in flight
+          long enough to try <strong>Interrupt run</strong> for real. A real provider profile paces itself and this
+          button will not appear for one.
+        </p>
+        <div class="button-row">
+          <button id="disconnect-button" type="button" disabled>Disconnect stream</button>
+          <button id="reconnect-button" type="button" disabled>Reconnect stream</button>
+        </div>
+        <p class="capability-summary" role="note">
+          Disconnecting only closes this page's own event stream — it never cancels the run itself. Reconnecting resumes
+          from the last event this page actually saw, not from the beginning, and is not durable provider resume across
+          a backend restart.
+        </p>
 
         <h3>Transcript</h3>
         <div id="transcript" class="transcript" aria-live="polite" aria-label="Assistant transcript"></div>

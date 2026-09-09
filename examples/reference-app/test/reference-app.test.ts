@@ -5,110 +5,40 @@
  * fake transport or fabricates an event — every receipt and every streamed
  * message is produced by the SDK itself.
  *
- * Further adversarial coverage (duplicate/conflict matrices, controlled
- * in-flight interrupt via the scripted controller, overflow/backfill,
- * cleanup-failure retry, and the full negative security matrix) is tracked as
- * pending follow-up work in `progress.md`; this file proves the coherent
- * end-to-end slice plus one representative case from each required category.
+ * Related suites: `reference-app-interrupt.test.ts` (in-flight interrupt,
+ * scripted failure), `reference-app-reconnect.test.ts` (reconnect, overflow,
+ * backfill, disconnect-vs-cancel), `reference-app-cleanup.test.ts` (cleanup
+ * failure retry, shutdown+SSE cleanup, missing real-provider setup failure).
  */
 
-import { mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { createReferenceApp, type ReferenceApp } from '../src/app.ts';
-import type { ReferenceAppConfig } from '../src/config.ts';
-
-const CSRF_HEADER_NAME = 'x-relvo-reference-app';
-const CSRF_HEADER_VALUE = '1';
-
-type JsonRecord = Record<string, unknown>;
-
-function commandId(prefix: string): string {
-  return `${prefix}-${crypto.randomUUID()}`;
-}
+import {
+  CSRF_HEADER_NAME,
+  CSRF_HEADER_VALUE,
+  commandId,
+  openScriptedSession,
+  startTestApp,
+  type JsonRecord,
+  type StartedApp,
+} from './helpers.ts';
 
 describe('reference-app: credential-free scripted vertical slice', () => {
-  let app: ReferenceApp;
-  let baseUrl: string;
-  let workspaceBase: string;
+  let started: StartedApp;
 
   beforeAll(async () => {
-    workspaceBase = mkdtempSync(join(tmpdir(), 'relvo-reference-app-test-'));
-    const config: ReferenceAppConfig = {
-      host: '127.0.0.1',
-      port: 0,
-      workspaceBaseDirectory: workspaceBase,
-      maxRequestBodyBytes: 4096,
-    };
-    app = createReferenceApp(config);
-    const { host, port } = await app.listen();
-    baseUrl = `http://${host}:${String(port)}`;
+    started = await startTestApp();
   });
 
   afterAll(async () => {
-    await app.close();
-    rmSync(workspaceBase, { recursive: true, force: true });
+    await started.teardown();
   });
 
-  async function call(
-    path: string,
-    init: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
-  ): Promise<{ status: number; body: JsonRecord }> {
-    const headers: Record<string, string> = { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE, ...(init.headers ?? {}) };
-    if (init.body !== undefined) headers['content-type'] = 'application/json';
-    const response = await fetch(`${baseUrl}${path}`, {
-      method: init.method ?? 'GET',
-      headers,
-      ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
-    });
-    const text = await response.text();
-    return { status: response.status, body: text.length > 0 ? (JSON.parse(text) as JsonRecord) : {} };
-  }
-
-  /** Collects every SSE message for `sessionId` until `until` returns true. */
-  async function collectSubscription(
-    sessionId: string,
-    until: (messages: readonly JsonRecord[]) => boolean,
-  ): Promise<{ messages: JsonRecord[]; stop: () => void }> {
-    const controller = new AbortController();
-    const response = await fetch(`${baseUrl}/api/sessions/${sessionId}/subscribe?fromSequence=0`, {
-      headers: { [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE },
-      signal: controller.signal,
-    });
-    expect(response.status).toBe(200);
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
-    const messages: JsonRecord[] = [];
-    let buffer = '';
-
-    const pump = (async () => {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) return;
-        buffer += decoder.decode(value, { stream: true });
-        let index: number;
-        while ((index = buffer.indexOf('\n\n')) !== -1) {
-          const frame = buffer.slice(0, index);
-          buffer = buffer.slice(index + 2);
-          for (const line of frame.split('\n')) {
-            if (!line.startsWith('data:')) continue;
-            messages.push(JSON.parse(line.slice('data:'.length).trim()) as JsonRecord);
-          }
-        }
-        if (until(messages)) return;
-      }
-    })();
-
-    const deadline = new Promise<void>((resolve) => setTimeout(resolve, 5000));
-    await Promise.race([pump, deadline]);
-    return { messages, stop: () => controller.abort() };
-  }
-
   it('lists the credential-free scripted-demo provider with an honest capability descriptor', async () => {
-    const { status, body } = await call('/api/providers');
+    const { status, body } = await started.call('/api/providers');
     expect(status).toBe(200);
     const providers = body.providers as JsonRecord[];
     const scripted = providers.find((p) => p.providerId === 'scripted-demo');
@@ -118,10 +48,18 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     expect((scripted!.interaction as JsonRecord).approval).toMatchObject({ supported: false });
   });
 
+  it('every JSON API response carries no-store, nosniff and framing-protection headers', async () => {
+    const { headers } = await started.call('/api/providers');
+    expect(headers.get('cache-control')).toBe('no-store');
+    expect(headers.get('x-content-type-options')).toBe('nosniff');
+    expect(headers.get('x-frame-options')).toBe('DENY');
+    expect(headers.get('access-control-allow-origin')).toBeNull();
+  });
+
   it('runs the full session lifecycle end to end through the real runtime', async () => {
     // 1. open_session — a real workspace lease and provider session are acquired.
     const openCommandId = commandId('open');
-    const opened = await call('/api/sessions', {
+    const opened = await started.call('/api/sessions', {
       method: 'POST',
       body: { commandId: openCommandId, providerId: 'scripted-demo' },
     });
@@ -132,7 +70,7 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     expect(sessionId).toMatch(/^ses_/);
 
     // Exact retry: same command id, same payload -> duplicate, same result.
-    const retried = await call('/api/sessions', {
+    const retried = await started.call('/api/sessions', {
       method: 'POST',
       body: { commandId: openCommandId, providerId: 'scripted-demo' },
     });
@@ -141,7 +79,7 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     expect((retriedReceipt.result as JsonRecord).sessionId).toBe(sessionId);
 
     // Changed intent under the same command id -> a conflict, not a mutation.
-    const conflicted = await call('/api/sessions', {
+    const conflicted = await started.call('/api/sessions', {
       method: 'POST',
       body: { commandId: openCommandId, providerId: 'does-not-exist' },
     });
@@ -149,15 +87,24 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     expect(conflictReceipt.disposition).toBe('rejected');
     expect((conflictReceipt.error as JsonRecord).code).toBe('command_id_conflict');
 
+    // A genuinely new, distinct open attempt is blocked while this one is
+    // open — this app allows only one active session at a time.
+    const secondOpen = await started.call('/api/sessions', {
+      method: 'POST',
+      body: { commandId: commandId('open'), providerId: 'scripted-demo' },
+    });
+    expect(secondOpen.status).toBe(409);
+    expect((secondOpen.body.error as JsonRecord).code).toBe('session_already_open');
+
     // 2. subscribe from sequence 0, replay-then-live, before any turn exists.
-    const subscription = await collectSubscription(sessionId, (messages) =>
+    const subscription = await started.collectSubscription(sessionId, (messages) =>
       messages.some((m) => m.type === 'caught_up'),
     );
     expect(subscription.messages.some((m) => m.type === 'caught_up')).toBe(true);
 
     // 3. submit_turn — a real run against the scripted provider's public controller.
     const turnCommandId = commandId('turn');
-    const submitted = await call(`/api/sessions/${sessionId}/turns`, {
+    const submitted = await started.call(`/api/sessions/${sessionId}/turns`, {
       method: 'POST',
       body: { commandId: turnCommandId, text: 'hello from the vertical-slice test' },
     });
@@ -169,10 +116,22 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     const runId = turnResult.runId as string;
     expect(runId).toMatch(/^run_/);
 
-    // 4. the run already completed (drained synchronously) by the time the
-    //    receipt above returned. Reading forward proves the transport
-    //    actually carried real streamed events, not a fabricated summary.
-    const afterTurn = await collectSubscription(sessionId, (messages) =>
+    // The run genuinely has not progressed yet: this app no longer auto-drains
+    // the scripted provider after `submit_turn`. Real in-flight interrupt is
+    // covered in `reference-app-interrupt.test.ts`; here, advance it forward
+    // through the same explicit, labelled HTTP affordance a human would use.
+    const midFlight = await started.call(`/api/sessions/${sessionId}`);
+    const midRun = (midFlight.body.snapshot as JsonRecord).runs as JsonRecord[];
+    expect(midRun[0]!.state).toBe('running');
+    expect((midRun[0] as JsonRecord).termination).toBeUndefined();
+
+    const advanced = await started.call(`/api/sessions/${sessionId}/advance-script`, { method: 'POST' });
+    expect(advanced.status).toBe(200);
+    expect(((advanced.body.snapshot as JsonRecord).runs as JsonRecord[])[0]!.state).toBe('succeeded');
+
+    // 4. reading forward proves the transport actually carried real streamed
+    //    events, not a fabricated summary.
+    const afterTurn = await started.collectSubscription(sessionId, (messages) =>
       messages.some(
         (m) =>
           m.type === 'event' &&
@@ -194,14 +153,14 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     afterTurn.stop();
 
     // 5. getSession / readEvents projections agree with what streamed.
-    const snapshot = await call(`/api/sessions/${sessionId}`);
+    const snapshot = await started.call(`/api/sessions/${sessionId}`);
     expect(snapshot.status).toBe(200);
     const snapshotBody = snapshot.body.snapshot as JsonRecord;
     expect((snapshotBody.session as JsonRecord).state).toBe('ready');
     expect((snapshotBody.turns as JsonRecord[])[0]!.state).toBe('completed');
     expect((snapshotBody.runs as JsonRecord[])[0]!.state).toBe('succeeded');
 
-    const events = await call(`/api/sessions/${sessionId}/events?fromSequence=0`);
+    const events = await started.call(`/api/sessions/${sessionId}/events?fromSequence=0`);
     expect(events.status).toBe(200);
     const page = events.body.page as JsonRecord;
     expect((page.events as unknown[]).length).toBeGreaterThan(0);
@@ -209,18 +168,19 @@ describe('reference-app: credential-free scripted vertical slice', () => {
 
     // 6. a second, sequential turn on the same session retains the session.
     const secondTurnCommandId = commandId('turn');
-    const secondSubmitted = await call(`/api/sessions/${sessionId}/turns`, {
+    const secondSubmitted = await started.call(`/api/sessions/${sessionId}/turns`, {
       method: 'POST',
       body: { commandId: secondTurnCommandId, text: 'a second message' },
     });
     const secondReceipt = secondSubmitted.body.receipt as JsonRecord;
     expect(secondReceipt.disposition).toBe('applied');
     expect((secondReceipt.result as JsonRecord).turnId).not.toBe(turnResult.turnId);
+    await started.call(`/api/sessions/${sessionId}/advance-script`, { method: 'POST' });
 
     // 7. interrupting an already-terminal run is truthfully reported, not
     //    invented: `delivered: false`, and the command still succeeds.
     const interruptCommandId = commandId('interrupt');
-    const interrupted = await call(`/api/sessions/${sessionId}/runs/${runId}/interrupt`, {
+    const interrupted = await started.call(`/api/sessions/${sessionId}/runs/${runId}/interrupt`, {
       method: 'POST',
       body: { commandId: interruptCommandId },
     });
@@ -231,7 +191,7 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     // 8. close_session releases the provider session and the managed workspace.
     const workspaceRoot = (snapshotBody.session as JsonRecord).workspace as JsonRecord;
     const closeCommandId = commandId('close');
-    const closed = await call(`/api/sessions/${sessionId}/close`, {
+    const closed = await started.call(`/api/sessions/${sessionId}/close`, {
       method: 'POST',
       body: { commandId: closeCommandId },
     });
@@ -240,12 +200,25 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     expect((closeReceipt.result as JsonRecord).interruptedActiveRun).toBe(false);
     expect(existsSync(workspaceRoot.root as string)).toBe(false);
 
-    const closedSnapshot = await call(`/api/sessions/${sessionId}`);
+    const closedSnapshot = await started.call(`/api/sessions/${sessionId}`);
     expect((closedSnapshot.body.snapshot as JsonRecord as { session: JsonRecord }).session.state).toBe('closed');
+
+    // 9. the admission slot is now free: a new session can be opened.
+    const reopened = await started.call('/api/sessions', {
+      method: 'POST',
+      body: { commandId: commandId('open'), providerId: 'scripted-demo' },
+    });
+    const reopenedReceipt = reopened.body.receipt as JsonRecord;
+    expect(reopenedReceipt.disposition).toBe('applied');
+    // Leave this app in a clean state for later tests in this file.
+    await started.call(`/api/sessions/${(reopenedReceipt.result as JsonRecord).sessionId as string}/close`, {
+      method: 'POST',
+      body: { commandId: commandId('close') },
+    });
   });
 
   it('rejects a mutating request that omits the anti-CSRF header', async () => {
-    const opened = await fetch(`${baseUrl}/api/sessions`, {
+    const opened = await fetch(`${started.baseUrl}/api/sessions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ commandId: commandId('open'), providerId: 'scripted-demo' }),
@@ -254,17 +227,37 @@ describe('reference-app: credential-free scripted vertical slice', () => {
   });
 
   it('rejects a cross-origin request even though it targets the right host', async () => {
-    const { status } = await call('/api/providers', { headers: { origin: 'http://evil.example' } });
+    const { status } = await started.call('/api/providers', { headers: { origin: 'http://evil.example' } });
     expect(status).toBe(403);
   });
 
-  it('rejects a request whose Host header does not name this loopback server', async () => {
-    const address = new URL(baseUrl);
+  it('rejects a request whose Host header names the right hostname but the wrong port', async () => {
     const status = await new Promise<number>((resolve, reject) => {
       const req = httpRequest(
         {
-          host: address.hostname,
-          port: address.port,
+          host: '127.0.0.1',
+          port: started.port,
+          path: '/api/providers',
+          method: 'GET',
+          headers: { host: `127.0.0.1:${String(started.port + 1)}`, [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE },
+        },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode ?? 0));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+    expect(status).toBe(400);
+  });
+
+  it('rejects a request whose Host header names a foreign hostname entirely', async () => {
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port: started.port,
           path: '/api/providers',
           method: 'GET',
           headers: { host: 'evil.example:9999', [CSRF_HEADER_NAME]: CSRF_HEADER_VALUE },
@@ -284,7 +277,7 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     // A syntactically valid but nonexistent session id, so the body-size
     // check (not the id-format check) is what this test exercises.
     const oversizedText = 'x'.repeat(8192);
-    const { status } = await call('/api/sessions/ses_0000000000000000/turns', {
+    const { status } = await started.call('/api/sessions/ses_0000000000000000/turns', {
       method: 'POST',
       body: { commandId: commandId('turn'), text: oversizedText },
     });
@@ -292,7 +285,7 @@ describe('reference-app: credential-free scripted vertical slice', () => {
   });
 
   it('rejects an unknown provider id with a rejected receipt, not a crash', async () => {
-    const { status, body } = await call('/api/sessions', {
+    const { status, body } = await started.call('/api/sessions', {
       method: 'POST',
       body: { commandId: commandId('open'), providerId: 'no-such-provider' },
     });
@@ -300,5 +293,59 @@ describe('reference-app: credential-free scripted vertical slice', () => {
     const receipt = body.receipt as JsonRecord;
     expect(receipt.disposition).toBe('rejected');
     expect((receipt.error as JsonRecord).code).toBe('provider_not_registered');
+  });
+
+  it('rejects a malformed run id before ever reaching the runtime', async () => {
+    const sessionId = await openScriptedSession(started);
+    const { status } = await started.call(`/api/sessions/${sessionId}/runs/not-a-real-run-id/interrupt`, {
+      method: 'POST',
+      body: { commandId: commandId('interrupt') },
+    });
+    expect(status).toBe(400);
+    await started.call(`/api/sessions/${sessionId}/close`, { method: 'POST', body: { commandId: commandId('close') } });
+  });
+
+  it('rejects fromSequence values that a truncating parse would have silently accepted', async () => {
+    const sessionId = await openScriptedSession(started);
+    for (const bad of ['1junk', '1.5', '-1', '', '007', '99999999999999999999999999']) {
+      const { status } = await started.call(`/api/sessions/${sessionId}/events?fromSequence=${bad}`);
+      expect(status, `fromSequence=${bad} must be rejected`).toBe(400);
+    }
+    const good = await started.call(`/api/sessions/${sessionId}/events?fromSequence=0`);
+    expect(good.status).toBe(200);
+    await started.call(`/api/sessions/${sessionId}/close`, { method: 'POST', body: { commandId: commandId('close') } });
+  });
+
+  it('rejects an open_session body carrying an extra field, and never touches a borrowed sentinel directory', async () => {
+    const sentinelDir = join(started.workspaceBase, 'sentinel');
+    mkdirSync(sentinelDir, { recursive: true });
+    const markerFile = join(sentinelDir, 'marker.txt');
+    writeFileSync(markerFile, 'do not touch');
+
+    const { status, body } = await started.call('/api/sessions', {
+      method: 'POST',
+      body: {
+        commandId: commandId('open'),
+        providerId: 'scripted-demo',
+        // An escalation attempt: a browser must never be able to name a
+        // workspace path. This must be rejected outright, not silently
+        // dropped — a silently-dropped field is indistinguishable, from the
+        // client's perspective, from one that was honoured but had no effect.
+        workspace: { kind: 'existing', path: sentinelDir },
+      },
+    });
+    expect(status).toBe(400);
+    expect((body.error as JsonRecord).message).toContain('workspace');
+    expect(existsSync(markerFile)).toBe(true);
+  });
+
+  it('rejects a submit_turn body carrying an extra field', async () => {
+    const sessionId = await openScriptedSession(started);
+    const { status } = await started.call(`/api/sessions/${sessionId}/turns`, {
+      method: 'POST',
+      body: { commandId: commandId('turn'), text: 'hi', providerOptions: { model: 'anything' } },
+    });
+    expect(status).toBe(400);
+    await started.call(`/api/sessions/${sessionId}/close`, { method: 'POST', body: { commandId: commandId('close') } });
   });
 });
