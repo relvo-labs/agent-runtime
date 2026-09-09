@@ -323,11 +323,16 @@ Every command sent to the runtime includes an explicit `type` field and a caller
 ### Close-versus-interrupt policy
 
 `close_session` accepts an `ifRunActive` field with two documented values, `"interrupt"` or
-`"reject"`, and — like every other command — has no silent default of its own; a caller must
-choose. **This app's browser client always sends `ifRunActive: "interrupt"` explicitly**, in both
-`public/app.js`'s `closeSession()` and its `commandId`-fingerprinting payload: closing a session
-always ends any still-active run first (a real `interrupted` outcome, not an abandoned one), rather
-than rejecting the close outright just because a run happens to be in flight.
+`"reject"`. The consumed SDK schema (`CloseSessionCommandSchema` in
+`packages/protocol/src/commands.ts`) itself **defaults `ifRunActive` to `"interrupt"`** when the
+field is omitted — so simply not sending it would already produce this app's desired behavior.
+**This app's browser client sends `ifRunActive: "interrupt"` explicitly anyway**, in both
+`public/app.js`'s `closeSession()` and its `commandId`-fingerprinting payload: an explicit choice
+documents the actual policy for a human reading this app's code, and keeps this app's own behavior
+stable even if the SDK's own default were ever to change — never relying on a default silently
+doing the right thing. Either way, the effect is the same: closing always ends any still-active run
+first (a real `interrupted` outcome, not an abandoned one), rather than rejecting the close outright
+just because a run happens to be in flight.
 
 Two things follow from that choice, both real UI behavior you can watch happen (and which
 `scripts/browser-check.ts`'s `exerciseCloseWhileRunActive` check drives with a genuine in-flight
@@ -341,19 +346,43 @@ run and click, not a state inspection):
   **Open session** click but deliberately leaves the transcript and every badge exactly as they
   were — that interrupted run's outcome included — so a human can actually see it. Contrast this
   with the **hard reset** (`resetSessionUi()`) an unknown/stale session (e.g. a `404` after a
-  backend restart — see `pumpSubscription`) gets: that case clears everything, because there is no
-  trustworthy final state left to show. Only the _next_ `openSession()` call clears the previous
-  session's preserved transcript/badges, right when its own fresh session is confirmed open — never
-  the close itself, and never a bounded fallback timer that fires early. (That fallback — 5s,
-  `CLOSE_FALLBACK_MS` — exists only for the edge case where the close receipt came back `applied`
-  but the SSE stream itself will never deliver a `closed` message, e.g. because it had already
-  disconnected; it does not shorten how long real evidence stays visible when the stream is
-  actually still delivering it.)
+  backend restart — see `pumpSubscription` — or a rejected `unknown_session` close, below) gets:
+  that case clears everything, because there is no trustworthy final state left to show. Only the
+  _next_ `openSession()` call clears a gracefully-released session's preserved transcript/badges,
+  right when its own fresh session is confirmed open — never the close itself. When the live SSE
+  stream is what delivers the terminal evidence, this release only ever happens once that stream's
+  own `closed` message actually arrives (never a bounded fallback timer firing early and guessing).
+  When it is NOT the SSE stream doing the delivering — see the `finalizeClosedSession` case just
+  below — the terminal evidence is recovered a different way first, but the release itself is still
+  gated on that recovery actually completing, not on a timer alone.
 
-A **rejected** close receipt (`disposition: "rejected"`, e.g. the session was already gone by the
-time the request arrived) never touches the UI at all beyond an error banner — the session the page
-still knows about is still genuinely open, so nothing is reset, and the same `commandId` (retained,
-not reissued) is what a retry click reuses.
+A **rejected** close receipt is definitive — the runtime recorded a real, final outcome for that
+exact `commandId`, so retrying with the same id would only replay the identical rejection. This
+app's `submitCommand` therefore retires the id on any rejected (or otherwise non-503) result; a
+retry click mints a **fresh** `commandId`, a genuinely new attempt. The one exception is the
+ambiguous `503` cleanup-failure (`workspace_unavailable`, from `close_session`'s own
+promise-rejecting cleanup path — see `callRuntimeCommand` in `src/http/routes.ts`): no receipt was
+ever persisted server-side either way, so THAT case, and only that case, keeps the same
+`commandId` for the retry (`submitCommand`'s `retainOnResult: (outcome) => outcome.status === 503`
+predicate in `closeSession`).
+
+Two specific outcomes get more than just a generic banner, because "still open, try again" (the
+default rejected-close handling) or a blind badge-preserving release (the default applied-close
+handling above) would be actively misleading for them:
+
+- **A rejected receipt with `error.code: "unknown_session"`** — the backend has no record of this
+  session at all (e.g. it was already released some other way). Retaining the stale session
+  id/controls would be fiction; the browser client performs the same **hard reset**
+  (`resetSessionUi()`) `pumpSubscription`'s `404` case uses, with a visible explanation, rather than
+  claiming the session is still open.
+- **An `applied` receipt whose SSE `closed` message will never arrive** — e.g. a prior explicit
+  Disconnect (no live subscription exists at all, detected immediately — `state.abortController ===
+null`) or a connection that silently died (covered by the bounded fallback timer above). Either
+  way, the browser client recovers the authoritative terminal session/run state with a plain
+  `GET /api/sessions/:id` (`finalizeClosedSession` in `public/app.js`) and publishes it to the
+  badges/transcript **before** releasing the one-session slot — never freeing the slot with
+  whatever stale `running`/`ready` badge happened to be on screen and losing that evidence the
+  moment the session id is gone.
 
 ## Security
 

@@ -632,10 +632,61 @@ async function interruptRun() {
  * A close whose success receipt arrived, but whose SSE `closed` message
  * (the actual trigger for `releaseSessionForReopen`) never did — e.g. the
  * stream had already disconnected. Bounded so the one-session slot is never
- * stuck forever; the transcript/badges are left exactly as `closeSession`
- * left them either way.
+ * stuck forever.
  */
 const CLOSE_FALLBACK_MS = 5000;
+
+/**
+ * Recovers the AUTHORITATIVE terminal session/run state with a plain GET —
+ * never assumed, never left as whatever stale badge happened to be on
+ * screen — and publishes it to the badges/transcript BEFORE releasing the
+ * one-session slot. Used whenever the SSE stream cannot be relied on to
+ * deliver its own `closed` message: an explicit prior Disconnect (no live
+ * subscription exists at all), or the bounded fallback timer below (a
+ * connection that appeared live but never actually delivered one).
+ *
+ * Fenced to `sessionId`: a response that resolves after a NEWER session
+ * already opened (or another finalize already ran) never publishes stale
+ * evidence over it, and never double-releases.
+ */
+async function finalizeClosedSession(sessionId) {
+  try {
+    const { status, body } = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    if (state.sessionId !== sessionId) return; // superseded meanwhile — never publish over it
+    const snapshot = status === 200 ? body.snapshot : undefined;
+    if (snapshot === undefined) {
+      // Could not recover authoritative state — be honest about that rather
+      // than silently pretending the stale badges were already correct.
+      showBanner(el.connectionError, 'the session closed, but its final state could not be confirmed.');
+    } else {
+      el.sessionStateBadge.textContent = snapshot.session.state === 'failed' ? 'failed' : 'closed';
+      const relevantRun =
+        snapshot.runs.find((run) => run.runId === state.currentRunId) ?? snapshot.runs[snapshot.runs.length - 1];
+      if (relevantRun) {
+        const runStateChanged = relevantRun.state !== state.currentRunState;
+        state.currentRunState = relevantRun.state;
+        el.runStateBadge.hidden = false;
+        el.runStateBadge.textContent = relevantRun.state;
+        el.interruptButton.disabled = true;
+        // Only append if this is genuinely new information — a live SSE
+        // stream may already have applied this exact terminal event before
+        // this recovery read ever ran; never duplicate that evidence.
+        if (runStateChanged && relevantRun.termination && relevantRun.termination.outcome !== 'succeeded') {
+          appendTranscriptLine(
+            `[run ${relevantRun.termination.outcome}${relevantRun.termination.error ? `: ${relevantRun.termination.error.message}` : ''}]`,
+            'diagnostic',
+          );
+        }
+      }
+      showBanner(el.connectionError, null);
+    }
+  } catch {
+    if (state.sessionId !== sessionId) return;
+    showBanner(el.connectionError, 'the session closed, but its final state could not be confirmed (network error).');
+  } finally {
+    if (state.sessionId === sessionId) releaseSessionForReopen();
+  }
+}
 
 async function closeSession() {
   if (state.sessionId === null) return;
@@ -674,27 +725,53 @@ async function closeSession() {
     appendInspectorEntry('receipt close_session', body.receipt ?? body);
     const receipt = body.receipt;
     if (receipt === undefined || receipt.disposition === 'rejected') {
-      // The close was REJECTED — the session is still open. Never tear the
-      // UI down for an effect that did not happen.
+      if (receipt?.error?.code === 'unknown_session') {
+        // The backend has no record of this session at all — most likely it
+        // was already released some other way. Retaining the stale session
+        // id/controls and claiming "the session is still open" would be
+        // fiction; this is the same HARD reset `pumpSubscription`'s 404 case
+        // uses, with a visible explanation, never a silent/quiet one.
+        showBanner(
+          el.setupError,
+          receipt.error.message ?? 'this session no longer exists on the backend — open a new one.',
+        );
+        resetSessionUi();
+        return;
+      }
+      // Any OTHER rejection (e.g. an already-terminal close being retried)
+      // means the session genuinely is still open — never tear the UI down
+      // for an effect that did not happen.
       showBanner(el.connectionError, receipt?.error?.message ?? 'the close was rejected — the session is still open');
       el.closeSessionButton.disabled = false;
       return;
     }
-    // Applied: the session is closing. Deliberately do NOT call
+    // Applied: the session is closing.
+    if (state.abortController === null) {
+      // No live subscription exists right now (e.g. an explicit Disconnect
+      // happened before this close) — the SSE `closed` message that
+      // normally drives finalization will never arrive. Recover the
+      // authoritative terminal session/run state right now rather than
+      // silently freeing the slot with whatever stale badges (`running`,
+      // `ready`, …) happened to be on screen.
+      setSessionControlsEnabled(false);
+      showBanner(el.connectionError, 'closing — recovering the final session/run state…');
+      await finalizeClosedSession(sessionId);
+      return;
+    }
+    // A live subscription exists: deliberately do NOT call
     // `releaseSessionForReopen()` here — the SSE stream is still delivering
     // the resulting events (the active run's own real `interrupted` outcome,
     // per the explicit policy above), and tearing the UI down immediately
     // would hide that evidence. `handleSubscriptionMessage`'s `closed` case
     // does the actual release once the stream itself reports the session is
-    // terminal; the bounded fallback below covers a stream that will not
-    // (e.g. already disconnected).
+    // terminal; the bounded fallback below covers a connection that
+    // appeared live but never actually delivered one, using the same
+    // authoritative-recovery path as the disconnected case above (never a
+    // blind release with stale badges).
     setSessionControlsEnabled(false);
     showBanner(el.connectionError, 'closing — waiting for the final events…');
     state.closeFallbackTimer = setTimeout(() => {
-      if (state.sessionId === sessionId) {
-        showBanner(el.connectionError, null);
-        releaseSessionForReopen();
-      }
+      if (state.sessionId === sessionId) void finalizeClosedSession(sessionId);
     }, CLOSE_FALLBACK_MS);
   } catch {
     if (state.sessionId !== sessionId) return;

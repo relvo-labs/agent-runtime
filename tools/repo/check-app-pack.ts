@@ -74,12 +74,24 @@ type ManagedServer = {
    * escalating to SIGKILL only if it has not. `ChildProcess#killed` means
    * "a signal was sent", not "the process has exited" — checking it instead
    * of the `exit` event would make the SIGKILL escalation below dead code.
+   * Throws `ChildExitNotConfirmedError` if the child's own `exit` event is
+   * still not observed even after the SIGKILL grace period — never a quiet
+   * success for a process that may still be alive.
    */
   stop(): Promise<void>;
 };
 
 const READY_LINE = /listening on (http:\/\/\S+)/u;
 const SHUTDOWN_GRACE_MS = 3000;
+
+/**
+ * Distinguishes "the managed child's exit was never actually observed" from
+ * every other failure this script can raise — so the top-level cleanup below
+ * can skip removing the scratch tree specifically (and only) in that case,
+ * rather than a bare `finally` removing it unconditionally regardless of why
+ * `main()` failed.
+ */
+class ChildExitNotConfirmedError extends Error {}
 
 /**
  * Spawns `command`/`args` with `REFERENCE_APP_PORT=0` (an ephemeral port,
@@ -164,11 +176,26 @@ async function startManagedServer(options: {
           }, SHUTDOWN_GRACE_MS);
         }),
       ]);
-      if (!exitedGracefully) {
-        // Harmless if the process exited between the race settling and here
-        // (`kill` on an already-gone pid is a no-op, not a throw).
-        child.kill('SIGKILL');
-        await Promise.race([exitPromise, new Promise<void>((r) => setTimeout(r, SHUTDOWN_GRACE_MS))]);
+      if (exitedGracefully) return;
+      // Harmless if the process exited between the race settling and here
+      // (`kill` on an already-gone pid is a no-op, not a throw).
+      child.kill('SIGKILL');
+      const exitedAfterKill = await Promise.race([
+        exitPromise.then(() => true),
+        new Promise<boolean>((r) => {
+          setTimeout(() => {
+            r(false);
+          }, SHUTDOWN_GRACE_MS);
+        }),
+      ]);
+      if (!exitedAfterKill) {
+        // Never silently report a clean stop, and never let the caller below
+        // remove the scratch tree this child may still hold open, on the
+        // strength of a signal merely having been *sent* — only a genuinely
+        // observed `exit` event proves the process is actually gone.
+        throw new ChildExitNotConfirmedError(
+          `managed server child (pid ${String(child.pid)}) did not exit even after SIGTERM, SIGKILL, and a further ${String(SHUTDOWN_GRACE_MS)}ms grace period — refusing to report a clean stop or remove its owned temp tree while it may still be alive`,
+        );
       }
     },
   };
@@ -350,8 +377,18 @@ async function main(): Promise<void> {
   }
 }
 
+let childExitUnconfirmed = false;
 try {
   await main();
+} catch (error) {
+  if (error instanceof ChildExitNotConfirmedError) childExitUnconfirmed = true;
+  throw error;
 } finally {
-  rmSync(scratchRoot, { recursive: true, force: true });
+  if (childExitUnconfirmed) {
+    process.stderr.write(
+      `app-pack: leaving scratch tree in place at ${scratchRoot} — a managed child process's exit was never confirmed\n`,
+    );
+  } else {
+    rmSync(scratchRoot, { recursive: true, force: true });
+  }
 }

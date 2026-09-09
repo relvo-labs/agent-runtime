@@ -139,9 +139,20 @@ async function startManagedServer(options: {
           }, SHUTDOWN_GRACE_MS);
         }),
       ]);
-      if (!exitedGracefully) {
-        child.kill('SIGKILL');
-        await Promise.race([exitPromise, new Promise<void>((r) => setTimeout(r, SHUTDOWN_GRACE_MS))]);
+      if (exitedGracefully) return;
+      child.kill('SIGKILL');
+      const exitedAfterKill = await Promise.race([
+        exitPromise.then(() => true),
+        new Promise<boolean>((r) => setTimeout(() => r(false), SHUTDOWN_GRACE_MS)),
+      ]);
+      if (!exitedAfterKill) {
+        // Never silently report a clean stop, and never let a caller remove a
+        // temp tree this child may still hold open, on the strength of a
+        // signal merely having been *sent* — only a genuinely observed `exit`
+        // event proves the process is actually gone.
+        throw new Error(
+          `managed server child (pid ${String(child.pid)}) did not exit even after SIGTERM, SIGKILL, and a further ${String(SHUTDOWN_GRACE_MS)}ms grace period — refusing to report a clean stop`,
+        );
       }
     },
   };
@@ -298,6 +309,135 @@ async function exerciseCloseWhileRunActive(page: Page, label: string): Promise<v
   );
 }
 
+/**
+ * Disconnect the SSE stream first (so the `closed` message that normally
+ * drives finalization can never arrive), THEN close a session with a
+ * genuinely still-active run. Proves `finalizeClosedSession` in
+ * `public/app.js`: the browser client must recover the authoritative
+ * closed/interrupted state itself (a real `GET /api/sessions/:id`), not
+ * silently free the one-session slot while leaving the badges on their
+ * stale `running`/`ready` values. The tight deadline below (well under
+ * `CLOSE_FALLBACK_MS`'s 5s) is deliberate: it would fail if this were only
+ * ever recovered by the bounded fallback timer, proving the immediate,
+ * "no live subscription" recovery path in `closeSession()` actually fired.
+ */
+async function exerciseDisconnectThenCloseWhileRunActive(page: Page, label: string): Promise<void> {
+  await page.selectOption('#provider-select', 'scripted-demo');
+  await page.click('#open-session-button');
+  await page.waitForSelector('#session-panel:not([hidden])', { timeout: 5000 });
+  await waitForBadgeText(page, 'session-state-badge', 'ready');
+
+  await page.fill('#turn-input', `${label} — disconnected, then closed while still running`);
+  await page.click('#send-turn-button');
+  await waitForBadgeText(page, 'run-state-badge', 'running');
+
+  await page.click('#disconnect-button');
+  assert(
+    await page.locator('#reconnect-button').isEnabled(),
+    `${label}: Disconnect must genuinely drop the live subscription (Reconnect becomes available)`,
+  );
+
+  await page.click('#close-session-button');
+
+  // Deliberately tight: proves the immediate ("no live subscription")
+  // recovery path, not the 5s bounded fallback.
+  await waitForBadgeText(page, 'session-state-badge', 'closed', 3000);
+  await waitForBadgeText(page, 'run-state-badge', 'interrupted', 3000);
+
+  const transcript = (await page.locator('#transcript').textContent()) ?? '';
+  assert(
+    transcript.includes('interrupted'),
+    `${label}: the recovered run outcome must be visible in the transcript, not just the badge`,
+  );
+  assert(
+    !(await page.locator('#run-state-badge').isHidden()),
+    `${label}: run badge must be recovered and visible, never left stale or hidden`,
+  );
+  assert(
+    !(await page.locator('#open-session-button').isDisabled()),
+    `${label}: Open session must be re-enabled once the recovered close genuinely finished`,
+  );
+
+  process.stdout.write(
+    `browser-check: [${label}] disconnect-then-close-while-active recovers authoritative closed/interrupted state — OK\n`,
+  );
+}
+
+/**
+ * A close rejected with `unknown_session` must HARD-reset (never retain the
+ * stale session id/controls while claiming "the session is still open" —
+ * the generic rejected-close handling). Since this app's own backend only
+ * ever produces `unknown_session` for a session id it no longer has any
+ * record of — not reachable through a normal, single-session-at-a-time UI
+ * flow — this SIMULATES that one server response with a Playwright route
+ * fixture. This is a TEST FIXTURE for this deterministic regression ONLY: a
+ * fabricated protocol response, never a real backend/provider answer, and
+ * never to be read as real provider evidence.
+ */
+async function exerciseUnknownSessionRejectedClose(page: Page, label: string): Promise<void> {
+  await page.selectOption('#provider-select', 'scripted-demo');
+  await page.click('#open-session-button');
+  await page.waitForSelector('#session-panel:not([hidden])', { timeout: 5000 });
+  await waitForBadgeText(page, 'session-state-badge', 'ready');
+  const sessionId = await badgeText(page, 'session-id-badge');
+
+  const closePathPredicate = (url: URL): boolean => url.pathname === `/api/sessions/${sessionId}/close`;
+  await page.route(closePathPredicate, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        receipt: {
+          disposition: 'rejected',
+          error: {
+            code: 'unknown_session',
+            message: `simulated (test fixture, NOT a real backend response): no session \`${sessionId}\``,
+            retryable: false,
+          },
+        },
+      }),
+    });
+  });
+
+  await page.click('#close-session-button');
+  await page.waitForSelector('#session-panel', { state: 'hidden', timeout: 5000 });
+  assert(
+    (await badgeText(page, 'session-id-badge')) === '—',
+    `${label}: an unknown_session rejected close must hard-reset the stale session id, not retain it`,
+  );
+  const setupErrorText = (await page.locator('#setup-error').textContent()) ?? '';
+  assert(
+    setupErrorText.length > 0,
+    `${label}: an unknown_session rejected close must show a visible explanation, not a silent reset`,
+  );
+  assert(
+    !(await page.locator('#open-session-button').isDisabled()),
+    `${label}: Open session must be re-enabled after the hard reset`,
+  );
+
+  // Remove ALL routes (not `unroute(closePathPredicate)` with a fresh
+  // function reference, which some Playwright versions would not recognise
+  // as the same handler) before the real cleanup request below.
+  await page.unrouteAll();
+
+  // The REAL backend session was never actually closed — the fixture above
+  // intercepted that one request before it ever reached the server. Close it
+  // for real now (bypassing this app's own UI, which already believes the
+  // session is gone) so this app's real "one session at a time" admission
+  // does not wrongly block whatever check runs next.
+  await page.evaluate(async (id) => {
+    await fetch(`/api/sessions/${id}/close`, {
+      method: 'POST',
+      headers: { 'x-relvo-reference-app': '1', 'content-type': 'application/json' },
+      body: JSON.stringify({ commandId: `cleanup_${crypto.randomUUID()}` }),
+    });
+  }, sessionId);
+
+  process.stdout.write(
+    `browser-check: [${label}] unknown_session rejected close hard-resets with a visible explanation — OK\n`,
+  );
+}
+
 async function main(): Promise<void> {
   const { chromium } = await import('playwright-core');
 
@@ -387,6 +527,14 @@ async function main(): Promise<void> {
     // the overlapping-close race guard, and preserved-evidence-until-reopen.
     await exerciseCloseWhileRunActive(desktopPage, 'desktop-close-while-active');
 
+    // ---- disconnect, THEN close a still-active run: must recover the
+    // authoritative closed/interrupted state itself, never a stale badge.
+    await exerciseDisconnectThenCloseWhileRunActive(desktopPage, 'desktop-disconnect-then-close');
+
+    // ---- unknown_session rejected close: must hard-reset with a visible
+    // explanation, never retain the stale identity/controls.
+    await exerciseUnknownSessionRejectedClose(desktopPage, 'desktop-unknown-session-close');
+
     // ---- close/reopen: a fresh session must never show a stale badge from
     // the one just closed (the exact P1/P2 regression this check now guards).
     await exerciseFullSessionLifecycle(desktopPage, 'desktop-reopened');
@@ -432,7 +580,10 @@ async function main(): Promise<void> {
     await browser?.close();
     // Genuinely awaited (including the SIGKILL escalation if needed) before
     // the workspace directory this process may still hold a handle into is
-    // removed below.
+    // removed below. `stop()` THROWS rather than resolving if the child's own
+    // `exit` event was never actually observed — that throw propagates out of
+    // this `finally` block and skips `rmSync` entirely, so an unconfirmed-
+    // dead child's temp tree is never removed out from under it.
     await server.stop();
     rmSync(workspaceBase, { recursive: true, force: true });
   }
