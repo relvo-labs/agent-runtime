@@ -477,5 +477,6 @@ source" the issue prohibits for this app's _consumer-facing_ typecheck/build.
 - `awaiting_interaction` is not exercised: neither the scripted lane (approval/question disabled
   on purpose) nor Codex/Claude support interaction bridging today, so there is no
   `respond_to_interaction` route.
-- One session, one active run at a time, by this app's own product policy — the SDK itself does
-  not impose that limit.
+- This app adds a product policy of **one active session across the whole app**. The SDK can host
+  multiple sessions, but Runtime v0.4 still permits only one active run within each session; a
+  subsequent turn on that session must wait for the prior run to terminate.
