@@ -22,6 +22,7 @@ import {
   requireFlag,
   validatePlanAgainstRequest,
 } from './lib/dispatch.ts';
+import { describeNpmTool, locateNpmTool } from './lib/npm-tool.ts';
 import { parseReleaseRequest, type Finding } from './lib/plan.ts';
 import { digestPlan, loadStaging, resolveStagingRoot } from './lib/staging.ts';
 import { readGitFacts, readPendingChangesetFiles, readRemoteMain } from './lib/workspace.ts';
@@ -41,6 +42,25 @@ if (process.env.NPM_TOKEN !== undefined) {
   });
 }
 
+/**
+ * The npm that the next step will publish with, proven while the credential
+ * still does not exist.
+ *
+ * `publish.ts` proves it again before it uses it, but the two checks answer
+ * different questions. This one answers "is the tool this job was bootstrapped
+ * with the reviewed one?" at the last moment a refusal is free — the credential
+ * is not in this step's environment, nothing has been uploaded, and the
+ * environment approval has already been spent. A missing or unpinned npm found
+ * here is a bootstrap failure; found a step later it is a bootstrap failure
+ * holding a publish token.
+ */
+const npmTool = locateNpmTool();
+if (npmTool.ok) {
+  process.stdout.write(`verify-staging: publication tool ${describeNpmTool(npmTool.tool)}\n`);
+} else {
+  findings.push(...npmTool.findings);
+}
+
 const parsedRequest = parseReleaseRequest(readDispatchInputs(process.env));
 if (!parsedRequest.ok) {
   reportFindings('verify-staging', [...findings, ...parsedRequest.findings]);
@@ -54,7 +74,8 @@ const git = readGitFacts(repoRoot);
 // and against the remote rather than only against what this job happened to
 // fetch, because an approval that sat while main advanced must be refused. The
 // pending-changeset scan is the dependency-free equivalent of `changeset
-// status`: this job installs nothing.
+// status`: the gated job installs the workspace only to obtain the pinned npm
+// it publishes with, and runs no workspace tooling to establish these facts.
 findings.push(
   ...checkSourceCurrency({
     request,

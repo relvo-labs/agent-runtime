@@ -61,11 +61,26 @@ export const STAGING_DIRECTORY = 'release-staging';
 export const PREFLIGHT_COMMAND = `node tools/release/preflight.ts --staging ${STAGING_DIRECTORY}`;
 export const VERIFY_STAGING_COMMAND = `node tools/release/verify-staging.ts --staging ${STAGING_DIRECTORY}`;
 export const PUBLISH_COMMAND = `node tools/release/publish.ts --staging ${STAGING_DIRECTORY}`;
-/** The gated job may run these commands and nothing else. */
-export const PUBLISH_JOB_COMMANDS: readonly string[] = [VERIFY_STAGING_COMMAND, PUBLISH_COMMAND];
+export const INSTALL_COMMAND = 'pnpm install --frozen-lockfile --ignore-scripts';
+/**
+ * The gated job may run these commands, in this order, and nothing else.
+ *
+ * The install is here because npm is a pinned devDependency of this workspace
+ * rather than something the runtime supplies: `pnpm/setup` installs Node from
+ * the `node` package, which bundles no npm at all. Without this step the gated
+ * job has no npm it can prove, and the alternative — falling back to whatever
+ * `npm` is on the runner's `PATH` — would publish through a program nothing
+ * here pins or reviews, and which is not the one the gate's differential test
+ * compared these archives against.
+ *
+ * It is a frozen, script-free install in a step that holds no credential, and
+ * it must stay ahead of both reviewed commands: `verify-staging.ts` proves the
+ * tool's identity before the credential exists, and `publish.ts` proves it
+ * again before it spawns it.
+ */
+export const PUBLISH_JOB_COMMANDS: readonly string[] = [INSTALL_COMMAND, VERIFY_STAGING_COMMAND, PUBLISH_COMMAND];
 export const SECRET_REFERENCE = '${{ secrets.NPM_TOKEN }}';
 
-const INSTALL_COMMAND = 'pnpm install --frozen-lockfile --ignore-scripts';
 const GATE_COMMAND = 'pnpm gate';
 const CHANGESETS_BASE_COMMAND = 'git update-ref refs/heads/main refs/remotes/origin/main';
 
@@ -230,6 +245,7 @@ const EXPECTED_JOBS: Readonly<Record<string, ExpectedJob>> = {
     steps: [
       { uses: 'actions/checkout', with: CHECKOUT_WITH },
       { uses: 'pnpm/setup', with: RUNTIME_WITH(false) },
+      { run: INSTALL_COMMAND },
       {
         uses: 'actions/download-artifact',
         with: {

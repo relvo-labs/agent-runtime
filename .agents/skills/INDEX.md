@@ -73,7 +73,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `local-ci-parity`
 
-- **Version:** 1.1.0 (stable)
+- **Version:** 1.2.0 (stable)
 - **Path:** `.agents/skills/local-ci-parity/SKILL.md`
 - **Description:** Keep one canonical credential-free gate that runs identically on a developer machine and in GitHub Actions, with no step that only exists in one place.
 - **Tags:** `ci`, `gate`, `github-actions`, `reproducibility`
@@ -82,7 +82,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `npm-release`
 
-- **Version:** 1.2.0 (stable)
+- **Version:** 1.4.0 (stable)
 - **Path:** `.agents/skills/npm-release/SKILL.md`
 - **Description:** Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
 - **Tags:** `npm`, `provenance`, `publish`, `registry`, `supply-chain`

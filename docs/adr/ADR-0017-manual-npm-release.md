@@ -42,7 +42,10 @@ order and registry facts are proven before any credential exists.
 - An artifact has exactly one identity or it is refused. What this repository reads out
   of a packed tarball and what npm extracts from it must never be two different packages;
   an offline differential test against npm's own bundled reader asserts that they either
-  agree or that this repository refuses the archive. Unrecognised header _formats_ are
+  agree or that this repository refuses the archive. That reader is loaded out of the one
+  npm this workspace pins — the same package that publishes — because an agreement with
+  an npm that never sees the release is not an agreement about anything. Unrecognised
+  header _formats_ are
   refused outright; inside the one recognised format, npm's field semantics are
   reproduced literally rather than approximated, because being stricter than npm about a
   format it accepts would reject artifacts this repository actually ships.
@@ -75,13 +78,32 @@ two-file change: the workflow and the reviewed structure in `workflow-policy.ts`
 friction is the point.
 
 The release tooling that runs in either job imports nothing outside Node's standard
-library — including its own narrow YAML-subset parser — so the gated job installs no
-dependencies, and reviewing this path means reviewing this repository's code rather than a
-supply chain. The one exception is a _test_: the artifact-identity differential loads
-`pacote` out of the npm bundled with the `.nvmrc` Node runtime, offline, purely to compare
-readings. It adds no workspace dependency and nothing it loads is shipped. Four actions
-are trusted, each pinned to a verified immutable commit; adding a fifth is a reviewed
-change, as is passing an action any input its pinned revision does not declare.
+library — including its own narrow YAML-subset parser — so reviewing this path means
+reviewing this repository's code rather than a supply chain. Four actions are trusted,
+each pinned to a verified immutable commit; adding a fifth is a reviewed change, as is
+passing an action any input its pinned revision does not declare.
+
+There is one deliberate exception, and it was originally recorded the other way round.
+This ADR first said the gated job installed no dependencies, and that the differential
+test's `pacote` came out of "the npm bundled with the `.nvmrc` Node runtime" without
+adding a workspace dependency. That was wrong about the runtime and, more importantly,
+wrong about what published: `pnpm/setup` installs Node from the `node` package, which
+bundles no npm, so on a runner the test could not load at all — and the publisher,
+which spawned bare `npm` from `PATH`, was using a different program than any
+differential run had ever compared against (run 34699256419). npm is therefore a pinned
+devDependency of this workspace, both jobs install from the lockfile, and
+`tools/release/lib/npm-tool.ts` proves the tool's identity before either the test or the
+publisher uses it, with no `PATH` fallback and no environment override. It costs one
+lockfile entry — npm vendors its own dependencies — and nothing it loads is shipped.
+
+Proving an identity turned out to be narrower than resolving one. A review of the first
+version of that module showed two ways the proof leaked, and both are now closed by
+construction: npm is read from the explicit path `node_modules/npm` whose real path must
+be owned by this repository — asking Node's resolver instead accepted an npm in an
+ancestor directory or on `NODE_PATH` when the workspace had none — and each bundled
+reader is bound to the realpath'd entry point `require` would load, confined to that
+reader's own directory, because a `main` or `exports` pointing out of the package made a
+contained `package.json` say nothing about the code that runs.
 
 Nothing has been published. The outstanding human approvals, and the evidence required
 before a first release, are recorded in `docs/release.md`.

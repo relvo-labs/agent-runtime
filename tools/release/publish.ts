@@ -25,6 +25,7 @@ import {
   requireFlag,
   validatePlanAgainstRequest,
 } from './lib/dispatch.ts';
+import { describeNpmTool, locateNpmTool, npmCommand } from './lib/npm-tool.ts';
 import { parseReleaseRequest, type Finding } from './lib/plan.ts';
 import { publishRelease, redactSecrets, summarizeReport, type CommandOutcome } from './lib/publish.ts';
 import { createHttpsRegistry } from './lib/registry.ts';
@@ -42,6 +43,25 @@ if (token === undefined || token.trim() === '') {
 }
 
 const findings: Finding[] = [];
+
+/**
+ * The tool, before the plan.
+ *
+ * `npm publish` is the irreversible step, so which npm runs it is a release
+ * fact like any other and is established the same way: proven, or refused.
+ * This is the pinned package the canonical gate's differential test compared
+ * its tar reader against — not a `npm` found on `PATH`, which on a runner is
+ * the image's preinstalled Node's npm and is pinned, locked and reviewed
+ * nowhere in this repository. An unprovable tool stops the run here, before
+ * any staging is read and well before the credential is used.
+ */
+const locatedNpm = locateNpmTool();
+if (!locatedNpm.ok) {
+  reportFindings('publish', locatedNpm.findings);
+  process.exit(1);
+}
+const npmTool = locatedNpm.tool;
+
 const parsedRequest = parseReleaseRequest(readDispatchInputs(process.env));
 if (!parsedRequest.ok) {
   reportFindings('publish', parsedRequest.findings);
@@ -106,8 +126,9 @@ const write = (line: string): void => {
 };
 
 function runNpm(args: readonly string[]): Promise<CommandOutcome> {
+  const { command, args: argv } = npmCommand(npmTool, args);
   return new Promise<CommandOutcome>((settle, reject) => {
-    const child = spawn('npm', [...args], { cwd: repoRoot, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, [...argv], { cwd: repoRoot, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -131,6 +152,9 @@ const authLine = `//${registryUrl.host}${registryUrl.pathname.replace(/\/?$/u, '
 let exitCode = 0;
 try {
   writeFileSync(userconfig, `${authLine}\n`, { mode: 0o600 });
+  // Stated in the log before anything is uploaded, so the run is attributable
+  // to an exact tool rather than to "npm".
+  write(`publish: using ${describeNpmTool(npmTool)}`);
   const report = await publishRelease(
     staging.plan,
     {

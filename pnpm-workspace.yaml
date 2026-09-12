@@ -24,6 +24,24 @@ catalog:
   '@anthropic-ai/claude-agent-sdk': 0.3.259
 
   # --- toolchain (dev only) ------------------------------------------------
+  # The npm CLI this repository publishes with, and the one the release
+  # tooling's differential test compares its tar reader against. Pinned here
+  # rather than inherited from the runtime because `pnpm/setup` installs Node
+  # from the `node` package, whose payload is the `node` binary alone — there
+  # is no bundled npm anywhere under `$PNPM_HOME`. Leaving it implicit meant
+  # the test read one npm (whatever the developer's Node shipped) while
+  # publication spawned another (whatever was on `PATH`), and in CI neither
+  # existed. One pin makes those the same proven package.
+  #
+  # 11.19.1, not the newer 12.x line: npm 12 declares
+  # `engines.node: ^22.22.2 || ^24.15.0 || >=26.0.0`, which excludes the
+  # 22.18.0 lower bound of our supported matrix. 11.19.1 declares
+  # `^20.17.0 || >=22.9.0` and covers 22.18.0, 24.20.0 and 26.8.1. It is the
+  # newest version that does, and it is older than the 3-day cooldown
+  # (published 2026-08-26). It adds exactly one entry to the lockfile: npm
+  # vendors all 65 of its dependencies as bundleDependencies.
+  npm: 11.19.1
+
   # TypeScript is pinned to the 6.x line on purpose. typescript@7 is the
   # native port and ships no JavaScript compiler API, which type-aware
   # linting depends on. See docs/adr/ADR-0012-typescript-toolchain-line.md.

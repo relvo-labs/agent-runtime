@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.2.0
+version: 1.4.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -31,7 +31,8 @@ Do not use this skill when:
 ## Owns
 
 - `.github/workflows/release.yml` — the only workflow that may reach a publish credential
-- `tools/release` — preflight, staging verification, publication and the workflow policy check
+- `tools/release` — preflight, staging verification, publication, the npm tool identity and
+  the workflow policy check
 - `docs/release.md` — the operator runbook and the outstanding-approval record
 - `docs/adr/ADR-0017-manual-npm-release.md` — the decision record for this path
 
@@ -76,6 +77,10 @@ Do not use this skill when:
    expected-digest input), re-verifies everything locally, and only then runs one step that
    can see `secrets.NPM_TOKEN`. Building never happens in a step that holds the credential.
 
+   Both jobs install the workspace from the lockfile, frozen and script-free. In the gated
+   job that install is a control, not a convenience: it is where the pinned npm comes from,
+   and without it there is no tool whose identity the job can prove (see step 5).
+
 4. **Preflight refuses; it never repairs.** Findings are refusals, and there is no
    override input. It refuses pending version intent, a commit that is not main's tip, a
    dirty tree, a version the commit does not carry, an artifact whose identity or contents
@@ -95,6 +100,42 @@ Do not use this skill when:
    skipped. `pacote-differential.test.ts` asserts the resulting property against npm's
    own bundled reader, offline: same identity, or refusal. Never relax that test to
    "we parse tar the same way" — the invariant is about disagreement, not parsing.
+
+   **Which npm, exactly.** That argument is worth nothing unless the npm the test
+   reads with is the npm that publishes. `tools/release/lib/npm-tool.ts` is the
+   single answer to "which npm": the package pinned in the catalog, taken from the
+   explicit path `node_modules/npm`, proven before use, and used by both
+   `pacote-differential.test.ts` and `publish.ts`. It never falls back to `PATH`
+   and takes no environment override — an unresolvable, malformed, mislocated or
+   wrong-versioned tool is a refusal, and refusals name every reason at once
+   because the reader is usually looking at a runner they cannot poke at. npm is a
+   declared devDependency here rather than something inherited from the runtime
+   because `pnpm/setup` installs Node from the `node` package, whose payload is
+   the `node` binary alone: guessing at `process.execPath`'s neighbours found no
+   npm and made the suite unloadable (run 34699256419), while `spawn('npm')`
+   published through whatever the runner image happened to ship. Those were the
+   same bug seen from two ends, and splitting the tool apart again reopens it.
+
+   **Locate; do not resolve, and do not stop at the manifest.** Two rules earned
+   the hard way, when a review broke the first version of this module twice:
+   - `createRequire(root).resolve('npm/…')` answers "what would `require` find",
+     which is not "what does this repository depend on". It walks every ancestor
+     `node_modules` and then `NODE_PATH`, and with no npm installed in the
+     workspace at all, both were accepted as the publishing tool. So: the root
+     manifest must declare `devDependencies.npm: "catalog:"`, the package is read
+     from exactly `<repoRoot>/node_modules/npm`, and its real path must be owned
+     by `<repoRoot>/node_modules`. `node_modules/npm` is a symlink under pnpm and
+     must stay usable, so the rule is about where the link _lands_, not that it
+     exists.
+   - A package's `main` and `exports` are part of its identity, so containment on
+     `package.json` proves nothing about the code that loads. A bundled `pacote`
+     whose `main` was `../../../../outside.cjs`, or whose `exports` target was a
+     symlink out of the tree, passed inspection and then loaded foreign code.
+     Each reader's entry point is therefore resolved, realpath'd, confined to
+     that reader's own directory and recorded; `loadNpmModule` loads that exact
+     file and refuses any id not proven here. Never hand a caller a bare
+     `require` rooted in npm — that re-runs resolution at load time, which is
+     precisely where the checked answer gets replaced by an unchecked one.
 
    Two rules of different kinds keep that true, and confusing them breaks something:
    - **Unrecognised header _formats_ are refused.** Only the POSIX ustar signature
@@ -151,9 +192,16 @@ Do not use this skill when:
 
 ```bash
 pnpm release:check                 # structural policy for the release workflow
-pnpm exec vitest run tools/release # preflight, ordering, registry and readback fixtures
+pnpm exec vitest run tools/release # tool identity, preflight, ordering, registry, readback
 pnpm gate                          # both of the above, plus everything else CI runs
 ```
+
+A local `pnpm gate` passing proves less about the release path than it looks like it does
+if your Node came from nvm or a system package: that layout has a bundled npm, and the
+runner's does not. When changing anything about how the tool is located, reproduce the CI
+layout rather than trusting the local one — install the pinned pnpm executable, run
+`pnpm runtime set node <matrix version> -g` into a scratch `PNPM_HOME`, and run the gate
+with that `node` first on `PATH`.
 
 Dry-run the preflight locally against real packed artifacts (credential-free; it is
 expected to refuse while changesets are pending):
@@ -176,7 +224,9 @@ node tools/release/preflight.ts --staging /tmp/release-staging
   — its `action.yml` contract and `src/download-artifact.ts` were read to establish that
   the pinned revision declares no `digest` input and derives the expected hash from
   artifact metadata. No text was incorporated.
-- Compared-against: `pacote`, as bundled with the npm that ships with the `.nvmrc` Node
-  runtime. It is loaded offline from that runtime's own installation for the
-  identity-agreement test, is not a declared dependency of this workspace, and no code
-  from it is incorporated.
+- Compared-against: `pacote` and `tar`, as bundled with the `npm` pinned in
+  `pnpm-workspace.yaml`'s catalog — the same package this repository publishes with. They
+  are loaded offline, out of that package, for the identity-agreement test. npm is a
+  declared devDependency (one lockfile entry; it vendors its own dependencies) and no code
+  from it is incorporated. It was previously loaded from whichever npm happened to sit
+  beside `process.execPath`, which assumed an official Node distribution's layout.
