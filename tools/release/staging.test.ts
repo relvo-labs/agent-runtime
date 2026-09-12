@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { validatePlanAgainstRequest } from './lib/dispatch.ts';
+import { checkSourceCurrency, validatePlanAgainstRequest } from './lib/dispatch.ts';
 import type { PlanEntry, ReleasePlan } from './lib/preflight.ts';
 import {
   digestPlan,
@@ -13,7 +13,7 @@ import {
   TARBALL_DIRECTORY,
 } from './lib/staging.ts';
 import { inspectTarball, tarballFileName } from './lib/tarball.ts';
-import { buildPackageTarball } from './testing/fixtures.ts';
+import { buildPackageTarball, buildTarball } from './testing/fixtures.ts';
 
 const PROTOCOL = '@relvo-labs/agent-protocol';
 const SHA = 'f'.repeat(40);
@@ -108,6 +108,33 @@ describe('staged release verification', () => {
     expect(codes(root)).toContain('staging_tarball_identity');
   });
 
+  /**
+   * Regression: the gated job must refuse an archive whose identity npm would
+   * read differently, even though the bytes are exactly the reviewed ones.
+   *
+   * An independent review staged an archive carrying both
+   * `package/package.json` (agent-protocol@0.2.0) and `package/./package.json`
+   * (agent-runtime@9.9.9). Preflight planned it as the former and `loadStaging`
+   * accepted it; npm's own reader resolved it as the latter. Every hash in the
+   * plan matched, because the ambiguity is in the archive, not the transport.
+   */
+  it('refuses a staged archive that resolves to two identities', () => {
+    const ambiguous = buildTarball({
+      'package/package.json': JSON.stringify({ name: PROTOCOL, version: '0.2.0' }),
+      'package/./package.json': JSON.stringify({ name: '@relvo-labs/agent-runtime', version: '9.9.9' }),
+      'package/README.md': '# x\n',
+      'package/LICENSE': 'Apache-2.0\n',
+      'package/NOTICE': 'NOTICE\n',
+    });
+    const root = scratch();
+    mkdirSync(join(root, TARBALL_DIRECTORY), { recursive: true });
+    writeFileSync(join(root, TARBALL_DIRECTORY, artifact.fileName), ambiguous);
+    writeFileSync(join(root, 'plan.json'), `${JSON.stringify(plan(), null, 2)}\n`);
+    writeFileSync(join(root, PLAN_DIGEST_FILE), `${digestPlan(plan())}\n`);
+
+    expect(codes(root)).toContain('staging_tarball_unreadable');
+  });
+
   it('refuses a plan whose recorded digest does not describe it', () => {
     const root = stage();
     writeFileSync(join(root, PLAN_DIGEST_FILE), `${'0'.repeat(64)}\n`);
@@ -195,5 +222,49 @@ describe('staged plan against the dispatch that approved it', () => {
     expect(code(plan({ packages: [entry(), entry({ order: 2, name: '@relvo-labs/agent-runtime' })] }))).toContain(
       'plan_scope_mismatch',
     );
+  });
+});
+
+/**
+ * The rule the runbook states — *only the exact current tip of main may be
+ * released* — is only true if it is checked after the environment approval, not
+ * just before it. Preflight runs before approval, and an approval can sit for
+ * hours; `origin/main` in the gated job is whatever main was when that job
+ * checked out. Both gated entry points re-derive these facts, and the publisher
+ * re-derives them again before every individual upload.
+ */
+describe('source currency after the approval', () => {
+  const request = { sourceSha: SHA, distTag: 'latest', targets: [{ name: PROTOCOL, version: '0.2.0' }] };
+  const current = {
+    request,
+    context: { eventName: 'workflow_dispatch', ref: 'refs/heads/main', runnerSha: SHA },
+    git: { headSha: SHA, originMainSha: SHA, porcelain: '' },
+    pendingChangesetFiles: [] as readonly string[],
+  };
+  const codesOf = (input: Parameters<typeof checkSourceCurrency>[0]): readonly string[] =>
+    checkSourceCurrency(input).map((finding) => finding.code);
+
+  it('accepts a checkout that is still the approved tip of main', () => {
+    expect(checkSourceCurrency(current)).toEqual([]);
+  });
+
+  it('refuses once main has advanced past the approved commit', () => {
+    const moved = { ...current, git: { ...current.git, originMainSha: 'a'.repeat(40) } };
+    expect(codesOf(moved)).toContain('git_main_tip');
+    expect(checkSourceCurrency(moved)[0]?.message).toContain('only the exact current tip of main');
+  });
+
+  it('refuses a checkout, dispatch or event that drifted from the approved one', () => {
+    expect(codesOf({ ...current, git: { ...current.git, headSha: 'b'.repeat(40) } })).toContain('git_head');
+    expect(codesOf({ ...current, git: { ...current.git, porcelain: ' M packages/x\n' } })).toContain('git_dirty');
+    expect(codesOf({ ...current, context: { ...current.context, runnerSha: 'c'.repeat(40) } })).toContain(
+      'context_sha',
+    );
+    expect(codesOf({ ...current, context: { ...current.context, ref: 'refs/heads/topic' } })).toContain('context_ref');
+    expect(codesOf({ ...current, context: { ...current.context, eventName: 'push' } })).toContain('context_event');
+  });
+
+  it('refuses version intent that landed after the approval', () => {
+    expect(codesOf({ ...current, pendingChangesetFiles: ['late-intent.md'] })).toContain('pending_version_intent');
   });
 });

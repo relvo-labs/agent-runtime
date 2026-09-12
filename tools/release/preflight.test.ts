@@ -3,7 +3,7 @@ import { runPreflight, type PreflightInput } from './lib/preflight.ts';
 import type { RegistryScript } from './testing/fixtures.ts';
 import { fakeRegistry, buildPackageTarball, published } from './testing/fixtures.ts';
 import { inspectTarball, tarballFileName, type PackedArtifact } from './lib/tarball.ts';
-import type { RegistryPort } from './lib/registry.ts';
+import { parsePackument, type RegistryPort } from './lib/registry.ts';
 import type { PackageFixture } from './testing/fixtures.ts';
 
 const SHA = 'c'.repeat(40);
@@ -294,6 +294,34 @@ describe('release preflight', () => {
       zod: { kind: 'error', detail: 'registry returned a body that is not JSON' },
     });
     expect(await codes(baseline(), malformedDependency)).toContain('registry_unavailable');
+  });
+
+  /**
+   * Regression: a packument this code cannot fully account for must refuse the
+   * release, not authorise it.
+   *
+   * An independent review served three malformed documents — no `dist-tags`
+   * block, `latest: "0.0.invalid"`, and `latest` pointing at a version the
+   * document does not list. Each was classified as `found` and each produced a
+   * complete release plan with zero findings, because the dist-tag comparison
+   * simply had nothing to compare against.
+   */
+  it('refuses a malformed packument instead of planning a release from it', async () => {
+    const malformed: Record<string, unknown> = {
+      missingTags: { name: PROTOCOL, versions: {} },
+      invalidTag: { name: PROTOCOL, versions: {}, 'dist-tags': { latest: '0.0.invalid' } },
+      nonsenseTag: { name: PROTOCOL, versions: {}, 'dist-tags': { latest: 'nonsense' } },
+      danglingTag: { name: PROTOCOL, versions: {}, 'dist-tags': { latest: '0.1.0' } },
+    };
+    for (const [label, document] of Object.entries(malformed)) {
+      const classified = parsePackument(PROTOCOL, document);
+      expect(classified.kind, `${label} must not classify as a usable packument`).toBe('error');
+      const outcome = await runPreflight(baseline(), {
+        lookup: (name) => Promise.resolve(name === PROTOCOL ? classified : { kind: 'absent' }),
+      });
+      expect(outcome.findings.map((finding) => finding.code)).toContain('registry_unavailable');
+      expect(outcome.plan, `${label} must produce no plan`).toBeUndefined();
+    }
   });
 
   it('looks each package up once, however many dependents mention it', async () => {

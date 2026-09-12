@@ -11,6 +11,8 @@
  * says a version is free.
  */
 
+import { EXACT_VERSION_RE } from './plan.ts';
+
 export const DEFAULT_REGISTRY = 'https://registry.npmjs.org';
 
 export type RegistryVersion = {
@@ -40,7 +42,6 @@ export type RegistryPort = {
 };
 
 function readStringMap(value: unknown): Readonly<Record<string, string>> | undefined {
-  if (value === undefined) return {};
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const out: Record<string, string> = {};
   for (const [key, entry] of Object.entries(value)) {
@@ -84,8 +85,9 @@ export function parsePackument(requestedName: string, document: unknown): Regist
     if (entry.name !== requestedName || entry.version !== version) {
       return { kind: 'error', detail: `registry entry ${requestedName}@${version} disagrees with its own identity` };
     }
-    const dependencies = readStringMap(entry.dependencies);
-    const peerDependencies = readStringMap(entry.peerDependencies);
+    // An absent dependency block is a genuine "this package declares none".
+    const dependencies = readStringMap(entry.dependencies ?? {});
+    const peerDependencies = readStringMap(entry.peerDependencies ?? {});
     if (dependencies === undefined || peerDependencies === undefined) {
       return { kind: 'error', detail: `registry entry ${requestedName}@${version} has a malformed dependency map` };
     }
@@ -101,10 +103,33 @@ export function parsePackument(requestedName: string, document: unknown): Regist
     versions.set(version, { name: requestedName, version, dependencies, peerDependencies, integrity, shasum });
   }
 
-  const rawTags = record['dist-tags'];
-  const distTagsRecord = readStringMap(rawTags);
+  // `dist-tags` is not optional and is not decoration: it is the mutable part
+  // of a packument, and it is what the dist-tag regression check reads. A
+  // document that omits it, names a tag that is not an exact version, or points
+  // a tag at a version the same document does not list, is a document this code
+  // cannot reason about — so it refuses rather than treating the tag as unset.
+  // Reading an absent or unparseable tag as "no tag" is exactly how a release
+  // approved earlier would be allowed to move `latest` backwards.
+  const distTagsRecord = readStringMap(record['dist-tags']);
   if (distTagsRecord === undefined) {
-    return { kind: 'error', detail: `registry document for ${requestedName} has a malformed dist-tags map` };
+    return {
+      kind: 'error',
+      detail: `registry document for ${requestedName} has a missing or malformed dist-tags map`,
+    };
+  }
+  for (const [tag, version] of Object.entries(distTagsRecord)) {
+    if (!EXACT_VERSION_RE.test(version)) {
+      return {
+        kind: 'error',
+        detail: `registry document for ${requestedName} maps dist-tag \`${tag}\` to \`${version}\`, which is not an exact version`,
+      };
+    }
+    if (!versions.has(version)) {
+      return {
+        kind: 'error',
+        detail: `registry document for ${requestedName} maps dist-tag \`${tag}\` to ${version}, which it does not list as a version`,
+      };
+    }
   }
   return {
     kind: 'found',

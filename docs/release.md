@@ -17,11 +17,32 @@ anything, and running it is a human decision, not an automated consequence of me
 | credential-free proof first | `verify` runs `pnpm gate`, packs, and runs preflight before any approval           |
 | approval                    | `publish` runs in the `npm-release` environment and needs its reviewers            |
 | credential confinement      | exactly one step references `secrets.NPM_TOKEN`; a temporary npmrc interpolates it |
-| artifact integrity          | upload digest + `digest-mismatch: error` + local re-hash of every tarball          |
+| artifact integrity          | `digest-mismatch: error` on the download, then a local re-hash of every tarball    |
+| unambiguous identity        | an archive npm would read as a different package is refused, not described         |
+| still-current source        | the gated job and every upload re-check that `source_sha` is main's tip            |
 | ordering                    | dependency-topological publication, one explicit tarball per `npm publish`         |
 | provenance                  | `--provenance` with `id-token: write` granted only to the publish job              |
 | no overwrite                | preflight and the publish step both refuse an existing version                     |
 | verified outcome            | registry readback of identity, integrity, dependencies and dist-tag                |
+
+### How the artifact actually gets from `verify` to `publish`
+
+Worth stating precisely, because it is easy to describe more strongly than it
+is. `verify` uploads the staging directory and records the resulting
+**artifact id** as a job output. `publish` downloads that exact id — not a name
+— and passes `digest-mismatch: error`, so the pinned `actions/download-artifact`
+revision fails the job if the bytes it receives do not hash to the digest the
+Actions service recorded for that artifact. That check is driven by the
+artifact's own metadata; the action declares no input for supplying an expected
+digest, and an earlier version of this workflow passed one anyway. It has been
+removed, because a value that is silently ignored reads like a comparison that
+is not happening.
+
+The protections that do not depend on the transport at all are the ones that
+matter most, and they run inside the gated job before the credential exists:
+every tarball is re-hashed and re-read from the archive, and the plan is
+re-hashed and compared against `plan-digest`, which `verify` recorded as a job
+output before the approval was requested.
 
 ## Before a release can be dispatched at all
 
@@ -37,14 +58,43 @@ Preflight refuses the release unless **all** of the following hold at the named 
 5. every packed tarball is the reviewed one — right identity, `publishConfig.access` of
    `public`, `publishConfig.provenance` true, a license, a repository url, `LICENSE`,
    `NOTICE`, `README.md`, and no `src/` or `test/` files;
-6. the scope is closed over its own dependency graph, every internal dependency resolves
+6. every packed tarball has exactly one identity. Archive paths are normalised the way
+   an extractor normalises them and any collision is refused, header checksums are
+   verified, data after the end-of-archive marker is refused, entries outside the
+   `package/` tree are refused, and unsupported archive semantics (links, devices,
+   global pax headers, pax keys other than a `path` override) are refused rather than
+   skipped. `tools/release/pacote-differential.test.ts` proves the property this buys:
+   for every archive, either this repository and npm's own reader report the _same_
+   name and version, or this repository refuses the archive;
+7. the scope is closed over its own dependency graph, every internal dependency resolves
    to an exact version that is either in scope or already published, every third-party
    dependency range is exact (or the caret of an exact version) and published, and the
    graph is acyclic;
-7. no named version already exists on the registry, and the dist-tag would not move
+8. no named version already exists on the registry, and the dist-tag would not move
    backwards;
-8. the registry answered definitively. A 404 means "not published". An authentication
-   failure, a rate limit, a 5xx, a timeout or a malformed packument is a refusal.
+9. the registry answered definitively. A 404 means "not published". An authentication
+   failure, a rate limit, a 5xx, a timeout or a malformed packument is a refusal — and
+   a packument counts as malformed if it omits `dist-tags`, names a tag that is not an
+   exact version, or points a tag at a version it does not itself list. A document this
+   tooling cannot fully account for never authorises a publication.
+
+## What is re-established after the approval
+
+An environment approval is not a snapshot of the world. It can sit for hours,
+and three things it depended on are mutable in that window: `main` can advance,
+the registry's dist-tags can move, and a dependency this scope needs can be
+unpublished. Preflight proved all of them before the approval; the gated job
+proves them again afterwards, and the publisher proves them again immediately
+before **each** package's bytes are uploaded:
+
+- `source_sha` is still the exact tip of `origin/main`, still the checked-out
+  `HEAD`, still a clean tree, and there is still no pending version intent;
+- the dist-tag this dispatch would move does not already point at something
+  newer than the version about to be published;
+- every runtime dependency the packed manifest names is still resolvable at the
+  exact version it names.
+
+Any of these failing stops the run non-zero, before that package is uploaded.
 
 ## Outstanding human approvals
 
@@ -140,12 +190,23 @@ gate, the pack, the preflight and the artifact upload without publishing anythin
 The run stops at the first failure and exits non-zero. Its summary lists what is already
 public, what failed and why, and what was never attempted.
 
+A zero exit from `npm publish` and a confirmed registry readback are **different facts**,
+and the summary keeps them apart, because the recovery instruction depends entirely on
+which one you have. Read the summary in these three categories:
+
+| Summary line                 | What it means                                             | What to do                                                     |
+| ---------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| `published and verified`     | uploaded, and the registry serves what was reviewed       | done; never name it again in any dispatch                      |
+| `published but NOT verified` | uploaded and public, but readback could not confirm it    | investigate the registry state; never name it again either     |
+| `outcome unknown`            | upload attempted, and the registry could not be consulted | establish whether it is public **before** dispatching anything |
+
 - Nothing is unpublished or overwritten. Do not attempt to "fix" a published version.
-- Recovery is a **new** dispatch whose scope names only the packages that are still
-  unpublished, at the same versions, reviewed and approved again.
-- If a package was published but its readback failed, investigate the registry state
-  before dispatching anything else: preflight will refuse that version from then on,
-  which is the intended behaviour.
+- Recovery is a **new** dispatch whose scope names only the packages that are confirmed
+  still unpublished, at the same versions, reviewed and approved again.
+- A version in either of the lower two rows is, or may be, public and immutable. Naming
+  it in a recovery dispatch cannot succeed — preflight will refuse it once the registry
+  lists it, which is the intended behaviour, and is why the summary never folds an
+  attempted upload into "nothing was published".
 
 ## Local rehearsal
 

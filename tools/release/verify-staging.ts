@@ -15,6 +15,7 @@
 
 import { resolve } from 'node:path';
 import {
+  checkSourceCurrency,
   readActionsContext,
   readDispatchInputs,
   reportFindings,
@@ -49,31 +50,19 @@ const request = parsedRequest.request;
 const context = readActionsContext(process.env);
 const git = readGitFacts(repoRoot);
 
-if (context.ref !== 'refs/heads/main') {
-  findings.push({
-    code: 'context_ref',
-    message: `release may only be dispatched on refs/heads/main, got \`${context.ref}\``,
-  });
-}
-if (context.runnerSha !== request.sourceSha) {
-  findings.push({
-    code: 'context_sha',
-    message: `dispatch resolved to ${context.runnerSha}, not ${request.sourceSha}`,
-  });
-}
-if (git.headSha !== request.sourceSha) {
-  findings.push({ code: 'git_head', message: `checkout HEAD is ${git.headSha}, expected ${request.sourceSha}` });
-}
-if (git.porcelain.trim() !== '') {
-  findings.push({ code: 'git_dirty', message: 'checkout has uncommitted changes' });
-}
-// Dependency-free equivalent of `changeset status`: this job installs nothing.
-for (const file of readPendingChangesetFiles(repoRoot)) {
-  findings.push({
-    code: 'pending_version_intent',
-    message: `\`.changeset/${file}\` is unreleased version intent; version it in a separate reviewed release PR before publishing`,
-  });
-}
+// The same rule preflight applied before the approval, applied again after it.
+// `origin/main` here is whatever main was when this gated job checked out, so
+// an approval that sat while main advanced is refused rather than published.
+// The pending-changeset scan is the dependency-free equivalent of
+// `changeset status`: this job installs nothing.
+findings.push(
+  ...checkSourceCurrency({
+    request,
+    context,
+    git,
+    pendingChangesetFiles: readPendingChangesetFiles(repoRoot),
+  }),
+);
 
 const stagingRoot = resolveStagingRoot(requested);
 if (stagingRoot === undefined) {

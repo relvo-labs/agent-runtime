@@ -84,7 +84,12 @@ function parseScopeEntry(entry: string, findings: Finding[]): ReleaseTarget | un
 export function parseReleaseRequest(raw: DispatchInputs): RequestResult {
   const findings: Finding[] = [];
 
-  const sourceSha = raw.sourceSha.trim();
+  // Nothing below is trimmed. These inputs are documented as exact, and the
+  // confirmation phrase is meant to be a literal restatement of them — so a
+  // value that only becomes valid after normalisation is a value the operator
+  // did not actually type, and accepting it would quietly weaken the one
+  // control whose entire purpose is literalness.
+  const sourceSha = raw.sourceSha;
   if (!COMMIT_SHA_RE.test(sourceSha)) {
     findings.push({
       code: 'dispatch_source_sha',
@@ -92,10 +97,10 @@ export function parseReleaseRequest(raw: DispatchInputs): RequestResult {
     });
   }
 
-  const entries = raw.packages
-    .split(/[\s,]+/u)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry !== '');
+  // The scope list is the one input with deliberately supported separators:
+  // whitespace and commas split it, and nothing else about an entry is
+  // normalised.
+  const entries = raw.packages.split(/[\s,]+/u).filter((entry) => entry !== '');
   const targets: ReleaseTarget[] = [];
   for (const entry of entries) {
     const target = parseScopeEntry(entry, findings);
@@ -121,7 +126,7 @@ export function parseReleaseRequest(raw: DispatchInputs): RequestResult {
     seen.add(target.name);
   }
 
-  const distTag = raw.distTag.trim();
+  const distTag = raw.distTag;
   if (!DIST_TAG_RE.test(distTag)) {
     findings.push({
       code: 'dispatch_dist_tag',
@@ -138,7 +143,7 @@ export function parseReleaseRequest(raw: DispatchInputs): RequestResult {
   // The phrase is derived from the *parsed* inputs, so a typo in any of them
   // also invalidates the confirmation rather than being confirmed by it.
   const expected = confirmationPhrase({ count: entries.length, sourceSha, distTag });
-  if (raw.confirm.trim() !== expected) {
+  if (raw.confirm !== expected) {
     findings.push({
       code: 'dispatch_confirmation',
       message: `confirmation must read exactly: ${expected}`,

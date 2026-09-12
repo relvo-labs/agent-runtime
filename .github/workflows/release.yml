@@ -47,7 +47,6 @@ jobs:
       contents: read
     outputs:
       artifact-id: ${{ steps.upload.outputs.artifact-id }}
-      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
       plan-digest: ${{ steps.preflight.outputs.plan-digest }}
     env:
       RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
@@ -124,7 +123,6 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact-id }}
-          digest: ${{ needs.verify.outputs.artifact-digest }}
           digest-mismatch: error
           path: release-staging
       - name: Verify staged artifacts

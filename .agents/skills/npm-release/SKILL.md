@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.0.0
+version: 1.1.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -81,24 +81,54 @@ Do not use this skill when:
    are not the reviewed ones, a dependency range it cannot resolve to one exact version, a
    scope that is not closed over its own dependency graph, a dependency cycle, an existing
    version, a dist-tag regression, and any registry answer that is not a definitive 404 or
-   a well-formed packument.
+   a well-formed packument. A packument missing `dist-tags`, naming a tag that is not an
+   exact version, or pointing a tag at a version it does not list is malformed: the
+   dist-tag is the mutable half of a packument and reading it as "unset" is how a release
+   moves `latest` backwards while reporting success.
 
-5. **Publication is ordered, explicit and non-overwriting.** One tarball per `npm publish`,
+5. **An artifact has exactly one identity, or it is refused.** What this repository
+   reads out of a tarball and what npm extracts from it must never be two different
+   packages. Paths are normalised the way an extractor normalises them and collisions
+   are refused, header checksums are verified, appended data and content outside
+   `package/` are refused, and unsupported archive semantics are refused rather than
+   skipped. `pacote-differential.test.ts` asserts the resulting property against npm's
+   own bundled reader, offline: same identity, or refusal. Never relax that test to
+   "we parse tar the same way" — the invariant is about disagreement, not parsing.
+
+6. **The approval is not a snapshot.** An approval can sit for hours while `main`
+   advances, a dist-tag moves and a dependency is unpublished. Every fact the approval
+   rested on is re-established in the gated job, and again immediately before each
+   individual upload: `source_sha` still being the exact current tip of main, the
+   dist-tag not already pointing at something newer, and every packed dependency still
+   resolvable at its exact version.
+
+7. **Publication is ordered, explicit and non-overwriting.** One tarball per `npm publish`,
    in dependency order, with `--ignore-scripts --access public --provenance --tag <tag>
 --registry https://registry.npmjs.org` and a temporary `--userconfig` npmrc that
    interpolates the token from the environment and is removed in a `finally`. Each upload
    is followed by a registry readback of identity, integrity, dependency ranges and
    dist-tag before the next package is attempted.
 
-6. **Partial failure stays partial.** On any failure the run stops non-zero and reports
-   exactly what is already public. Nothing is unpublished, no version is overwritten, and
-   recovery is a _new_ human-reviewed dispatch whose scope names only what is still
-   unpublished.
+8. **Partial failure stays partial, and acceptance is not verification.** On any failure
+   the run stops non-zero. A zero exit from `npm publish` means the registry accepted the
+   bytes; a readback means it serves what was reviewed. The report keeps those apart —
+   `published`, `acceptedUnverified`, and `unknown` for an upload it could not
+   adjudicate — because reporting an accepted-but-unconfirmed upload as "not published"
+   invites a recovery dispatch naming a version that is already public and immutable.
+   Nothing is unpublished, no version is overwritten, and recovery is a _new_
+   human-reviewed dispatch whose scope names only what is _confirmed_ still unpublished.
 
-7. **Changing this path is a reviewed change.** `pnpm release:check` parses the workflow
-   and fails on a widened trigger, a second credentialed step, an unpinned or unreviewed
-   action, an inline shell program, or a publish command outside the reviewed scripts. Add
-   a new action to `ALLOWED_ACTIONS` only with an independently verified commit SHA.
+9. **Changing this path is a reviewed change.** `pnpm release:check` describes the
+   reviewed workflow as an exact structure: allowed job and step keys, exact job `env`
+   and `outputs` bindings, exact action inputs, the exact command sequence per job, and
+   an allow-list of every `${{ … }}` expression that may appear anywhere in the file. It
+   is exhaustive on purpose — a field the policy does not assert is a field an attacker
+   chooses, and `continue-on-error`, a `shell:` override, an extra `run:`, a constant in
+   place of a dispatch input and `secrets['NPM_TOKEN']` were each demonstrated to pass a
+   policy that only checked a list of properties. Editing the workflow therefore means
+   editing `EXPECTED_JOBS` in `workflow-policy.ts` too; that is the review step. Add a
+   new action to `ALLOWED_ACTIONS` only with an independently verified commit SHA, and
+   never pass an action input the pinned revision does not declare.
 
 ## Verification
 
@@ -125,3 +155,11 @@ node tools/release/preflight.ts --staging /tmp/release-staging
   (`publish`, `dist-tag`, `--provenance`, `--userconfig`), the npm registry packument
   format, and the GitHub Actions documentation for `workflow_dispatch` inputs,
   environments, job outputs and artifact digests.
+- Reviewed-not-copied: `actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`
+  — its `action.yml` contract and `src/download-artifact.ts` were read to establish that
+  the pinned revision declares no `digest` input and derives the expected hash from
+  artifact metadata. No text was incorporated.
+- Compared-against: `pacote`, as bundled with the npm that ships with the `.nvmrc` Node
+  runtime. It is loaded offline from that runtime's own installation for the
+  identity-agreement test, is not a declared dependency of this workspace, and no code
+  from it is incorporated.

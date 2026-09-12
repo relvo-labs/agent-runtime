@@ -106,6 +106,51 @@ describe('release dispatch inputs', () => {
     );
   });
 
+  /**
+   * Regressions for literal inputs.
+   *
+   * These fields are documented as exact and the confirmation phrase is
+   * documented as a literal restatement of them. An independent review wrapped
+   * each of them in a leading space and a trailing newline and the dispatch was
+   * still accepted — with the *normalised* value in the parsed request, not the
+   * one that was typed. Nothing here changed which package or version was
+   * selected, but "retype this exactly" stops meaning anything the moment
+   * something else is quietly accepted in its place.
+   *
+   * The scope list keeps its deliberately supported separators; that is the one
+   * documented exception and it is asserted above.
+   */
+  describe('exactness of the values the operator types', () => {
+    const decorate = (value: string): string => ` ${value}\n`;
+
+    it('refuses a source SHA that is only valid after trimming', () => {
+      for (const sourceSha of [decorate(SHA), `${SHA}\n`, ` ${SHA}`, `\t${SHA}`]) {
+        expect(codes({ ...inputs(), sourceSha })).toContain('dispatch_source_sha');
+      }
+    });
+
+    it('refuses a dist-tag that is only valid after trimming', () => {
+      for (const distTag of [decorate('latest'), 'latest\n', ' latest']) {
+        expect(codes({ ...inputs(), distTag })).toContain('dispatch_dist_tag');
+      }
+    });
+
+    it('compares the confirmation literally, with no normalisation at all', () => {
+      const base = inputs();
+      for (const confirm of [decorate(base.confirm), `${base.confirm}\n`, ` ${base.confirm}`, `${base.confirm} `]) {
+        expect(codes({ ...base, confirm })).toContain('dispatch_confirmation');
+      }
+    });
+
+    it('keeps the accepted request identical to what was typed', () => {
+      const result = parseReleaseRequest(inputs());
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.request.sourceSha).toBe(SHA);
+      expect(result.request.distTag).toBe('latest');
+    });
+  });
+
   it('does not let a stale confirmation survive a changed scope', () => {
     const stale = confirmationPhrase({ count: 2, sourceSha: SHA, distTag: 'latest' });
     const widened = inputs({

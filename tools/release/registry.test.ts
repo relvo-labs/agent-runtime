@@ -75,6 +75,56 @@ describe('registry response classification', () => {
     }
   });
 
+  /**
+   * Regressions for the fail-closed contract.
+   *
+   * An independent review fed three malformed packuments to preflight. Each was
+   * classified as `found` and each produced a release plan with zero findings:
+   * an absent `dist-tags` block read as "no tag is set", a tag whose value was
+   * not a version read as "nothing to compare", and a tag pointing at a version
+   * the document did not list read the same way. All three are the input to the
+   * dist-tag regression check, so accepting them is how a release moves
+   * `latest` backwards while reporting success.
+   */
+  it('refuses a document with no dist-tags block at all', () => {
+    const result = parsePackument(NAME, { name: NAME, versions: {} });
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.detail).toContain('dist-tags');
+  });
+
+  it('refuses a dist-tag whose value is not an exact version', () => {
+    for (const value of ['0.0.invalid', 'nonsense', '^0.1.0', '0.1', 'latest', '']) {
+      const document = { name: NAME, versions: {}, 'dist-tags': { latest: value } };
+      const result = parsePackument(NAME, document);
+      expect(result.kind, `dist-tag \`${value}\` must be refused`).toBe('error');
+      if (result.kind !== 'error') continue;
+      expect(result.detail).toContain('not an exact version');
+    }
+  });
+
+  it('refuses a dist-tag that points at a version the document does not list', () => {
+    const result = parsePackument(NAME, { name: NAME, versions: {}, 'dist-tags': { latest: '0.1.0' } });
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.detail).toContain('does not list as a version');
+  });
+
+  it('accepts an empty dist-tags block, which is a real state for a fresh name', () => {
+    expect(parsePackument(NAME, { name: NAME, versions: {}, 'dist-tags': {} }).kind).toBe('found');
+  });
+
+  it('still accepts a version entry that genuinely declares no dependencies', () => {
+    const result = parsePackument(NAME, {
+      name: NAME,
+      'dist-tags': { latest: '0.1.0' },
+      versions: { '0.1.0': { name: NAME, version: '0.1.0', dist: { integrity: 'sha512-abc' } } },
+    });
+    expect(result.kind).toBe('found');
+    if (result.kind !== 'found') return;
+    expect(result.packument.versions.get('0.1.0')?.dependencies).toEqual({});
+  });
+
   it('reads a well-formed packument', () => {
     const result = classifyRegistryResponse(NAME, 200, packumentBody());
     expect(result.kind).toBe('found');

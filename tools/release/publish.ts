@@ -18,6 +18,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
+  checkSourceCurrency,
   readActionsContext,
   readDispatchInputs,
   reportFindings,
@@ -28,7 +29,7 @@ import { parseReleaseRequest, type Finding } from './lib/plan.ts';
 import { publishRelease, redactSecrets, summarizeReport, type CommandOutcome } from './lib/publish.ts';
 import { createHttpsRegistry } from './lib/registry.ts';
 import { digestPlan, loadStaging, resolveStagingRoot } from './lib/staging.ts';
-import { readGitFacts } from './lib/workspace.ts';
+import { readGitFacts, readPendingChangesetFiles } from './lib/workspace.ts';
 
 const repoRoot = resolve(import.meta.dirname, '../..');
 const argv = process.argv.slice(2);
@@ -48,16 +49,21 @@ if (!parsedRequest.ok) {
 }
 const request = parsedRequest.request;
 const context = readActionsContext(process.env);
-const git = readGitFacts(repoRoot);
-if (context.ref !== 'refs/heads/main') {
-  findings.push({
-    code: 'context_ref',
-    message: `release may only be dispatched on refs/heads/main, got \`${context.ref}\``,
+
+/**
+ * Re-read, never remembered: this is called once here and again before each
+ * individual upload, so a `main` that advances mid-run stops the run rather
+ * than finishing it.
+ */
+const readSourceCurrency = (): readonly Finding[] =>
+  checkSourceCurrency({
+    request,
+    context,
+    git: readGitFacts(repoRoot),
+    pendingChangesetFiles: readPendingChangesetFiles(repoRoot),
   });
-}
-if (git.headSha !== request.sourceSha) {
-  findings.push({ code: 'git_head', message: `checkout HEAD is ${git.headSha}, expected ${request.sourceSha}` });
-}
+
+findings.push(...readSourceCurrency());
 
 const stagingRoot = resolveStagingRoot(requested);
 if (stagingRoot === undefined) {
@@ -125,6 +131,7 @@ try {
       registry: createHttpsRegistry(staging.plan.registry),
       log: write,
       sleep: (ms: number) => new Promise<void>((done) => setTimeout(done, ms)),
+      revalidateSource: readSourceCurrency,
     },
     { tarballPath: staging.tarballPath, userconfig },
   );

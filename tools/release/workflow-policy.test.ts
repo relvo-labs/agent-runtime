@@ -149,10 +149,6 @@ describe('artifact integrity between jobs', () => {
       /fail closed on an artifact digest mismatch/u,
     );
     expectRejected(
-      mutate('          digest: ${{ needs.verify.outputs.artifact-digest }}\n', ''),
-      /must pass the digest/u,
-    );
-    expectRejected(
       mutate('          artifact-ids: ${{ needs.verify.outputs.artifact-id }}', '          artifact-ids: latest'),
       /exact artifact id/u,
     );
@@ -188,6 +184,137 @@ describe('artifact integrity between jobs', () => {
         '      - name: Rebuild\n        run: pnpm build\n      - name: Verify staged artifacts\n        run: node tools/release/verify-staging.ts --staging release-staging',
       ),
       /publish must run exactly/u,
+    );
+  });
+});
+
+/**
+ * Regressions for structural bypasses reproduced by an independent review.
+ *
+ * Every mutation below previously returned **zero** findings. They are grouped
+ * here rather than scattered because they share one cause: the policy asserted
+ * a list of properties and said nothing about the rest of the document, so any
+ * field it did not name was a field an attacker could choose.
+ */
+describe('reproduced policy bypasses', () => {
+  it('rejects a gate step that is allowed to fail', () => {
+    expectRejected(
+      mutate('        run: pnpm gate', '        continue-on-error: true\n        run: pnpm gate'),
+      /must not suppress its own failure/u,
+    );
+  });
+
+  it('rejects a job that is allowed to fail', () => {
+    expectRejected(
+      mutate('  publish:\n    name: publish', '  publish:\n    continue-on-error: true\n    name: publish'),
+      /must not suppress its own failure/u,
+    );
+  });
+
+  it('rejects a shell override that need not run the command it declares', () => {
+    expectRejected(
+      mutate('        run: pnpm gate', '        shell: /bin/true {0}\n        run: pnpm gate'),
+      /must not override the shell/u,
+    );
+  });
+
+  it('rejects an extra unreviewed command in the credential-free job', () => {
+    expectRejected(
+      mutate(
+        '      - name: Run canonical gate',
+        '      - name: Unreviewed command\n        run: echo unreviewed\n      - name: Run canonical gate',
+      ),
+      /must run exactly 7 reviewed step\(s\)/u,
+    );
+  });
+
+  it('rejects an alternate spelling of the one reviewed secret reference', () => {
+    // `secrets['NPM_TOKEN']` is the same credential written a different way.
+    const bracketed = "      - name: Run canonical gate\n        env:\n          LEAK: ${{ secrets['NPM_TOKEN'] }}";
+    expectRejected(mutate('      - name: Run canonical gate', bracketed), /unreviewed secret expression/u);
+    expectRejected(mutate('      - name: Run canonical gate', bracketed), /exactly one step may receive a secret/u);
+  });
+
+  it('rejects a secret handed to a step of the gated job that is not the publication', () => {
+    expectRejected(
+      mutate(
+        '      - name: Verify staged artifacts\n',
+        "      - name: Verify staged artifacts\n        env:\n          LEAK: ${{ secrets['NPM_TOKEN'] }}\n",
+      ),
+      /must not declare env/u,
+    );
+  });
+
+  it('rejects a fabricated job output in place of the step that produces it', () => {
+    expectRejected(
+      mutate('plan-digest: ${{ steps.preflight.outputs.plan-digest }}', 'plan-digest: fabricated'),
+      /outputs `plan-digest` must be/u,
+    );
+  });
+
+  it('rejects a constant pinned in place of a dispatch input', () => {
+    expectRejected(
+      mutate('RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}', `RELEASE_SOURCE_SHA: ${'a'.repeat(40)}`),
+      /env `RELEASE_SOURCE_SHA` must be/u,
+    );
+  });
+
+  it('rejects an indirect spelling of a reviewed expression', () => {
+    expectRejected(
+      mutate('RELEASE_PACKAGES: ${{ inputs.packages }}', 'RELEASE_PACKAGES: ${{ github.event.inputs.packages }}'),
+      /unreviewed expression/u,
+    );
+  });
+
+  it('rejects a gated checkout that keeps the run token on disk', () => {
+    const persisted = releaseWorkflow.replace(
+      /( {2}publish:[\s\S]*?)persist-credentials: false/u,
+      '$1persist-credentials: true',
+    );
+    expect(persisted).not.toBe(releaseWorkflow);
+    expectRejected(persisted, /publish checkout must not persist credentials/u);
+  });
+
+  it('rejects a second env entry smuggled alongside the credential', () => {
+    expectRejected(
+      mutate('NPM_TOKEN: ${{ secrets.NPM_TOKEN }}', 'NPM_TOKEN: missing\n          OTHER: ${{ secrets.NPM_TOKEN }}'),
+      /env must be exactly \[NPM_TOKEN\]/u,
+    );
+  });
+
+  it('rejects a reintroduced digest input the pinned action does not declare', () => {
+    expectRejected(
+      mutate(
+        '          digest-mismatch: error',
+        '          digest: ${{ needs.verify.outputs.artifact-digest }}\n          digest-mismatch: error',
+      ),
+      /must not pass a `digest` input/u,
+    );
+  });
+
+  it('rejects a per-step timeout or working directory that the review never saw', () => {
+    expectRejected(
+      mutate('        run: pnpm gate', '        timeout-minutes: 1\n        run: pnpm gate'),
+      /must not set its own timeout/u,
+    );
+    expectRejected(
+      mutate('        run: pnpm gate', '        working-directory: /tmp\n        run: pnpm gate'),
+      /must not change its working directory/u,
+    );
+  });
+
+  it('rejects a matrix, a reusable workflow and a forwarded secrets block', () => {
+    expectRejected(
+      mutate('  publish:\n    name: publish', '  publish:\n    strategy:\n      fail-fast: false\n    name: publish'),
+      /must not use a matrix strategy/u,
+    );
+    expectRejected(
+      mutate('  publish:\n    name: publish', '  publish:\n    uses: ./.github/workflows/other.yml\n    name: publish'),
+      /must not delegate to a reusable workflow/u,
+    );
+    expectRejected(
+      mutate('  publish:\n    name: publish', '  publish:\n    secrets: inherit\n    name: publish'),
+      /must not forward a secrets block/u,
     );
   });
 });
