@@ -79,7 +79,14 @@ Choosing `workspace-write` or `danger-full-access` alongside a `cwd` also causes
 
 ### Credentials
 
-This adapter neither reads, manages, nor forwards credentials. The child inherits the host process environment, and the app-server resolves its own auth from `CODEX_HOME`/`HOME`. Nothing from a credential, a prompt, a path or a raw upstream error string is copied into a durable event or `AgentError`: upstream failures are published only as an allowlisted classification.
+This adapter does not parse or manage credentials. The child inherits the host process
+environment, and the app-server resolves its own auth from `CODEX_HOME`/`HOME`.
+
+Adapter-generated failures are published as allowlisted classifications rather than copied from
+raw upstream error strings. That protection is not a blanket redaction guarantee for durable
+events: assistant text is transmitted faithfully and can repeat prompts, paths, or other sensitive
+content. The host owns access control, retention, logging, downstream forwarding, and any content
+redaction required for durable event history.
 
 ## Lifecycle
 
