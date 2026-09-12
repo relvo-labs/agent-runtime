@@ -1,7 +1,7 @@
 ---
 name: local-ci-parity
 description: Keep one canonical credential-free gate that runs identically on a developer machine and in GitHub Actions, with no step that only exists in one place.
-version: 1.1.0
+version: 1.2.0
 stability: stable
 tags: [ci, github-actions, gate, reproducibility]
 ---
@@ -89,6 +89,17 @@ Do not use this skill when:
    frozen install next. Do not depend on `actions/setup-node` or Corepack: supported Node
    installations, including Node 26, need not ship Corepack. Never `npm i -g pnpm@latest`.
 
+   **The managed runtime is a `node` binary and nothing else.** `pnpm/setup` installs the
+   runtime with `pnpm runtime set node <version> -g`, which resolves the `node` package
+   into the pnpm store: `$PNPM_HOME/bin/node` is a link to
+   `…/store/v11/links/@/node/<version>/<hash>/node_modules/node/bin/node`, and there is no
+   `npm`, `npx` or `lib/node_modules` anywhere near it. Nothing in this repository may
+   assume otherwise. A tool that is not pnpm, Node or this workspace's own code is a
+   **dependency**: pin it in the catalog and resolve it through `node_modules`, never from
+   `process.execPath`'s neighbours and never from `PATH`. `tools/release/lib/npm-tool.ts`
+   is the worked example — the npm that publishes is pinned, because assuming the runtime
+   carried one is what broke run 34699256419.
+
    Changesets needs its configured base as a local Git ref. Checkout must fetch complete
    history and materialize `refs/heads/main` from `refs/remotes/origin/main`; full history
    with only the remote-tracking ref still fails `git merge-base main HEAD`.
@@ -112,6 +123,16 @@ act -j gate               # optional, if you have `act` installed
 
 After changing a workflow, confirm the step ids in the workflow match
 `node tools/repo/gate.ts --list` exactly. A mismatch is a parity break.
+
+Parity is about the toolchain as well as the step list, and a developer Node from nvm or a
+distro package is _not_ the runtime CI uses. When a change could depend on the runtime's
+layout, reproduce the hosted one before trusting a local green:
+
+```bash
+export PNPM_HOME=/tmp/setup-pnpm            # stands in for ~/setup-pnpm on the runner
+"$PNPM_HOME/pnpm" runtime set node 24.20.0 -g   # the pinned pnpm executable, as the action installs it
+PATH="$PNPM_HOME:$PNPM_HOME/bin:$PATH" pnpm gate
+```
 
 ## Provenance
 

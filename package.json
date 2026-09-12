@@ -49,6 +49,7 @@
     "ajv-formats": "catalog:",
     "eslint": "catalog:",
     "eslint-config-prettier": "catalog:",
+    "npm": "catalog:",
     "prettier": "catalog:",
     "publint": "catalog:",
     "tsdown": "catalog:",

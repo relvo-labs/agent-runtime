@@ -6,6 +6,13 @@
 # canonical credential-free gate and the fail-closed preflight; `publish`
 # uploads those same bytes and verifies them back out of the registry.
 #
+# Both jobs install the workspace from the lockfile. The gated job does so for
+# one reason: npm is a pinned devDependency here, because `pnpm/setup` installs
+# a Node runtime that bundles none, and the npm that publishes must be the same
+# proven package the gate's differential test read these archives with. It runs
+# in a step that does not hold the credential — building never happens in one
+# that does.
+#
 # Policy: .agents/skills/npm-release/SKILL.md
 # Runbook: docs/release.md
 # Structure is machine-checked by `pnpm release:check`.
@@ -119,6 +126,8 @@ jobs:
           cache: false
           require-lockfile: true
           install: false
+      - name: Install from lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Download reviewed release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

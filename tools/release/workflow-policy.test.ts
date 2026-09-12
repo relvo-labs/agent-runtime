@@ -189,6 +189,45 @@ describe('artifact integrity between jobs', () => {
 });
 
 /**
+ * The bootstrap the gated job depends on, as policy.
+ *
+ * `publish.ts` spawns npm from this workspace's own `node_modules`, because
+ * `pnpm/setup` installs a Node runtime that bundles no npm and the alternative
+ * — bare `npm` off `PATH` — is a program nothing here pins or reviews, and not
+ * the one the gate's differential test compared these archives against. That
+ * makes the frozen install a release control rather than a convenience: drop
+ * it and the gated job has no provable tool at all.
+ */
+describe('publication tool bootstrap', () => {
+  const gatedInstall =
+    '      - name: Install from lockfile\n        run: pnpm install --frozen-lockfile --ignore-scripts\n      - name: Download reviewed release artifacts';
+
+  it('rejects a gated job that never installs the pinned npm', () => {
+    expectRejected(
+      mutate(gatedInstall, '      - name: Download reviewed release artifacts'),
+      /publish must run exactly/u,
+    );
+  });
+
+  it('rejects a gated install that is not frozen and script-free', () => {
+    expectRejected(
+      mutate(gatedInstall, gatedInstall.replace('pnpm install --frozen-lockfile --ignore-scripts', 'pnpm install')),
+      /publish must run exactly/u,
+    );
+  });
+
+  it('rejects an install that lands after the steps which need the tool', () => {
+    expectRejected(
+      mutate(gatedInstall, '      - name: Download reviewed release artifacts').replace(
+        '      - name: Publish to npm',
+        '      - name: Install from lockfile\n        run: pnpm install --frozen-lockfile --ignore-scripts\n      - name: Publish to npm',
+      ),
+      /publish must run exactly/u,
+    );
+  });
+});
+
+/**
  * Regressions for structural bypasses reproduced by an independent review.
  *
  * Every mutation below previously returned **zero** findings. They are grouped

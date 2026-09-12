@@ -19,6 +19,7 @@ anything, and running it is a human decision, not an automated consequence of me
 | credential confinement      | exactly one step references `secrets.NPM_TOKEN`; a temporary npmrc interpolates it |
 | artifact integrity          | `digest-mismatch: error` on the download, then a local re-hash of every tarball    |
 | unambiguous identity        | an archive npm would read as a different package is refused, not described         |
+| one proven publishing tool  | npm is pinned in the catalog; the gate compares against it and only it publishes   |
 | still-current source        | the gated job and every upload re-ask the **remote** whether `source_sha` is main  |
 | ordering                    | dependency-topological publication, one explicit tarball per `npm publish`         |
 | provenance                  | `--provenance` with `id-token: write` granted only to the publish job              |
@@ -43,6 +44,36 @@ matter most, and they run inside the gated job before the credential exists:
 every tarball is re-hashed and re-read from the archive, and the plan is
 re-hashed and compared against `plan-digest`, which `verify` recorded as a job
 output before the approval was requested.
+
+### Which npm publishes
+
+One npm, pinned in `pnpm-workspace.yaml`'s catalog and locked with an integrity
+hash. It is a declared devDependency rather than something the runtime
+supplies, because `pnpm/setup` installs Node from the `node` package — a
+`node` binary and nothing else, with no npm beside it. Both jobs therefore
+install the workspace from the lockfile, frozen and script-free, and in the
+gated job that install is what puts the tool on disk. It runs in a step that
+holds no credential.
+
+The same package is used in both places that need it: the canonical gate's
+`tools/release/pacote-differential.test.ts` reads archives with _its_ bundled
+`pacote` and `tar`, and `tools/release/publish.ts` spawns _its_ CLI with
+`process.execPath`. That is the point — the identity-agreement argument is
+about npm's behaviour, so the npm it is argued about has to be the npm that
+runs. `tools/release/lib/npm-tool.ts` proves that before either one uses it:
+resolvable from this workspace, named `npm`, the exact catalog version, with a
+CLI and bundled readers that stay inside the package. There is no `PATH`
+fallback and no environment override; anything it cannot prove is refused, in
+`verify-staging.ts` before the credential exists and again in `publish.ts`
+before the tool is spawned.
+
+Until run 34699256419 this was two different programs. The test looked for npm
+beside `process.execPath`, which is where an nvm or distro Node keeps it and
+where the runner's managed runtime has nothing — so the suite failed to load
+and its gate step could not run. Publication meanwhile spawned bare `npm` off
+`PATH`, which on a runner is the image's preinstalled Node's npm: not pinned,
+not locked, not reviewed, and not what any differential run had ever compared
+against.
 
 ## Before a release can be dispatched at all
 
@@ -209,8 +240,8 @@ failure in any of them as a workflow bug rather than a reason to retry with a wi
   dispatched, the run will **refuse** rather than publish, and that refusal is the control
   working. Fixing it is a reviewed change to how the remote tip is observed, never a
   removal of the check;
-- that `npm` from the Node runtime `pnpm/setup` installs accepts the granular token and
-  mints provenance with `id-token: write`;
+- that the pinned `npm` this repository installs accepts the granular token and mints
+  provenance with `id-token: write`;
 - that the `npm-release` environment's reviewers are the people you expect.
 
 Everything before the environment approval is credential-free, so a first dispatch can be

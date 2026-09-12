@@ -17,20 +17,26 @@
  *   **for every archive, either both readers report the same identity, or this
  *   repository refuses the archive.** Silent disagreement is impossible.
  *
- * The comparison uses npm's own `pacote`, loaded out of the bundled npm that
- * ships with the Node runtime the gate already requires, in `offline` mode
- * against a local file. It is credential-free and makes no network request, so
- * it satisfies the canonical gate's constraints. If that module cannot be
- * found, this test fails: a differential test that quietly stops being
- * differential is worse than no differential test at all.
+ * The comparison uses npm's own `pacote`, loaded out of the npm package this
+ * workspace pins — the same npm `publish.ts` spawns to upload these bytes — in
+ * `offline` mode against a local file. It is credential-free and makes no
+ * network request, so it satisfies the canonical gate's constraints. If that
+ * tool's identity cannot be proven, this test fails: a differential test that
+ * quietly stops being differential is worse than no differential test at all.
+ *
+ * That tool used to be located by guessing at `process.execPath`'s neighbours,
+ * which is the layout of an official Node distribution and not the one
+ * `pnpm/setup` installs — see `lib/npm-tool.ts` for why that made the suite
+ * unloadable in CI, and why comparing against "whatever npm is around" would
+ * not have been a fix.
  */
 
-import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { afterAll, describe, expect, it } from 'vitest';
+import { describeNpmTool, requireFromNpmTool, requireNpmTool } from './lib/npm-tool.ts';
 import { inspectTarball } from './lib/tarball.ts';
 import { buildPackageTarball, buildTarball } from './testing/fixtures.ts';
 
@@ -39,24 +45,9 @@ type Pacote = {
   readonly manifest: (spec: string, options: Record<string, unknown>) => Promise<PacoteManifest>;
 };
 
-/** Locate the `npm` that ships with this Node runtime, not one on `PATH`. */
-function bundledNpmManifestPath(): string {
-  const executableDirectory = dirname(process.execPath);
-  const candidates = [
-    join(executableDirectory, '..', 'lib', 'node_modules', 'npm', 'package.json'),
-    join(executableDirectory, 'node_modules', 'npm', 'package.json'),
-  ];
-  const found = candidates.find((candidate) => existsSync(candidate));
-  if (found === undefined) {
-    throw new Error(
-      `cannot locate the npm bundled with ${process.execPath}; this differential test must not be skipped. Looked in: ${candidates.join(', ')}`,
-    );
-  }
-  return found;
-}
-
-const npmManifestPath = bundledNpmManifestPath();
-const pacote = createRequire(npmManifestPath)('pacote') as Pacote;
+const npmTool = requireNpmTool();
+const requireFromNpm = requireFromNpmTool(npmTool);
+const pacote = requireFromNpm('pacote') as Pacote;
 const cache = mkdtempSync(join(tmpdir(), 'relvo-release-pacote-'));
 
 afterAll(() => {
@@ -290,9 +281,24 @@ describe("identity agreement with npm's own archive reader", () => {
     );
   });
 
+  /**
+   * The attribution that makes the rest of this file mean anything: the npm
+   * read here is the pinned one, resolved out of this workspace, and it is the
+   * same package `publish.ts` spawns. If those ever come apart again, every
+   * agreement asserted above is an agreement with a program that never sees
+   * the release.
+   */
   it('states which npm it compared against, so the evidence is attributable', () => {
-    const npmVersion = (createRequire(npmManifestPath)('./package.json') as { version?: unknown }).version;
-    expect(typeof npmVersion).toBe('string');
+    const pinned = requireFromNpm('./package.json') as { name?: unknown; version?: unknown };
+    expect(pinned.name).toBe('npm');
+    expect(pinned.version).toBe(npmTool.version);
+    expect(npmTool.modules.map((module) => module.id)).toEqual(['pacote', 'tar']);
+    for (const module of npmTool.modules) {
+      expect(module.manifestPath.startsWith(npmTool.packageRoot), `${module.id} must come from the pinned npm`).toBe(
+        true,
+      );
+    }
+    process.stdout.write(`pacote-differential: compared against ${describeNpmTool(npmTool)}\n`);
   });
 });
 
@@ -302,9 +308,10 @@ describe("identity agreement with npm's own archive reader", () => {
  * Refusing formats is only safe if the format this repository actually ships is
  * not one of them. `npm pack` and `pnpm pack` both write through node-tar, so
  * the archive below is written by *that exact writer* — the one bundled with
- * the npm this test already loads — rather than by the in-memory fixture
- * builder. If a future node-tar stopped emitting the POSIX ustar signature, or
- * started splitting paths with `prefix`, this fails rather than the release.
+ * the pinned npm this test already loads — rather than by the in-memory
+ * fixture builder. If a future node-tar stopped emitting the POSIX ustar
+ * signature, or started splitting paths with `prefix`, this fails rather than
+ * the release.
  *
  * The long nested path is deliberate: node-tar emits a pax `path` record once a
  * name exceeds the 100-byte name field, so this also covers the one path
@@ -312,7 +319,7 @@ describe("identity agreement with npm's own archive reader", () => {
  */
 describe('archives written by npm’s own tar writer', () => {
   type TarWriter = { readonly create: (options: Record<string, unknown>, paths: readonly string[]) => void };
-  const tar = createRequire(npmManifestPath)('tar') as TarWriter;
+  const tar = requireFromNpm('tar') as TarWriter;
 
   function packWithNodeTar(files: Readonly<Record<string, string>>): Buffer {
     const scratch = mkdtempSync(join(cache, 'node-tar-'));
