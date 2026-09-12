@@ -350,6 +350,159 @@ describe('facts re-established after the approval', () => {
 });
 
 /**
+ * Regression for the closure finding: an in-scope dependency is re-looked-up
+ * too, not trusted because this run remembers publishing it.
+ *
+ * The reviewer built a three-package plan, let the first publish and verify,
+ * removed it from the registry while the *second* was publishing, and watched
+ * the third — which depends on the first — upload successfully with `ok: true`.
+ * No lookup of the first package happened after its removal, because membership
+ * of `publishedSoFar` short-circuited the check.
+ *
+ * The scenario is reproduced exactly: a registry whose contents change as a
+ * side effect of an upload, so the removal happens mid-run rather than being
+ * scripted in advance.
+ */
+describe('in-scope dependencies are re-established, not remembered', () => {
+  const PROVIDER = '@relvo-labs/agent-provider';
+  const names = [PROTOCOL, PROVIDER, RUNTIME] as const;
+
+  /** Three packages; only the third depends on the first. */
+  function threePackagePlan(): { plan: ReleasePlan; bytes: Buffer[] } {
+    const bytes = [
+      buildPackageTarball({ name: PROTOCOL, version: '0.2.0' }),
+      buildPackageTarball({ name: PROVIDER, version: '0.2.0' }),
+      buildPackageTarball({ name: RUNTIME, version: '0.2.0', dependencies: { [PROTOCOL]: '^0.2.0' } }),
+    ];
+    return {
+      bytes,
+      plan: {
+        schema: 'relvo-release-plan/1',
+        sourceSha: 'e'.repeat(40),
+        distTag: 'latest',
+        registry: 'https://registry.npmjs.org',
+        packages: [
+          entry(PROTOCOL, bytes[0]!, 1, {}),
+          entry(PROVIDER, bytes[1]!, 2, {}),
+          entry(RUNTIME, bytes[2]!, 3, { [PROTOCOL]: '^0.2.0' }),
+        ],
+        excluded: [],
+      },
+    };
+  }
+
+  /**
+   * A registry that reflects what this run has uploaded, and forgets one
+   * package again at a chosen moment.
+   */
+  function mutableRegistry(
+    bytes: readonly Buffer[],
+    removeAfterUploadOf: string | undefined,
+  ): { readonly ports: PublishPorts; readonly commands: string[]; readonly lookups: string[] } {
+    const uploaded = new Set<string>();
+    const commands: string[] = [];
+    const lookups: string[] = [];
+    let removed = false;
+    return {
+      commands,
+      lookups,
+      ports: {
+        registry: {
+          lookup: (name) => {
+            lookups.push(name);
+            if (removed && name === PROTOCOL) return Promise.resolve({ kind: 'absent' } as RegistryLookup);
+            if (!uploaded.has(name)) return Promise.resolve({ kind: 'absent' } as RegistryLookup);
+            const index = names.indexOf(name as (typeof names)[number]);
+            return Promise.resolve(
+              published(
+                name,
+                { '0.2.0': { dependencies: name === RUNTIME ? { [PROTOCOL]: '^0.2.0' } : {}, tarball: bytes[index]! } },
+                { latest: '0.2.0' },
+              ),
+            );
+          },
+        },
+        npm: (argv) => {
+          const name = names.find((candidate) => argv[1]?.includes(candidate.replace('@relvo-labs/', '')))!;
+          commands.push(name);
+          uploaded.add(name);
+          if (name === removeAfterUploadOf) removed = true;
+          return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+        },
+        log: () => undefined,
+        sleep: () => Promise.resolve(),
+        revalidateSource: () => [],
+      },
+    };
+  }
+
+  it('refuses the dependent when its in-scope dependency vanished mid-run', async () => {
+    const { plan: threePlan, bytes } = threePackagePlan();
+    // agent-protocol disappears while agent-provider is being published.
+    const { ports, commands, lookups } = mutableRegistry(bytes, PROVIDER);
+    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+
+    expect(report.ok).toBe(false);
+    expect(report.failure).toMatchObject({ name: RUNTIME, code: 'dependency_unpublished' });
+    expect(report.failure?.message).toContain('disappeared from the registry since this run published it');
+    // The first two are public; the dependent was never uploaded.
+    expect(commands).toEqual([PROTOCOL, PROVIDER]);
+    expect(report.published).toEqual([`${PROTOCOL}@0.2.0`, `${PROVIDER}@0.2.0`]);
+    // The proof that the lookup actually happens: protocol is consulted again
+    // after it was already published and verified.
+    expect(lookups.filter((name) => name === PROTOCOL).length).toBeGreaterThan(2);
+  });
+
+  it('still publishes all three when the dependency stays where this run put it', async () => {
+    const { plan: threePlan, bytes } = threePackagePlan();
+    const { ports, commands } = mutableRegistry(bytes, undefined);
+    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+
+    expect(report.ok).toBe(true);
+    expect(commands).toEqual([PROTOCOL, PROVIDER, RUNTIME]);
+  });
+
+  it('refuses the dependent when the in-scope lookup is merely inconclusive', async () => {
+    const { plan: threePlan, bytes } = threePackagePlan();
+    const uploaded = new Set<string>();
+    let poisoned = false;
+    const commands: string[] = [];
+    const ports: PublishPorts = {
+      registry: {
+        lookup: (name) => {
+          if (poisoned && name === PROTOCOL) {
+            return Promise.resolve({ kind: 'error', detail: 'ETIMEDOUT' } as RegistryLookup);
+          }
+          if (!uploaded.has(name)) return Promise.resolve({ kind: 'absent' } as RegistryLookup);
+          const index = names.indexOf(name as (typeof names)[number]);
+          return Promise.resolve(
+            published(
+              name,
+              { '0.2.0': { dependencies: name === RUNTIME ? { [PROTOCOL]: '^0.2.0' } : {}, tarball: bytes[index]! } },
+              { latest: '0.2.0' },
+            ),
+          );
+        },
+      },
+      npm: (argv) => {
+        const name = names.find((candidate) => argv[1]?.includes(candidate.replace('@relvo-labs/', '')))!;
+        commands.push(name);
+        uploaded.add(name);
+        if (name === PROVIDER) poisoned = true;
+        return Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      },
+      log: () => undefined,
+      sleep: () => Promise.resolve(),
+      revalidateSource: () => [],
+    };
+    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+
+    expect(report.failure).toMatchObject({ name: RUNTIME, code: 'registry_unavailable' });
+    expect(commands).toEqual([PROTOCOL, PROVIDER]);
+  });
+});
+
+/**
  * Regressions for publication accounting. A zero exit from `npm publish` and a
  * confirmed registry readback are different facts; folding them together made
  * a successful, immutable upload disappear from the summary.

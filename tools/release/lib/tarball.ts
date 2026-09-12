@@ -78,6 +78,59 @@ function verifyChecksum(header: Buffer): void {
 }
 
 /**
+ * Decide an entry's path the way npm's extractor decides it, and refuse any
+ * header format whose field semantics are not npm's.
+ *
+ * The `prefix` field at offset 345 is how ustar splits a path too long for the
+ * 100-byte name field, and it is *format-specific*: npm's bundled `node-tar`
+ * reads it only inside the branch guarded by the POSIX ustar signature — the
+ * exact eight bytes `ustar\0` + `00` at offset 257. Outside that branch npm
+ * ignores the field completely.
+ *
+ * An independent closure review turned that asymmetry into two identities for
+ * one archive: a second `package/package.json` header with valid checksums, a
+ * populated `prefix` and *no* ustar signature. This reader prepended the prefix
+ * and saw `package/ignored/package.json` — a different, harmless path — while
+ * npm ignored the prefix and let that header overwrite the real manifest with
+ * `agent-runtime@9.9.9`. Preflight and staging both passed.
+ *
+ * Two rules follow, and they are deliberately different in kind:
+ *
+ *   1. **Refuse unrecognised formats.** The signature must be POSIX ustar. GNU
+ *      (`ustar  \0`), old-style v7 (all zeroes) and anything else are refused
+ *      outright, because for those "what does this field mean?" has more than
+ *      one answer and this reader will not pick one.
+ *
+ *   2. **Inside ustar, match npm exactly.** `prefix` is *not* refused, because
+ *      node-tar genuinely emits it: a path that can be split so the tail fits
+ *      in 100 bytes and the head in 155 uses `prefix`, and only an unsplittable
+ *      path falls back to a pax record. Refusing it would reject real packed
+ *      artifacts with deep `dist/` trees. So the npm rule is reproduced
+ *      literally, including the byte-475 branch that selects a 155-byte or a
+ *      130-byte prefix — see `header.js` in the bundled `tar`.
+ *
+ * Rule 1 is what closes the finding; rule 2 is what keeps it honest. A reader
+ * that refuses what npm accepts is a release that cannot ship; a reader that
+ * accepts what npm reads differently is a release that ships the wrong thing.
+ */
+const USTAR_SIGNATURE = 'ustar\0' + '00';
+
+function ustarPathOf(header: Buffer): string {
+  const signature = header.subarray(257, 265).toString('latin1');
+  if (signature !== USTAR_SIGNATURE) {
+    throw new Error(
+      `tar header does not carry the POSIX ustar signature (found ${JSON.stringify(signature)}); this reader ` +
+        'refuses formats whose field semantics it cannot guarantee match npm',
+    );
+  }
+  const name = readString(header, 0, 100);
+  // npm: `if (buf[off + 475] !== 0)` selects a 155-byte prefix, else 130.
+  const prefix = header[475] !== 0 ? readString(header, 345, 155) : readString(header, 345, 130);
+  if (header[475] !== 0) return `${prefix}/${name}`;
+  return prefix === '' ? name : `${prefix}/${name}`;
+}
+
+/**
  * Normalize an entry path the way an extractor does before it decides which
  * file a name refers to.
  *
@@ -129,13 +182,16 @@ export function readTarEntries(tar: Buffer): Map<string, Buffer> {
       return entries;
     }
     verifyChecksum(header);
-    const name = readString(header, 0, 100);
+    // Refuses a non-ustar header, and otherwise yields exactly the path npm
+    // would compute for this entry — name plus, if present, the ustar prefix.
+    const headerPath = ustarPathOf(header);
     const size = readOctal(header, 124, 12);
     const typeFlag = readString(header, 156, 1);
-    const prefix = readString(header, 345, 155);
     const dataStart = offset + BLOCK;
     const dataEnd = dataStart + size;
-    if (dataEnd > tar.length) throw new Error(`tar entry \`${name}\` claims ${size} bytes past the end of the archive`);
+    if (dataEnd > tar.length) {
+      throw new Error(`tar entry \`${headerPath}\` claims ${size} bytes past the end of the archive`);
+    }
     const data = tar.subarray(dataStart, dataEnd);
     offset = dataStart + Math.ceil(size / BLOCK) * BLOCK;
 
@@ -157,15 +213,25 @@ export function readTarEntries(tar: Buffer): Map<string, Buffer> {
       continue;
     }
     if (typeFlag === 'g') throw new Error('tar archive uses a global pax header');
-    if (typeFlag === 'L') {
-      pendingPath = data.toString('utf8').replace(/\0+$/u, '');
-      continue;
+    if (typeFlag === 'L' || typeFlag === 'K') {
+      // GNU long-name/long-link entries. Unreachable in practice now that the
+      // POSIX ustar signature is required — GNU writes `ustar  \0` — but stated
+      // as a refusal rather than left to fall through as an unknown type, so
+      // the reason a GNU archive is rejected is the format, not a type flag.
+      throw new Error('tar archive uses a GNU long-name entry; only pax `path` overrides are supported');
     }
 
-    const rawPath = pendingPath ?? (prefix === '' ? name : `${prefix}/${name}`);
+    // A pax `path` record overrides the header, exactly as it does for npm.
+    const rawPath = pendingPath ?? headerPath;
     pendingPath = undefined;
     const path = normalizeEntryPath(rawPath);
-    if (typeFlag === '5') continue; // directory
+    // npm: `if (this.#type === '0' && this.path.slice(-1) === '/') type = '5'`.
+    // A regular-file entry whose name ends in a slash is a *directory* to npm,
+    // so `package/package.json/` carries no manifest there. Normalising the
+    // slash away here and keeping it as a file would be an identity difference
+    // on exactly the file that decides what is being published.
+    const trailingSlash = rawPath.endsWith('/');
+    if (typeFlag === '5' || ((typeFlag === '0' || typeFlag === '') && trailingSlash)) continue; // directory
     if (typeFlag !== '0' && typeFlag !== '') {
       throw new Error(`tar entry \`${path}\` has unsupported type flag \`${typeFlag}\``);
     }

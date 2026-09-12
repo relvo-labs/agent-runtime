@@ -26,7 +26,7 @@
  */
 
 import { createRequire } from 'node:module';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gzipSync, gunzipSync } from 'node:zlib';
@@ -116,6 +116,39 @@ const archives: Readonly<Record<string, Buffer>> = {
     'package//package.json': manifestJson(IMPOSTOR, '9.9.9'),
   }),
 
+  // The format-signature bypass found by the closure review. A second header
+  // for `package/package.json` with valid checksums, a populated `prefix` and
+  // no ustar signature. npm applies `prefix` only under the ustar branch, so it
+  // ignores it and overwrites the real manifest; a reader that applies `prefix`
+  // unconditionally sees the harmless `package/ignored/package.json` instead.
+  'v7-prefix-shadow.tgz': (() => {
+    const raw = gunzipSync(
+      buildPackageTarball({
+        name: PROTOCOL,
+        version: '0.2.0',
+        extraEntries: { 'package/second.json': manifestJson(IMPOSTOR, '9.9.9') },
+      }),
+    );
+    for (let offset = 0; offset + 512 <= raw.length;) {
+      const header = raw.subarray(offset, offset + 512);
+      if (header.every((byte) => byte === 0)) break;
+      const name = header.subarray(0, 100).toString('utf8').split('\0')[0];
+      const size = Number.parseInt(header.subarray(124, 136).toString('utf8').trim(), 8);
+      if (name === 'package/second.json') {
+        header.fill(0, 0, 100);
+        header.write('package/package.json', 0, 'utf8');
+        header.fill(0, 257, 265); // strip the ustar signature
+        header.write('package/ignored', 345, 'utf8'); // …and add a prefix
+        header.fill(0x20, 148, 156);
+        let sum = 0;
+        for (const byte of header) sum += byte;
+        header.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 'utf8');
+      }
+      offset += 512 + Math.ceil(size / 512) * 512;
+    }
+    return gzipSync(raw);
+  })(),
+
   // A header checksum npm rejects as an unrecognised archive.
   'bad-checksum.tgz': (() => {
     const raw = gunzipSync(buildTarball({ 'package/package.json': manifestJson(PROTOCOL, '0.2.0') }));
@@ -134,6 +167,13 @@ const archives: Readonly<Record<string, Buffer>> = {
   'outside-package-tree.tgz': buildTarball({
     'package/package.json': manifestJson(PROTOCOL, '0.2.0'),
     'elsewhere/payload.js': 'globalThis.pwned = true;\n',
+  }),
+
+  // A regular-file entry whose name ends in a slash. npm rewrites its type to
+  // directory, so the impostor manifest is not a manifest there at all.
+  'trailing-slash-directory.tgz': buildTarball({
+    'package/package.json': manifestJson(PROTOCOL, '0.2.0'),
+    'package/package.json/': manifestJson(IMPOSTOR, '9.9.9'),
   }),
 
   // A manifest reachable only through a pax path override.
@@ -193,7 +233,12 @@ describe("identity agreement with npm's own archive reader", () => {
   });
 
   it('refuses every archive npm would read as a different package', async () => {
-    for (const fileName of ['normalized-duplicate.tgz', 'empty-segment-duplicate.tgz', 'appended-archive.tgz']) {
+    for (const fileName of [
+      'normalized-duplicate.tgz',
+      'empty-segment-duplicate.tgz',
+      'appended-archive.tgz',
+      'v7-prefix-shadow.tgz',
+    ]) {
       const bytes = archives[fileName]!;
       // npm resolves each of these to *some* identity — that is the danger.
       const theirs = await readWithNpm(fileName, bytes);
@@ -202,10 +247,32 @@ describe("identity agreement with npm's own archive reader", () => {
     }
   });
 
+  /**
+   * The sharpest form of the closure finding: the two readers do not merely
+   * differ in strictness here, they name *different packages* for identical
+   * bytes. Asserted explicitly against npm rather than only as "we refuse", so
+   * that weakening the header rules cannot quietly pass this file.
+   */
+  it('confirms npm reads the prefix-shadow archive as the impostor', async () => {
+    const bytes = archives['v7-prefix-shadow.tgz']!;
+    expect(await readWithNpm('v7-prefix-shadow.tgz', bytes)).toEqual({
+      kind: 'identity',
+      identity: { name: IMPOSTOR, version: '9.9.9' },
+    });
+    expect(readWithThisRepository('v7-prefix-shadow.tgz', bytes)).toEqual({ kind: 'refused' });
+  });
+
   it('refuses an archive npm itself cannot recognise', async () => {
     const bytes = archives['bad-checksum.tgz']!;
     expect(await readWithNpm('bad-checksum.tgz', bytes)).toEqual({ kind: 'refused' });
     expect(readWithThisRepository('bad-checksum.tgz', bytes)).toEqual({ kind: 'refused' });
+  });
+
+  it('agrees that a trailing-slash entry is a directory, not a second manifest', async () => {
+    const bytes = archives['trailing-slash-directory.tgz']!;
+    const expected = { kind: 'identity', identity: { name: PROTOCOL, version: '0.2.0' } };
+    expect(readWithThisRepository('trailing-slash-directory.tgz', bytes)).toEqual(expected);
+    expect(await readWithNpm('trailing-slash-directory.tgz', bytes)).toEqual(expected);
   });
 
   it('refuses an archive carrying files npm would never install', async () => {
@@ -226,5 +293,63 @@ describe("identity agreement with npm's own archive reader", () => {
   it('states which npm it compared against, so the evidence is attributable', () => {
     const npmVersion = (createRequire(npmManifestPath)('./package.json') as { version?: unknown }).version;
     expect(typeof npmVersion).toBe('string');
+  });
+});
+
+/**
+ * The positive control for header strictness.
+ *
+ * Refusing formats is only safe if the format this repository actually ships is
+ * not one of them. `npm pack` and `pnpm pack` both write through node-tar, so
+ * the archive below is written by *that exact writer* — the one bundled with
+ * the npm this test already loads — rather than by the in-memory fixture
+ * builder. If a future node-tar stopped emitting the POSIX ustar signature, or
+ * started splitting paths with `prefix`, this fails rather than the release.
+ *
+ * The long nested path is deliberate: node-tar emits a pax `path` record once a
+ * name exceeds the 100-byte name field, so this also covers the one path
+ * override the reader still honours.
+ */
+describe('archives written by npm’s own tar writer', () => {
+  type TarWriter = { readonly create: (options: Record<string, unknown>, paths: readonly string[]) => void };
+  const tar = createRequire(npmManifestPath)('tar') as TarWriter;
+
+  function packWithNodeTar(files: Readonly<Record<string, string>>): Buffer {
+    const scratch = mkdtempSync(join(cache, 'node-tar-'));
+    for (const [relative, contents] of Object.entries(files)) {
+      const destination = join(scratch, relative);
+      mkdirSync(dirname(destination), { recursive: true });
+      writeFileSync(destination, contents);
+    }
+    const archive = join(scratch, 'packed.tgz');
+    tar.create({ sync: true, gzip: true, cwd: scratch, file: archive, portable: true }, ['package']);
+    return readFileSync(archive);
+  }
+
+  it('accepts an ordinary package written by node-tar, and reads it as npm does', async () => {
+    const deepName = `package/dist/${'nested-directory/'.repeat(6)}index.js`;
+    const bytes = packWithNodeTar({
+      'package/package.json': manifestJson(PROTOCOL, '0.2.0'),
+      'package/README.md': '# readme\n',
+      'package/LICENSE': 'Apache-2.0\n',
+      'package/NOTICE': 'NOTICE\n',
+      'package/dist/index.js': 'export const marker = 1;\n',
+      [deepName]: 'export const deep = 1;\n',
+    });
+
+    const ours = readWithThisRepository('node-tar-ordinary.tgz', bytes);
+    expect(ours).toEqual({ kind: 'identity', identity: { name: PROTOCOL, version: '0.2.0' } });
+    expect(await readWithNpm('node-tar-ordinary.tgz', bytes)).toEqual(ours);
+
+    // The long path survived, which means the pax `path` record was honoured
+    // rather than the entry being dropped or truncated.
+    expect(inspectTarball('node-tar-ordinary.tgz', bytes).entries).toContain(deepName);
+  });
+
+  it('confirms node-tar writes the signature this reader requires', () => {
+    const raw = gunzipSync(packWithNodeTar({ 'package/package.json': manifestJson(PROTOCOL, '0.2.0') }));
+    expect(raw.subarray(257, 265)).toEqual(Buffer.from('ustar\u000000', 'latin1'));
+    // …and does not use the ambiguous prefix split.
+    expect(raw.subarray(345, 500).every((byte) => byte === 0)).toBe(true);
   });
 });

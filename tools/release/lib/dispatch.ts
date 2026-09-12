@@ -11,6 +11,7 @@
 
 import type { Finding, DispatchInputs, ReleaseRequest } from './plan.ts';
 import type { ActionsContext, GitFacts, ReleasePlan } from './preflight.ts';
+import type { RemoteMain } from './workspace.ts';
 import { DEFAULT_REGISTRY } from './registry.ts';
 
 export function readDispatchInputs(env: NodeJS.ProcessEnv): DispatchInputs {
@@ -49,17 +50,29 @@ export function requireFlag(argv: readonly string[], flag: string): string {
  * matters, so the gated job re-checks it, and the publisher re-checks it again
  * before every single upload.
  *
- * `originMainSha` is the meaningful one: the other facts are stable within a
- * job, but the remote-tracking ref is whatever `main` was when this job checked
- * out, which is after the approval was given.
+ * Two facts about `main` are checked, and they are not the same fact:
+ *
+ *   - `git.originMainSha` is the *cached* remote-tracking ref. It is whatever
+ *     this job fetched when it checked out, which is already after the approval
+ *     was given, so it is worth checking — but it never changes again for the
+ *     rest of the job, however long the job runs.
+ *   - `remoteMain` is an observation of the **actual remote**, taken now.
+ *
+ * An independent review made exactly that distinction the finding: it advanced
+ * `main` on the server after the gated checkout, and every per-upload check
+ * still passed, because the cached ref was the only thing anyone asked. A
+ * caller that cannot obtain a fresh remote observation must pass the
+ * `unavailable` result it got, and this refuses — an unanswerable remote is
+ * never read as agreement.
  */
 export function checkSourceCurrency(input: {
   readonly request: ReleaseRequest;
   readonly context: ActionsContext;
   readonly git: GitFacts;
+  readonly remoteMain: RemoteMain;
   readonly pendingChangesetFiles: readonly string[];
 }): readonly Finding[] {
-  const { context, git, request } = input;
+  const { context, git, request, remoteMain } = input;
   const findings: Finding[] = [];
   if (context.eventName !== 'workflow_dispatch') {
     findings.push({
@@ -85,7 +98,18 @@ export function checkSourceCurrency(input: {
   if (git.originMainSha !== request.sourceSha) {
     findings.push({
       code: 'git_main_tip',
-      message: `origin/main is now ${git.originMainSha}; only the exact current tip of main may be released, not ${request.sourceSha}`,
+      message: `the checkout's cached origin/main is ${git.originMainSha}; only the exact current tip of main may be released, not ${request.sourceSha}`,
+    });
+  }
+  if (remoteMain.kind === 'unavailable') {
+    findings.push({
+      code: 'git_remote_unavailable',
+      message: `could not establish where main is on the remote right now: ${remoteMain.detail}; refusing to publish against an unverifiable branch tip`,
+    });
+  } else if (remoteMain.sha !== request.sourceSha) {
+    findings.push({
+      code: 'git_remote_main_tip',
+      message: `main on the remote is now ${remoteMain.sha}, not the approved ${request.sourceSha}; it advanced after this release was approved`,
     });
   }
   if (git.porcelain.trim() !== '') {

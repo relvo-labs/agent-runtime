@@ -29,7 +29,7 @@ import { parseReleaseRequest, type Finding } from './lib/plan.ts';
 import { publishRelease, redactSecrets, summarizeReport, type CommandOutcome } from './lib/publish.ts';
 import { createHttpsRegistry } from './lib/registry.ts';
 import { digestPlan, loadStaging, resolveStagingRoot } from './lib/staging.ts';
-import { readGitFacts, readPendingChangesetFiles } from './lib/workspace.ts';
+import { readGitFacts, readPendingChangesetFiles, readRemoteMain } from './lib/workspace.ts';
 
 const repoRoot = resolve(import.meta.dirname, '../..');
 const argv = process.argv.slice(2);
@@ -54,12 +54,19 @@ const context = readActionsContext(process.env);
  * Re-read, never remembered: this is called once here and again before each
  * individual upload, so a `main` that advances mid-run stops the run rather
  * than finishing it.
+ *
+ * `readRemoteMain` is the part that makes that claim true. The checkout's
+ * cached `origin/main` cannot change once this job has started, so re-reading
+ * it proves nothing about the world after the approval; the remote is asked
+ * directly, read-only, and an unanswerable remote refuses. Git is spawned
+ * without `NPM_TOKEN` in its environment — see `workspace.ts`.
  */
 const readSourceCurrency = (): readonly Finding[] =>
   checkSourceCurrency({
     request,
     context,
     git: readGitFacts(repoRoot),
+    remoteMain: readRemoteMain(repoRoot),
     pendingChangesetFiles: readPendingChangesetFiles(repoRoot),
   });
 

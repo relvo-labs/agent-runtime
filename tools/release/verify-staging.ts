@@ -24,7 +24,7 @@ import {
 } from './lib/dispatch.ts';
 import { parseReleaseRequest, type Finding } from './lib/plan.ts';
 import { digestPlan, loadStaging, resolveStagingRoot } from './lib/staging.ts';
-import { readGitFacts, readPendingChangesetFiles } from './lib/workspace.ts';
+import { readGitFacts, readPendingChangesetFiles, readRemoteMain } from './lib/workspace.ts';
 
 const repoRoot = resolve(import.meta.dirname, '../..');
 const argv = process.argv.slice(2);
@@ -50,16 +50,17 @@ const request = parsedRequest.request;
 const context = readActionsContext(process.env);
 const git = readGitFacts(repoRoot);
 
-// The same rule preflight applied before the approval, applied again after it.
-// `origin/main` here is whatever main was when this gated job checked out, so
-// an approval that sat while main advanced is refused rather than published.
-// The pending-changeset scan is the dependency-free equivalent of
-// `changeset status`: this job installs nothing.
+// The same rule preflight applied before the approval, applied again after it —
+// and against the remote rather than only against what this job happened to
+// fetch, because an approval that sat while main advanced must be refused. The
+// pending-changeset scan is the dependency-free equivalent of `changeset
+// status`: this job installs nothing.
 findings.push(
   ...checkSourceCurrency({
     request,
     context,
     git,
+    remoteMain: readRemoteMain(repoRoot),
     pendingChangesetFiles: readPendingChangesetFiles(repoRoot),
   }),
 );

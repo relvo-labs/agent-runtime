@@ -13,15 +13,33 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ChangesetRelease, GitFacts, WorkspacePackage } from './preflight.ts';
 
-export function runCommand(
-  program: string,
-  args: readonly string[],
-  cwd: string,
-): { code: number; stdout: string; stderr: string } {
-  const result = spawnSync(program, args, { cwd, env: process.env, encoding: 'utf8' });
+export type CommandResult = { readonly code: number; readonly stdout: string; readonly stderr: string };
+
+/**
+ * The command boundary, as one named function.
+ *
+ * Everything in this module that shells out goes through here, so a test can
+ * substitute the boundary rather than a builtin, and so there is exactly one
+ * place that decides what environment a child process sees.
+ */
+export type CommandRunner = (program: string, args: readonly string[], cwd: string) => CommandResult;
+
+/**
+ * `NPM_TOKEN` exists in exactly one step, and nothing spawned from this module
+ * needs it. Git in particular is invoked *while* the credential is in the
+ * publisher's environment, so it is removed from the child's environment rather
+ * than merely trusted not to be used.
+ */
+function credentialFreeEnv(): NodeJS.ProcessEnv {
+  const { NPM_TOKEN: _removed, ...rest } = process.env;
+  return rest;
+}
+
+export const runCommand: CommandRunner = (program, args, cwd) => {
+  const result = spawnSync(program, args, { cwd, env: credentialFreeEnv(), encoding: 'utf8' });
   if (result.error !== undefined) throw result.error;
   return { code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
-}
+};
 
 export function readWorkspaceInventory(repoRoot: string): readonly WorkspacePackage[] {
   const packagesRoot = join(repoRoot, 'packages');
@@ -87,15 +105,82 @@ export function readChangesetStatus(repoRoot: string): readonly ChangesetRelease
   }
 }
 
-export function readGitFacts(repoRoot: string): GitFacts {
+export function readGitFacts(repoRoot: string, run: CommandRunner = runCommand): GitFacts {
   const revParse = (ref: string): string => {
-    const result = runCommand('git', ['rev-parse', ref], repoRoot);
+    const result = run('git', ['rev-parse', ref], repoRoot);
     return result.code === 0 ? result.stdout.trim() : `<unresolved ${ref}>`;
   };
-  const status = runCommand('git', ['status', '--porcelain'], repoRoot);
+  const status = run('git', ['status', '--porcelain'], repoRoot);
   return {
     headSha: revParse('HEAD'),
     originMainSha: revParse('refs/remotes/origin/main'),
     porcelain: status.code === 0 ? status.stdout : '<git status failed>',
   };
+}
+
+/** The current tip of `main` **on the remote**, or an explicit refusal to say. */
+export type RemoteMain =
+  { readonly kind: 'observed'; readonly sha: string } | { readonly kind: 'unavailable'; readonly detail: string };
+
+const LS_REMOTE_LINE_RE = /^(?<sha>[0-9a-f]{40})\t(?<ref>\S+)$/u;
+
+/**
+ * Classify `git ls-remote` output. Pure, so every failure mode is testable
+ * without a network, a remote or a subprocess.
+ *
+ * Fail-closed in every direction: a non-zero exit, empty output, a line this
+ * cannot parse, a ref that is not the one asked for, a short or upper-case
+ * object id, or more than one matching line all produce `unavailable`. There is
+ * no path from "the remote did not answer clearly" to "the remote agrees".
+ */
+export function parseRemoteMain(result: CommandResult, ref = 'refs/heads/main'): RemoteMain {
+  if (result.code !== 0) {
+    const detail = (result.stderr.trim() || result.stdout.trim() || '<no output>').split('\n').slice(-3).join('; ');
+    return { kind: 'unavailable', detail: `git ls-remote exited ${String(result.code)}: ${detail}` };
+  }
+  const lines = result.stdout.split('\n').filter((line) => line.trim() !== '');
+  if (lines.length === 0) {
+    return { kind: 'unavailable', detail: `the remote lists no \`${ref}\`; it may have been renamed or deleted` };
+  }
+  const matches: string[] = [];
+  for (const line of lines) {
+    const parsed = LS_REMOTE_LINE_RE.exec(line.trimEnd());
+    if (parsed?.groups === undefined) {
+      return { kind: 'unavailable', detail: `git ls-remote produced a line this tool cannot parse: \`${line}\`` };
+    }
+    if (parsed.groups.ref !== ref) continue;
+    matches.push(parsed.groups.sha!);
+  }
+  if (matches.length === 0) {
+    return { kind: 'unavailable', detail: `git ls-remote answered without a \`${ref}\` entry` };
+  }
+  if (matches.length > 1) {
+    return { kind: 'unavailable', detail: `git ls-remote reports \`${ref}\` more than once; the answer is ambiguous` };
+  }
+  return { kind: 'observed', sha: matches[0]! };
+}
+
+/**
+ * Ask the remote where `main` actually is, right now.
+ *
+ * The cached `refs/remotes/origin/main` that `readGitFacts` reads is whatever
+ * the checkout fetched — which, in the gated job, is a snapshot taken when that
+ * job started. An independent review advanced `main` on the server after that
+ * point and every per-upload source check still passed, because nothing ever
+ * asked the remote anything. This does.
+ *
+ * It is a read-only query over the transport the checkout already used. It
+ * writes nothing, persists no credential (the child process does not even
+ * receive `NPM_TOKEN`), fetches no objects, and needs no permission beyond what
+ * cloning the repository required. If it cannot get an answer, the caller
+ * refuses — see `parseRemoteMain`.
+ */
+export function readRemoteMain(repoRoot: string, run: CommandRunner = runCommand): RemoteMain {
+  let result: CommandResult;
+  try {
+    result = run('git', ['ls-remote', '--exit-code', 'origin', 'refs/heads/main'], repoRoot);
+  } catch (error) {
+    return { kind: 'unavailable', detail: `git ls-remote could not be run: ${String(error)}` };
+  }
+  return parseRemoteMain(result);
 }

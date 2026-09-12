@@ -34,10 +34,18 @@ order and registry facts are proven before any credential exists.
   while it is pending — `source_sha` still being main's exact tip, the dist-tag not
   already pointing at something newer, every packed dependency still resolvable — is
   re-established in the gated job and again immediately before each individual upload.
+  "Re-established" means observed, not recalled: main's tip is read from the **remote**
+  with `git ls-remote`, because the checkout's cached `origin/main` is frozen for the
+  life of the job; and a dependency this run published itself is looked up again like
+  any other, because an upload this run performed is not evidence that the registry
+  still serves it. An unanswerable remote or registry refuses.
 - An artifact has exactly one identity or it is refused. What this repository reads out
   of a packed tarball and what npm extracts from it must never be two different packages;
   an offline differential test against npm's own bundled reader asserts that they either
-  agree or that this repository refuses the archive.
+  agree or that this repository refuses the archive. Unrecognised header _formats_ are
+  refused outright; inside the one recognised format, npm's field semantics are
+  reproduced literally rather than approximated, because being stricter than npm about a
+  format it accepts would reject artifacts this repository actually ships.
 - Acceptance and verification are reported as different facts. A zero exit from
   `npm publish` means the bytes were accepted; only a readback means the registry serves
   what was reviewed. An accepted-but-unconfirmed upload is never folded into "nothing was

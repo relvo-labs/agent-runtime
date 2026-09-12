@@ -1,9 +1,10 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { checkSourceCurrency, validatePlanAgainstRequest } from './lib/dispatch.ts';
 import type { PlanEntry, ReleasePlan } from './lib/preflight.ts';
+import { parseRemoteMain, readRemoteMain, type CommandRunner, type RemoteMain } from './lib/workspace.ts';
 import {
   digestPlan,
   loadStaging,
@@ -239,6 +240,7 @@ describe('source currency after the approval', () => {
     request,
     context: { eventName: 'workflow_dispatch', ref: 'refs/heads/main', runnerSha: SHA },
     git: { headSha: SHA, originMainSha: SHA, porcelain: '' },
+    remoteMain: { kind: 'observed', sha: SHA } satisfies RemoteMain,
     pendingChangesetFiles: [] as readonly string[],
   };
   const codesOf = (input: Parameters<typeof checkSourceCurrency>[0]): readonly string[] =>
@@ -248,7 +250,7 @@ describe('source currency after the approval', () => {
     expect(checkSourceCurrency(current)).toEqual([]);
   });
 
-  it('refuses once main has advanced past the approved commit', () => {
+  it('refuses once the cached origin/main has advanced past the approved commit', () => {
     const moved = { ...current, git: { ...current.git, originMainSha: 'a'.repeat(40) } };
     expect(codesOf(moved)).toContain('git_main_tip');
     expect(checkSourceCurrency(moved)[0]?.message).toContain('only the exact current tip of main');
@@ -266,5 +268,110 @@ describe('source currency after the approval', () => {
 
   it('refuses version intent that landed after the approval', () => {
     expect(codesOf({ ...current, pendingChangesetFiles: ['late-intent.md'] })).toContain('pending_version_intent');
+  });
+
+  /**
+   * Regression for the closure finding. The cached `origin/main` cannot change
+   * once the gated job has checked out, so re-reading it proves nothing about
+   * the world after the approval. A review advanced `main` on the server and
+   * every per-upload check still passed. The remote is now a separate input.
+   */
+  it('refuses when the remote has moved even though the cached ref has not', () => {
+    const advanced = { ...current, remoteMain: { kind: 'observed', sha: 'd'.repeat(40) } satisfies RemoteMain };
+    // The whole point: the cached ref still agrees, so `git_main_tip` is silent.
+    expect(codesOf(advanced)).not.toContain('git_main_tip');
+    expect(codesOf(advanced)).toEqual(['git_remote_main_tip']);
+    expect(checkSourceCurrency(advanced)[0]?.message).toContain('advanced after this release was approved');
+  });
+
+  it('refuses when the remote cannot be consulted at all', () => {
+    const blind = {
+      ...current,
+      remoteMain: {
+        kind: 'unavailable',
+        detail: 'git ls-remote exited 128: fatal: could not read',
+      } satisfies RemoteMain,
+    };
+    expect(codesOf(blind)).toEqual(['git_remote_unavailable']);
+    expect(checkSourceCurrency(blind)[0]?.message).toContain('unverifiable branch tip');
+  });
+});
+
+/**
+ * The command boundary itself, exercised with injected git output rather than a
+ * real remote. No subprocess runs, nothing is fetched, and every fail-closed
+ * path is reachable deterministically.
+ */
+describe('observing the remote tip of main', () => {
+  const run = (result: { code?: number; stdout?: string; stderr?: string }): CommandRunner => {
+    return (program, args) => {
+      calls.push([program, ...args]);
+      return { code: result.code ?? 0, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    };
+  };
+  let calls: string[][] = [];
+  beforeEach(() => {
+    calls = [];
+  });
+
+  it('asks the remote, read-only, for exactly refs/heads/main', () => {
+    const observed = readRemoteMain('/repo', run({ stdout: `${SHA}\trefs/heads/main\n` }));
+    expect(observed).toEqual({ kind: 'observed', sha: SHA });
+    expect(calls).toEqual([['git', 'ls-remote', '--exit-code', 'origin', 'refs/heads/main']]);
+  });
+
+  it('reproduces the closure probe: the server moves while the cached ref does not', () => {
+    // The reviewer stubbed the same boundary and advanced only the server.
+    const cachedGit = { headSha: SHA, originMainSha: SHA, porcelain: '' };
+    const serverSha = 'c'.repeat(40);
+    const observed = readRemoteMain('/repo', run({ stdout: `${serverSha}\trefs/heads/main\n` }));
+    const findings = checkSourceCurrency({
+      request: { sourceSha: SHA, distTag: 'latest', targets: [] },
+      context: { eventName: 'workflow_dispatch', ref: 'refs/heads/main', runnerSha: SHA },
+      git: cachedGit,
+      remoteMain: observed,
+      pendingChangesetFiles: [],
+    });
+    expect(findings.map((finding) => finding.code)).toEqual(['git_remote_main_tip']);
+  });
+
+  it('refuses every way the remote can fail to give a clear answer', () => {
+    const unavailable = (result: Parameters<typeof run>[0]): string =>
+      (readRemoteMain('/repo', run(result)) as { kind: string; detail: string }).detail;
+
+    expect(readRemoteMain('/repo', run({ code: 128, stderr: 'fatal: repository not found' })).kind).toBe('unavailable');
+    expect(unavailable({ code: 2, stderr: 'could not read Username' })).toContain('git ls-remote exited 2');
+    // `--exit-code` makes an absent ref a non-zero exit, but an empty success
+    // must refuse too rather than be read as "main does not exist, carry on".
+    expect(unavailable({ stdout: '' })).toContain('lists no `refs/heads/main`');
+    expect(unavailable({ stdout: 'not-a-ref-line\n' })).toContain('cannot parse');
+    expect(unavailable({ stdout: `${'a'.repeat(39)}\trefs/heads/main\n` })).toContain('cannot parse');
+    expect(unavailable({ stdout: `${SHA.toUpperCase()}\trefs/heads/main\n` })).toContain('cannot parse');
+    expect(unavailable({ stdout: `${SHA}\trefs/heads/other\n` })).toContain('without a `refs/heads/main` entry');
+    expect(unavailable({ stdout: `${SHA}\trefs/heads/main\n${'b'.repeat(40)}\trefs/heads/main\n` })).toContain(
+      'more than once',
+    );
+  });
+
+  it('treats a boundary that throws as unavailable rather than propagating', () => {
+    const thrown = readRemoteMain('/repo', () => {
+      throw new Error('ENOENT git');
+    });
+    expect(thrown.kind).toBe('unavailable');
+  });
+
+  it('ignores unrelated refs that accompany the answer', () => {
+    const observed = readRemoteMain(
+      '/repo',
+      run({ stdout: `${'e'.repeat(40)}\trefs/heads/mainline\n${SHA}\trefs/heads/main\n` }),
+    );
+    expect(observed).toEqual({ kind: 'observed', sha: SHA });
+  });
+
+  it('classifies output without running anything at all', () => {
+    expect(parseRemoteMain({ code: 0, stdout: `${SHA}\trefs/heads/main`, stderr: '' })).toEqual({
+      kind: 'observed',
+      sha: SHA,
+    });
   });
 });

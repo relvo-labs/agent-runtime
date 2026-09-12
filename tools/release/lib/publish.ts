@@ -177,6 +177,22 @@ function checkDistTagStillSafe(entry: PlanEntry, distTag: string, before: Regist
  * where the packed `peerDependenciesMeta` was available to tell a required peer
  * from an optional one; the plan does not carry that distinction, and refusing
  * on an optional peer would be a false blocker.
+ *
+ * ## Why an in-scope dependency is looked up too
+ *
+ * An earlier version of this function treated membership of `publishedSoFar` as
+ * proof that an in-scope dependency was resolvable, and skipped the lookup. An
+ * independent review showed what that costs: with a three-package plan, the
+ * first package was published and verified, then removed from the registry
+ * while the *second* package was being published. The third package depended on
+ * the first, uploaded successfully, and the run reported `ok: true` — because
+ * nothing looked at the first package again after it was verified.
+ *
+ * `publishedSoFar` is this run's own recollection; the registry is the fact. So
+ * the ordering check is kept — a dependent must never be uploaded before its
+ * in-scope dependency, which is a plan-shape error rather than a registry one —
+ * and a fresh lookup is performed *as well*, immediately before the dependent's
+ * bytes are uploaded.
  */
 async function checkDependenciesStillAvailable(
   entry: PlanEntry,
@@ -197,8 +213,7 @@ async function checkDependenciesStillAvailable(
 
     const scoped = inScope.get(dependency);
     if (scoped !== undefined) {
-      // A dependency inside this scope was verified onto the registry earlier
-      // in this same run, or the plan order is wrong and must not proceed.
+      // Plan shape first: a dependent must never precede its dependency.
       if (scoped !== exact) {
         return {
           code: 'dependency_scope_mismatch',
@@ -211,7 +226,7 @@ async function checkDependenciesStillAvailable(
           message: `${entry.name} requires ${dependency}@${exact}, which this plan has not yet published; refusing to publish a dependent first`,
         };
       }
-      continue;
+      // …and then the registry, because "we published it" is not "it is there".
     }
 
     const result = await ports.registry.lookup(dependency);
@@ -219,13 +234,19 @@ async function checkDependenciesStillAvailable(
       if (result.packument.versions.has(exact)) continue;
       return {
         code: 'dependency_unpublished',
-        message: `${entry.name} requires ${dependency}@${exact}, which the registry no longer lists; it was available at preflight`,
+        message:
+          scoped === undefined
+            ? `${entry.name} requires ${dependency}@${exact}, which the registry no longer lists; it was available at preflight`
+            : `${entry.name} requires ${dependency}@${exact}, which this run published and verified but the registry no longer lists`,
       };
     }
     if (result.kind === 'absent') {
       return {
         code: 'dependency_unpublished',
-        message: `${entry.name} requires ${dependency}@${exact}, but \`${dependency}\` is no longer on the registry at all`,
+        message:
+          scoped === undefined
+            ? `${entry.name} requires ${dependency}@${exact}, but \`${dependency}\` is no longer on the registry at all`
+            : `${entry.name} requires ${dependency}@${exact}, but \`${dependency}\` has disappeared from the registry since this run published it`,
       };
     }
     return {

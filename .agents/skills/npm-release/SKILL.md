@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.1.0
+version: 1.2.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -71,9 +71,10 @@ Do not use this skill when:
 3. **Two jobs, one credential.** `verify` is ungated: it checks out the named commit, runs
    the canonical `pnpm gate`, packs exactly the named packages, runs the fail-closed
    preflight and uploads the staged plan plus tarballs. `publish` needs `verify`, runs in
-   the `npm-release` environment, downloads that exact artifact id and digest, re-verifies
-   everything locally, and only then runs one step that can see `secrets.NPM_TOKEN`.
-   Building never happens in a step that holds the credential.
+   the `npm-release` environment, downloads that exact artifact **id** (with
+   `digest-mismatch: error`, which the action drives from artifact metadata — it takes no
+   expected-digest input), re-verifies everything locally, and only then runs one step that
+   can see `secrets.NPM_TOKEN`. Building never happens in a step that holds the credential.
 
 4. **Preflight refuses; it never repairs.** Findings are refusals, and there is no
    override input. It refuses pending version intent, a commit that is not main's tip, a
@@ -95,12 +96,28 @@ Do not use this skill when:
    own bundled reader, offline: same identity, or refusal. Never relax that test to
    "we parse tar the same way" — the invariant is about disagreement, not parsing.
 
+   Two rules of different kinds keep that true, and confusing them breaks something:
+   - **Unrecognised header _formats_ are refused.** Only the POSIX ustar signature
+     (`ustar\0` + `00`) is accepted. A review built a second `package/package.json`
+     header with valid checksums, a populated `prefix` and no signature: npm ignored the
+     prefix and let it overwrite the real manifest; this reader applied the prefix and
+     saw a harmless path. Refusing the format closes that.
+   - **Inside ustar, npm's field semantics are reproduced literally** — the `prefix`
+     split including its byte-475 155-vs-130 branch, and the rule that a regular-file
+     entry whose name ends in `/` is a directory. `prefix` is _not_ refused: node-tar
+     genuinely emits it for deep `dist/` paths, so refusing it would reject artifacts
+     `pnpm pack` actually produces. Refusing what npm accepts breaks the release;
+     accepting what npm reads differently breaks the approval.
+
 6. **The approval is not a snapshot.** An approval can sit for hours while `main`
    advances, a dist-tag moves and a dependency is unpublished. Every fact the approval
    rested on is re-established in the gated job, and again immediately before each
-   individual upload: `source_sha` still being the exact current tip of main, the
-   dist-tag not already pointing at something newer, and every packed dependency still
-   resolvable at its exact version.
+   individual upload: the dist-tag not already pointing at something newer, every packed
+   dependency still resolvable at its exact version — **including dependencies this run
+   published itself**, because "we uploaded it" is memory and the registry is fact — and
+   `source_sha` still being main's tip **on the remote**, read with `git ls-remote` rather
+   than from the checkout's cached `origin/main`, which cannot change once the job has
+   started. An unanswerable remote refuses; it is never read as agreement.
 
 7. **Publication is ordered, explicit and non-overwriting.** One tarball per `npm publish`,
    in dependency order, with `--ignore-scripts --access public --provenance --tag <tag>
