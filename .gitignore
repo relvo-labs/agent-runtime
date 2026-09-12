@@ -3,5 +3,6 @@ dist/
 coverage/
 *.tsbuildinfo
 *.tgz
+release-staging/
 .pnpm-store/
 .DS_Store

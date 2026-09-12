@@ -28,6 +28,7 @@ Before mutating any area of this repository, read the skill that owns it.
 | dependencies, the lockfile, install scripts              | `pnpm-supply-chain`              |
 | version intent for a published package                   | `changesets-release`             |
 | CI workflows or the local gate                           | `local-ci-parity`                |
+| the release workflow or `tools/release`                  | `npm-release`                    |
 
 `.agents/skills/INDEX.md` is generated. Run `pnpm skills:index` after adding or editing a
 skill; `pnpm skills:check` verifies it is not stale.
@@ -51,7 +52,8 @@ pnpm gate
 
 CI runs the identical step list (`tools/repo/gate.ts` is the single source of truth for
 both). No gate step may require provider credentials, network access to a model provider,
-or a publish token.
+or a publish token — including the `release` step, which checks the release workflow's
+structure without being able to publish anything.
 
 ## 5. Hard boundaries for this foundation
 
@@ -62,7 +64,12 @@ or a publish token.
   otherwise destructively mutate a borrowed workspace.
 - Zod schemas are authoritative. TypeScript types are inferred from them; JSON Schema is
   generated from them. Never hand-write a type or a `.json` schema that duplicates one.
-- No package is published from this repository yet. There is no release workflow.
+- No package has been published from this repository. Publication happens only through
+  `.github/workflows/release.yml`: manual `workflow_dispatch` on `main`, an explicitly
+  typed `name@version` scope, a credential-free gate and fail-closed preflight first, then
+  an `npm-release` environment approval. It refuses to run while any version intent is
+  pending, and it never chooses a version. Read `.agents/skills/npm-release/SKILL.md` and
+  `docs/release.md` before changing it; an agent may not initiate a publication.
 
 ## 6. Provenance and licensing
 

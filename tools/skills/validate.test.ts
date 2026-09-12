@@ -16,6 +16,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { validateSkills, type Finding } from './validate.ts';
 import { parseFrontmatter } from './lib/frontmatter.ts';
+import { REQUIRED_SKILLS } from './lib/model.ts';
 import { renderIndex } from './generate-index.ts';
 import { scanSkillRoot } from './lib/model.ts';
 
@@ -293,7 +294,8 @@ describe('required canonical set', () => {
   it('reports every missing production skill when the canonical set is required', () => {
     const findings = validateSkills({ repoRoot: fixture(), skillRoot: 'skills', checkCompetingRoots: false });
     const missing = findings.filter((f) => f.code === 'REQUIRED_SKILL_MISSING');
-    expect(missing).toHaveLength(10);
+    // The fixture root carries none of them, so this tracks the canonical set itself.
+    expect(missing).toHaveLength(REQUIRED_SKILLS.length);
   });
 });
 

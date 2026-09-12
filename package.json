@@ -34,6 +34,7 @@
     "app:browser-check": "pnpm --filter @relvo-labs/reference-app browser-check",
     "supply-chain:check": "node tools/repo/check-supply-chain.ts",
     "static:check": "node tools/repo/check-static.ts",
+    "release:check": "node tools/release/check-release-workflow.ts",
     "licenses:check": "node tools/repo/check-licenses.ts",
     "changeset": "changeset",
     "changeset:status": "changeset status"
