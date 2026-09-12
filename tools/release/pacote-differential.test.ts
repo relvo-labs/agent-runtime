@@ -36,7 +36,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { afterAll, describe, expect, it } from 'vitest';
-import { describeNpmTool, requireFromNpmTool, requireNpmTool } from './lib/npm-tool.ts';
+import { describeNpmTool, loadNpmModule, requireNpmTool } from './lib/npm-tool.ts';
 import { inspectTarball } from './lib/tarball.ts';
 import { buildPackageTarball, buildTarball } from './testing/fixtures.ts';
 
@@ -46,8 +46,7 @@ type Pacote = {
 };
 
 const npmTool = requireNpmTool();
-const requireFromNpm = requireFromNpmTool(npmTool);
-const pacote = requireFromNpm('pacote') as Pacote;
+const pacote = loadNpmModule(npmTool, 'pacote') as Pacote;
 const cache = mkdtempSync(join(tmpdir(), 'relvo-release-pacote-'));
 
 afterAll(() => {
@@ -289,16 +288,26 @@ describe("identity agreement with npm's own archive reader", () => {
    * the release.
    */
   it('states which npm it compared against, so the evidence is attributable', () => {
-    const pinned = requireFromNpm('./package.json') as { name?: unknown; version?: unknown };
+    const pinned = JSON.parse(readFileSync(npmTool.manifestPath, 'utf8')) as { name?: unknown; version?: unknown };
     expect(pinned.name).toBe('npm');
     expect(pinned.version).toBe(npmTool.version);
     expect(npmTool.modules.map((module) => module.id)).toEqual(['pacote', 'tar']);
+    // Both the manifest *and* the entry point actually loaded live inside the
+    // pinned npm. Checking only the manifest is what let a `main` of
+    // `../../../../outside.cjs` be read as npm's own reader.
     for (const module of npmTool.modules) {
-      expect(module.manifestPath.startsWith(npmTool.packageRoot), `${module.id} must come from the pinned npm`).toBe(
+      expect(module.manifestPath.startsWith(npmTool.packageRoot), `${module.id} manifest must be inside npm`).toBe(
         true,
       );
+      expect(
+        module.entryPath.startsWith(module.directory),
+        `${module.id} entry point must be inside ${module.id}`,
+      ).toBe(true);
     }
     process.stdout.write(`pacote-differential: compared against ${describeNpmTool(npmTool)}\n`);
+    for (const module of npmTool.modules) {
+      process.stdout.write(`pacote-differential: ${module.id}@${module.version} entry ${module.entryPath}\n`);
+    }
   });
 });
 
@@ -319,7 +328,7 @@ describe("identity agreement with npm's own archive reader", () => {
  */
 describe('archives written by npm’s own tar writer', () => {
   type TarWriter = { readonly create: (options: Record<string, unknown>, paths: readonly string[]) => void };
-  const tar = requireFromNpm('tar') as TarWriter;
+  const tar = loadNpmModule(npmTool, 'tar') as TarWriter;
 
   function packWithNodeTar(files: Readonly<Record<string, string>>): Buffer {
     const scratch = mkdtempSync(join(cache, 'node-tar-'));

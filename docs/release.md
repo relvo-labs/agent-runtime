@@ -61,11 +61,24 @@ The same package is used in both places that need it: the canonical gate's
 `process.execPath`. That is the point — the identity-agreement argument is
 about npm's behaviour, so the npm it is argued about has to be the npm that
 runs. `tools/release/lib/npm-tool.ts` proves that before either one uses it:
-resolvable from this workspace, named `npm`, the exact catalog version, with a
-CLI and bundled readers that stay inside the package. There is no `PATH`
-fallback and no environment override; anything it cannot prove is refused, in
-`verify-staging.ts` before the credential exists and again in `publish.ts`
-before the tool is spawned.
+declared by the root manifest as a catalog devDependency, taken from exactly
+`node_modules/npm`, owned — by real path — by this repository's own dependency
+tree, named `npm`, the exact catalog version, with a CLI and bundled readers
+that stay inside the package, and with each reader bound to the entry point
+`require` will actually load. There is no `PATH` fallback, no ancestor search,
+no `NODE_PATH` and no environment override; anything it cannot prove is
+refused, in `verify-staging.ts` before the credential exists and again in
+`publish.ts` before the tool is spawned.
+
+The last two clauses are not decoration. An independent review of the first
+version of this module found both of them missing and demonstrated the cost:
+asking Node's resolver for `npm` accepted an npm one directory up, or anywhere
+`NODE_PATH` pointed, when the workspace had none installed at all; and checking
+only each reader's `package.json` let a `pacote` whose `main` was
+`../../../../outside.cjs` — or whose `exports` target was a symlink out of the
+tree — pass inspection and then load code from outside npm. A resolver answers
+"what would `require` find", which is a different question from "what does this
+repository depend on", and a manifest is not an entry point.
 
 Until run 34699256419 this was two different programs. The test looked for npm
 beside `process.execPath`, which is where an nvm or distro Node keeps it and

@@ -96,5 +96,14 @@ devDependency of this workspace, both jobs install from the lockfile, and
 publisher uses it, with no `PATH` fallback and no environment override. It costs one
 lockfile entry — npm vendors its own dependencies — and nothing it loads is shipped.
 
+Proving an identity turned out to be narrower than resolving one. A review of the first
+version of that module showed two ways the proof leaked, and both are now closed by
+construction: npm is read from the explicit path `node_modules/npm` whose real path must
+be owned by this repository — asking Node's resolver instead accepted an npm in an
+ancestor directory or on `NODE_PATH` when the workspace had none — and each bundled
+reader is bound to the realpath'd entry point `require` would load, confined to that
+reader's own directory, because a `main` or `exports` pointing out of the package made a
+contained `package.json` say nothing about the code that runs.
+
 Nothing has been published. The outstanding human approvals, and the evidence required
 before a first release, are recorded in `docs/release.md`.

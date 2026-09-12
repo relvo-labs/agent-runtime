@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.3.0
+version: 1.4.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -103,8 +103,8 @@ Do not use this skill when:
 
    **Which npm, exactly.** That argument is worth nothing unless the npm the test
    reads with is the npm that publishes. `tools/release/lib/npm-tool.ts` is the
-   single answer to "which npm": the package pinned in the catalog, resolved
-   through this workspace's own module graph, proven before use, and used by both
+   single answer to "which npm": the package pinned in the catalog, taken from the
+   explicit path `node_modules/npm`, proven before use, and used by both
    `pacote-differential.test.ts` and `publish.ts`. It never falls back to `PATH`
    and takes no environment override — an unresolvable, malformed, mislocated or
    wrong-versioned tool is a refusal, and refusals name every reason at once
@@ -115,6 +115,27 @@ Do not use this skill when:
    npm and made the suite unloadable (run 34699256419), while `spawn('npm')`
    published through whatever the runner image happened to ship. Those were the
    same bug seen from two ends, and splitting the tool apart again reopens it.
+
+   **Locate; do not resolve, and do not stop at the manifest.** Two rules earned
+   the hard way, when a review broke the first version of this module twice:
+   - `createRequire(root).resolve('npm/…')` answers "what would `require` find",
+     which is not "what does this repository depend on". It walks every ancestor
+     `node_modules` and then `NODE_PATH`, and with no npm installed in the
+     workspace at all, both were accepted as the publishing tool. So: the root
+     manifest must declare `devDependencies.npm: "catalog:"`, the package is read
+     from exactly `<repoRoot>/node_modules/npm`, and its real path must be owned
+     by `<repoRoot>/node_modules`. `node_modules/npm` is a symlink under pnpm and
+     must stay usable, so the rule is about where the link _lands_, not that it
+     exists.
+   - A package's `main` and `exports` are part of its identity, so containment on
+     `package.json` proves nothing about the code that loads. A bundled `pacote`
+     whose `main` was `../../../../outside.cjs`, or whose `exports` target was a
+     symlink out of the tree, passed inspection and then loaded foreign code.
+     Each reader's entry point is therefore resolved, realpath'd, confined to
+     that reader's own directory and recorded; `loadNpmModule` loads that exact
+     file and refuses any id not proven here. Never hand a caller a bare
+     `require` rooted in npm — that re-runs resolution at load time, which is
+     precisely where the checked answer gets replaced by an unchecked one.
 
    Two rules of different kinds keep that true, and confusing them breaks something:
    - **Unrecognised header _formats_ are refused.** Only the POSIX ustar signature
