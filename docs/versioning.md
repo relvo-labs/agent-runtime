@@ -11,4 +11,4 @@ intentionally parsed as a bounded string, then compared explicitly before regist
 
 Foundation v0.4 is the unreleased initial line, so release-blocker corrections are incorporated before its first publication rather than pretending the reviewed candidate was already a compatible public contract. After publication, the versioned compatibility fixtures are immutable.
 
-No publish workflow exists. Version files and pending Changesets provide evidence and release intent only; publication requires a separate reviewed decision.
+Nothing has been published yet. Version files and pending Changesets record intent only: a version bump is made by a separate reviewed release PR running `changeset version`, and publication is a manual, explicitly scoped dispatch of [`.github/workflows/release.yml`](../.github/workflows/release.yml) that refuses to run while any changeset is still pending. See the [release runbook](release.md).

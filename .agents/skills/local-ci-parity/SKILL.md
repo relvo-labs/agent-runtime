@@ -1,7 +1,7 @@
 ---
 name: local-ci-parity
 description: Keep one canonical credential-free gate that runs identically on a developer machine and in GitHub Actions, with no step that only exists in one place.
-version: 1.0.0
+version: 1.1.0
 stability: stable
 tags: [ci, github-actions, gate, reproducibility]
 ---
@@ -24,11 +24,13 @@ Do not use this skill when:
 - you are changing what a single gate step _checks_ — use that step's owning skill
   (`package-artifact-validation`, `runtime-contract-evolution`, …)
 - you are changing dependency install policy — use `pnpm-supply-chain`
-- you want to add a publish job — use `changesets-release` (answer: no)
+- you are changing the release workflow, or anything about how publication works — use
+  `npm-release`. No workflow this skill owns may publish, reference a secret, or hold a
+  publish credential.
 
 ## Owns
 
-- `.github/workflows` — every hosted workflow
+- `.github/workflows` — every hosted workflow except `release.yml`, and the rule that a new one must be classified in `check-engines.ts` before it can exist
 - `tools/repo/gate.ts` — the canonical step list
 - `tools/repo/check-engines.ts` — supported-runtime and hosted-workflow bootstrap policy
 - `.nvmrc` — the baseline Node version and, with it, the supported matrix
@@ -41,12 +43,15 @@ Do not use this skill when:
 - `tools/repo/check-dag.ts` — owned by `package-architecture`
 - `pnpm-lock.yaml` — owned by `pnpm-supply-chain`
 - `.changeset` — owned by `changesets-release`
+- `.github/workflows/release.yml` — owned by `npm-release`; this skill owns every other workflow
+- `tools/release` — owned by `npm-release`, including the `release` gate step's implementation
 
 ## Relationships
 
 - `depends-on` → `pnpm-supply-chain` — CI installs with a frozen lockfile.
 - `boundary-with` → `package-artifact-validation` — that skill defines the artifact checks; this skill guarantees they run in both places.
 - `boundary-with` → `changesets-release` — this skill owns workflows but may not add a publishing job.
+- `boundary-with` → `npm-release` — the release workflow is the one exception to "every workflow here is credential-free"; it lives inside this skill's directory but is owned, and structurally checked, there.
 
 ## Procedure
 
@@ -90,6 +95,9 @@ Do not use this skill when:
 
 6. **Concurrency and permissions.** Every workflow sets `permissions: contents: read` at
    the top level and a `concurrency` group keyed on the ref, so superseded runs cancel.
+   The release workflow is the deliberate exception to cancellation: its group is a
+   constant and `cancel-in-progress` is `false`, because interrupting a run half way
+   through a sequence of irreversible publications is worse than queueing it.
 
 7. **Do not add a step that is green because it is skipped.** The canonical gate has no
    environment-dependent skip path. If a required step cannot run, it fails.

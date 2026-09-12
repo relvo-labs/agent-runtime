@@ -14,6 +14,7 @@ export const CANONICAL_SKILL_ROOT = '.agents/skills';
 export const REQUIRED_SKILLS: readonly string[] = [
   'changesets-release',
   'local-ci-parity',
+  'npm-release',
   'package-architecture',
   'package-artifact-validation',
   'pnpm-supply-chain',

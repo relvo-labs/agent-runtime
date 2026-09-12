@@ -47,10 +47,14 @@ pnpm gate
 
 Install the exact pnpm version declared by `packageManager` before running these commands;
 Corepack is not required. Node `^22.18.0`, `^24.11.0`, and `^26.0.0` are supported and
-exercised in CI. Node 20 and Node 27+ are not supported. Packages are not published from
-this repository.
+exercised in CI. Node 20 and Node 27+ are not supported.
 
-Start with [Architecture Foundation v0.4](docs/architecture/foundation-v0.4.md), then see [CONTRIBUTING.md](CONTRIBUTING.md), [provider development](docs/provider-development.md), [versioning](docs/versioning.md), and [SECURITY.md](SECURITY.md).
+No package has been published yet. Publication is manual, explicitly scoped and approved
+per run through [`.github/workflows/release.yml`](.github/workflows/release.yml); see the
+[release runbook](docs/release.md) for what it proves before anything reaches the registry
+and which human approvals are still outstanding.
+
+Start with [Architecture Foundation v0.4](docs/architecture/foundation-v0.4.md), then see [CONTRIBUTING.md](CONTRIBUTING.md), [provider development](docs/provider-development.md), [versioning](docs/versioning.md), [releasing](docs/release.md), and [SECURITY.md](SECURITY.md).
 
 ## License
 

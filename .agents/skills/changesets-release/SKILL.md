@@ -1,7 +1,7 @@
 ---
 name: changesets-release
-description: Record version intent for pre-1.0 packages with Changesets while this repository deliberately has no publish workflow.
-version: 1.0.0
+description: Record version intent for pre-1.0 packages with Changesets, and keep versioning separate from the manual release workflow that publishes them.
+version: 1.1.0
 stability: stable
 tags: [changesets, semver, changelog, prerelease]
 ---
@@ -25,7 +25,9 @@ Do not use this skill when:
   those are not published and need no changeset
 - you are classifying _whether_ a change is breaking — use `public-api-evolution` (API
   surface) or `runtime-contract-evolution` (wire contract), then come back
-- you want to publish — **there is no publish path in this repository yet**
+- you want to publish, or to change how publication works — use `npm-release`. This skill
+  decides _which version_; that skill decides _whether these exact artifacts may reach the
+  registry_, and refuses while any changeset here is still pending.
 
 ## Owns
 
@@ -38,18 +40,23 @@ Do not use this skill when:
 - `packages/protocol/src` — owned by `runtime-contract-evolution`, including `WIRE_VERSION`
 - `examples/consumer-smoke` — owned by `public-api-evolution`, which classifies compatibility
 - `.github/workflows` — owned by `local-ci-parity`
+- `.github/workflows/release.yml` — owned by `npm-release`, which publishes but never versions
+- `tools/release` — owned by `npm-release`
 
 ## Relationships
 
 - `depends-on` → `public-api-evolution` — the semver class is an input to this skill.
 - `depends-on` → `runtime-contract-evolution` — a wire break must also be reflected here.
-- `boundary-with` → `local-ci-parity` — that skill owns workflows; this skill asserts that no workflow may publish.
+- `boundary-with` → `local-ci-parity` — that skill owns workflows; no workflow it owns may publish.
+- `boundary-with` → `npm-release` — that skill owns the one workflow that may publish; this skill owns the versions it is allowed to publish.
 
 ## Procedure
 
-1. **No publishing exists here, on purpose.** There is no `release.yml`, no `NPM_TOKEN`,
-   no `changeset publish`. CI runs `changeset status` only, which is credential-free.
-   Adding a publish workflow is a separate, reviewed decision — not part of a feature PR.
+1. **Versioning and publishing are separate decisions, on purpose.** `changeset publish`
+   is never run here. The release workflow publishes an explicitly typed `name@version`
+   scope, and refuses while any `.changeset/*.md` is pending — so a feature PR can record
+   intent freely without ever being one merge away from a publication. The gate runs
+   `changeset status` only, which is credential-free.
 
 2. **Add a changeset with every publishable change:**
 
@@ -81,7 +88,9 @@ Do not use this skill when:
    break that.
 
 6. **Never hand-run `changeset version` on a feature branch.** Version bumps and changelog
-   generation belong to a dedicated release PR, once a release process exists.
+   generation belong to a dedicated release PR that does nothing else, so the diff a
+   reviewer approves is exactly the versions that may then be published. Publication is a
+   separate manual dispatch against that merge commit — see `docs/release.md`.
 
 ## Verification
 

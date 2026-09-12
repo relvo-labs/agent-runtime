@@ -1,0 +1,135 @@
+# Manual npm release.
+#
+# Nothing here runs automatically. The only trigger is workflow_dispatch, the
+# scope is typed in full by a human, and the credential exists in exactly one
+# step of one environment-gated job. `verify` proves the artifacts with the
+# canonical credential-free gate and the fail-closed preflight; `publish`
+# uploads those same bytes and verifies them back out of the registry.
+#
+# Policy: .agents/skills/npm-release/SKILL.md
+# Runbook: docs/release.md
+# Structure is machine-checked by `pnpm release:check`.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character commit id to release. Must be the exact current tip of main.
+        required: true
+        type: string
+      packages:
+        description: Explicit scope, space separated, each entry written as name@version.
+        required: true
+        type: string
+      dist_tag:
+        description: npm dist-tag to point at these versions.
+        required: true
+        type: string
+      confirm:
+        description: Retype exactly - publish <count> package(s) from <source_sha> to <dist_tag>
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      plan-digest: ${{ steps.preflight.outputs.plan-digest }}
+    env:
+      RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_PACKAGES: ${{ inputs.packages }}
+      RELEASE_DIST_TAG: ${{ inputs.dist_tag }}
+      RELEASE_CONFIRM: ${{ inputs.confirm }}
+      RELEASE_EVENT_NAME: ${{ github.event_name }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_RUNNER_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Materialize Changesets base ref
+        run: git update-ref refs/heads/main refs/remotes/origin/main
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          version: 11.25.0
+          runtime: node@24.20.0
+          cache: true
+          require-lockfile: true
+          install: false
+      - name: Install from lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Run canonical gate
+        run: pnpm gate
+      - name: Release preflight and pack
+        id: preflight
+        run: node tools/release/preflight.ts --staging release-staging
+      - name: Upload reviewed release artifacts
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-staging
+          path: release-staging
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+
+  publish:
+    name: publish
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+      RELEASE_PACKAGES: ${{ inputs.packages }}
+      RELEASE_DIST_TAG: ${{ inputs.dist_tag }}
+      RELEASE_CONFIRM: ${{ inputs.confirm }}
+      RELEASE_EVENT_NAME: ${{ github.event_name }}
+      RELEASE_REF: ${{ github.ref }}
+      RELEASE_RUNNER_SHA: ${{ github.sha }}
+      RELEASE_PLAN_DIGEST: ${{ needs.verify.outputs.plan-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          version: 11.25.0
+          runtime: node@24.20.0
+          cache: false
+          require-lockfile: true
+          install: false
+      - name: Download reviewed release artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          digest: ${{ needs.verify.outputs.artifact-digest }}
+          digest-mismatch: error
+          path: release-staging
+      - name: Verify staged artifacts
+        run: node tools/release/verify-staging.ts --staging release-staging
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node tools/release/publish.ts --staging release-staging

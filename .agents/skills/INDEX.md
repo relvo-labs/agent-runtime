@@ -12,6 +12,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | --- | --- |
 | `.changeset` | `changesets-release` |
 | `.github/workflows` | `local-ci-parity` |
+| `.github/workflows/release.yml` | `npm-release` |
 | `.npmrc` | `pnpm-supply-chain` |
 | `.nvmrc` | `local-ci-parity` |
 | `docs/adr/ADR-0002-command-receipts-and-idempotency.md` | `runtime-lifecycle-coordination` |
@@ -25,7 +26,9 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `docs/adr/ADR-0013-supply-chain-policy.md` | `pnpm-supply-chain` |
 | `docs/adr/ADR-0014-ci-and-gate-parity.md` | `local-ci-parity` |
 | `docs/adr/ADR-0016-provider-event-activation.md` | `runtime-lifecycle-coordination` |
+| `docs/adr/ADR-0017-manual-npm-release.md` | `npm-release` |
 | `docs/architecture/foundation-v0.4.md` | `runtime-contract-evolution` |
+| `docs/release.md` | `npm-release` |
 | `examples/consumer-smoke` | `public-api-evolution` |
 | `package.json#packageManager` | `pnpm-supply-chain` |
 | `packages/*/CHANGELOG.md` | `changesets-release` |
@@ -44,6 +47,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 | `pnpm-workspace.yaml#minimumReleaseAge` | `pnpm-supply-chain` |
 | `pnpm-workspace.yaml#onlyBuiltDependencies` | `pnpm-supply-chain` |
 | `pnpm-workspace.yaml#packages` | `package-architecture` |
+| `tools/release` | `npm-release` |
 | `tools/repo/check-artifacts.ts` | `package-artifact-validation` |
 | `tools/repo/check-dag.ts` | `package-architecture` |
 | `tools/repo/check-engines.ts` | `local-ci-parity` |
@@ -60,21 +64,30 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `changesets-release`
 
-- **Version:** 1.0.0 (stable)
+- **Version:** 1.1.0 (stable)
 - **Path:** `.agents/skills/changesets-release/SKILL.md`
-- **Description:** Record version intent for pre-1.0 packages with Changesets while this repository deliberately has no publish workflow.
+- **Description:** Record version intent for pre-1.0 packages with Changesets, and keep versioning separate from the manual release workflow that publishes them.
 - **Tags:** `changelog`, `changesets`, `prerelease`, `semver`
 - **Owns:** `.changeset`, `packages/*/CHANGELOG.md`, `packages/*/package.json#version`
-- **Relationships:** `boundary-with` → `local-ci-parity`, `depends-on` → `public-api-evolution`, `depends-on` → `runtime-contract-evolution`
+- **Relationships:** `boundary-with` → `local-ci-parity`, `boundary-with` → `npm-release`, `depends-on` → `public-api-evolution`, `depends-on` → `runtime-contract-evolution`
 
 ### `local-ci-parity`
 
-- **Version:** 1.0.0 (stable)
+- **Version:** 1.1.0 (stable)
 - **Path:** `.agents/skills/local-ci-parity/SKILL.md`
 - **Description:** Keep one canonical credential-free gate that runs identically on a developer machine and in GitHub Actions, with no step that only exists in one place.
 - **Tags:** `ci`, `gate`, `github-actions`, `reproducibility`
 - **Owns:** `.github/workflows`, `.nvmrc`, `docs/adr/ADR-0014-ci-and-gate-parity.md`, `tools/repo/check-engines.ts`, `tools/repo/gate.ts`
-- **Relationships:** `boundary-with` → `changesets-release`, `boundary-with` → `package-artifact-validation`, `depends-on` → `pnpm-supply-chain`
+- **Relationships:** `boundary-with` → `changesets-release`, `boundary-with` → `npm-release`, `boundary-with` → `package-artifact-validation`, `depends-on` → `pnpm-supply-chain`
+
+### `npm-release`
+
+- **Version:** 1.0.0 (stable)
+- **Path:** `.agents/skills/npm-release/SKILL.md`
+- **Description:** Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
+- **Tags:** `npm`, `provenance`, `publish`, `registry`, `supply-chain`
+- **Owns:** `.github/workflows/release.yml`, `docs/adr/ADR-0017-manual-npm-release.md`, `docs/release.md`, `tools/release`
+- **Relationships:** `boundary-with` → `changesets-release`, `boundary-with` → `local-ci-parity`, `depends-on` → `package-artifact-validation`, `depends-on` → `pnpm-supply-chain`
 
 ### `package-architecture`
 

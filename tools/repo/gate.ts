@@ -22,6 +22,11 @@ export const GATE_STEPS: readonly GateStep[] = [
   { id: 'skills', command: ['pnpm', 'skills:check'] },
   { id: 'dag', command: ['pnpm', 'dag:check'] },
   { id: 'static', command: ['pnpm', 'static:check'] },
+  // Structural policy for the manual release workflow. Credential-free and
+  // network-free: it reads the workflow as data, so a widened trigger, a
+  // second credentialed step or an unpinned action fails here rather than in
+  // a hosted run that can publish.
+  { id: 'release', command: ['pnpm', 'release:check'] },
   { id: 'supply-chain', command: ['pnpm', 'supply-chain:check'] },
   { id: 'licenses', command: ['pnpm', 'licenses:check'] },
   { id: 'tests', command: ['pnpm', 'test'] }, // includes examples/reference-app/test via vitest.config.ts's include glob

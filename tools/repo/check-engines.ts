@@ -28,7 +28,13 @@ for (const directory of readdirSync(join(repoRoot, 'packages')).sort()) {
 // unrestricted reusable caller — cannot bypass the policy below by simply not being
 // gate.yml. This inventory is the reviewed set; fail closed until a new entry is
 // explicitly classified and checked here.
-const reviewedWorkflows = ['gate.yml'];
+//
+// `release.yml` is the reviewed manual publication path. Its trigger map is checked
+// below — manual dispatch and nothing else — and its internal structure (job gating,
+// credential confinement, provenance, pinned actions) is checked by
+// `tools/release/check-release-workflow.ts`, which the canonical gate runs as the
+// `release` step.
+const reviewedWorkflows = ['gate.yml', 'release.yml'];
 const workflowDirectory = join(repoRoot, '.github/workflows');
 const workflowEntries = readdirSync(workflowDirectory, { withFileTypes: true });
 const workflowFiles = workflowEntries
@@ -463,9 +469,73 @@ if (/actions\/setup-node|corepack/iu.test(workflow)) {
 if (!workflow.includes('pnpm install --frozen-lockfile') || !workflow.includes('run: pnpm gate')) {
   problems.push('CI must perform a frozen install and run the canonical gate');
 }
-for (const match of workflow.matchAll(/^\s*-\s+uses:\s+(\S+)/gmu)) {
-  if (!/@[0-9a-f]{40}$/u.test(match[1] ?? '')) {
-    problems.push(`CI action must use an immutable SHA: ${match[1] ?? '<missing>'}`);
+
+// Bootstrap policy is per workflow, not per file name: every reviewed workflow pins every
+// action to an immutable commit and none of them may reintroduce a Corepack/setup-node
+// toolchain path.
+for (const file of workflowFiles) {
+  const source = readFileSync(join(workflowDirectory, file), 'utf8');
+  for (const match of source.matchAll(/^\s*(?:-\s+)?uses:\s+(\S+)/gmu)) {
+    if (!/@[0-9a-f]{40}$/u.test(match[1] ?? '')) {
+      problems.push(`${file} action must use an immutable SHA: ${match[1] ?? '<missing>'}`);
+    }
+  }
+  if (/actions\/setup-node|corepack/iu.test(source)) {
+    problems.push(`${file} must not depend on actions/setup-node or Corepack`);
+  }
+  if (!source.includes(setup)) problems.push(`${file} toolchain must use ${setup}`);
+}
+
+// The release workflow has one entrance only. This is the same repository-wide trigger
+// policy the gate workflow is held to, expressed for a manual-only workflow: no push, no
+// schedule, no pull_request, no workflow_run, and no second `on` key to hide one in.
+function evaluateManualOnlyTriggerPolicy(file: string, source: string): string[] {
+  const found: string[] = [];
+  const lines = source.split('\n');
+  const onKeys = lines.filter((line) => /^(?:on|'on'|"on")\s*:/u.test(line));
+  if (onKeys.length !== 1 || onKeys[0] !== 'on:') {
+    found.push(
+      `${file} must declare exactly one canonical top-level on: block, found: [${onKeys.join(' | ') || '<none>'}]`,
+    );
+    return found;
+  }
+  const events: string[] = [];
+  for (const line of lines.slice(lines.indexOf('on:') + 1)) {
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+    if (!line.startsWith('  ')) break;
+    const event = /^ {2}([a-z_]+):\s*$/u.exec(line);
+    if (event?.[1] !== undefined) events.push(event[1]);
+  }
+  if (events.join(',') !== 'workflow_dispatch') {
+    found.push(`${file} must be triggered by workflow_dispatch alone, found: [${events.join(', ') || '<none>'}]`);
+  }
+  return found;
+}
+problems.push(
+  ...evaluateManualOnlyTriggerPolicy('release.yml', readFileSync(join(workflowDirectory, 'release.yml'), 'utf8')),
+);
+for (const fixture of [
+  {
+    name: 'release with a push trigger',
+    source: 'name: release\n\non:\n  workflow_dispatch:\n  push:\n',
+    reason: /workflow_dispatch alone/u,
+  },
+  {
+    name: 'release with a quoted on key',
+    source: "name: release\n\n'on':\n  workflow_dispatch:\n",
+    reason: /exactly one canonical/u,
+  },
+  {
+    name: 'release with no trigger at all',
+    source: 'name: release\n\npermissions:\n  contents: read\n',
+    reason: /exactly one canonical/u,
+  },
+]) {
+  const findings = evaluateManualOnlyTriggerPolicy('fixture.yml', fixture.source);
+  if (!findings.some((finding) => fixture.reason.test(finding))) {
+    problems.push(
+      `manual trigger fixture "${fixture.name}" must be rejected by ${fixture.reason.source}, got: [${findings.join(' | ') || '<accepted>'}]`,
+    );
   }
 }
 
@@ -474,5 +544,6 @@ if (problems.length > 0) {
   process.exit(1);
 }
 process.stdout.write(
-  'engines: OK — Node 22/24/26 bounded support, immutable CI bootstrap, manual + ready_for_review triggers only\n',
+  `engines: OK — Node 22/24/26 bounded support, immutable bootstrap across ${String(workflowFiles.length)} reviewed workflows, ` +
+    'gate on manual + ready_for_review, release on manual dispatch only\n',
 );
