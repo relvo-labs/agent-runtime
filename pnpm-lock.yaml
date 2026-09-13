@@ -9,12 +9,27 @@ catalogs:
     '@arethetypeswrong/cli':
       specifier: 0.18.5
       version: 0.18.5
+    '@changesets/assemble-release-plan':
+      specifier: 7.0.0
+      version: 7.0.0
     '@changesets/cli':
       specifier: 3.0.1
       version: 3.0.1
+    '@changesets/config':
+      specifier: 4.0.0
+      version: 4.0.0
+    '@changesets/pre':
+      specifier: 3.0.0
+      version: 3.0.0
+    '@changesets/read':
+      specifier: 1.0.0
+      version: 1.0.0
     '@eslint/js':
       specifier: 10.0.1
       version: 10.0.1
+    '@manypkg/get-packages':
+      specifier: 3.1.0
+      version: 3.1.0
     '@types/node':
       specifier: 22.20.1
       version: 22.20.1
@@ -68,12 +83,27 @@ importers:
       '@arethetypeswrong/cli':
         specifier: 'catalog:'
         version: 0.18.5
+      '@changesets/assemble-release-plan':
+        specifier: 'catalog:'
+        version: 7.0.0
       '@changesets/cli':
         specifier: 'catalog:'
         version: 3.0.1
+      '@changesets/config':
+        specifier: 'catalog:'
+        version: 4.0.0
+      '@changesets/pre':
+        specifier: 'catalog:'
+        version: 3.0.0
+      '@changesets/read':
+        specifier: 'catalog:'
+        version: 1.0.0
       '@eslint/js':
         specifier: 'catalog:'
         version: 10.0.1(eslint@10.9.1(supports-color@7.2.0))
+      '@manypkg/get-packages':
+        specifier: 'catalog:'
+        version: 3.1.0
       '@types/node':
         specifier: 'catalog:'
         version: 22.20.1

@@ -1,7 +1,7 @@
 ---
 name: changesets-release
 description: Record version intent for pre-1.0 packages with Changesets, and keep versioning separate from the manual release workflow that publishes them.
-version: 1.1.0
+version: 1.2.0
 stability: stable
 tags: [changesets, semver, changelog, prerelease]
 ---
@@ -56,7 +56,9 @@ Do not use this skill when:
    is never run here. The release workflow publishes an explicitly typed `name@version`
    scope, and refuses while any `.changeset/*.md` is pending — so a feature PR can record
    intent freely without ever being one merge away from a publication. The gate runs
-   `changeset status` only, which is credential-free.
+   `pnpm changeset:status`, a credential-free coverage and version-transition check.
+   Release preflight inventories the pinned Changesets library plan independently of
+   feature coverage; it still refuses every pending intent file, including empty ones.
 
 2. **Add a changeset with every publishable change:**
 
@@ -92,16 +94,30 @@ Do not use this skill when:
    reviewer approves is exactly the versions that may then be published. Publication is a
    separate manual dispatch against that merge commit — see `docs/release.md`.
 
+7. **Prove a dedicated version transition against the real Git baseline.** The gate
+   compares existing workspace manifests with the merge base of the configured branch,
+   reads its real intents and computes the pinned library release plan from that metadata.
+   Every manifest must equal the baseline except for the exact predicted `version`;
+   all intents must be consumed, with none pending. Package additions, deletions,
+   source/test/build/tooling-input edits anywhere in the repository, planning-config
+   edits, arbitrary bumps and other manifest edits are refused. READMEs may record release evidence, and configured
+   changelogs may carry release notes; these documentation allowances do not cover source.
+   Prerelease transitions and dependency-range rewrites require a separately reviewed
+   extension of this proof. Never move a base ref, add a dummy intent, or use a label or
+   environment flag to make a version candidate pass.
+
 ## Verification
 
 ```bash
-pnpm changeset:status        # credential-free; lists pending bumps
-git diff --name-only origin/main... | grep -q '^packages/' && ls .changeset/*.md
+pnpm changeset:status        # feature coverage or a proven version-only transition
+pnpm changeset status       # upstream CLI; may refuse a correctly versioned PR
 pnpm gate
 ```
 
-CI fails a PR that modifies `packages/**` without a valid `.changeset/*.md`. This
-foundation has no label-based bypass in its workflow.
+Feature changes to a public package require a real, nonempty changeset naming that
+package; the upstream CLI coverage check also remains in place. A dedicated version PR
+instead must satisfy the baseline proof above. An empty release inventory alone never
+passes feature coverage. This foundation has no label or environment bypass.
 
 ## Provenance
 

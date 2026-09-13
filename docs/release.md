@@ -95,7 +95,7 @@ Preflight refuses the release unless **all** of the following hold at the named 
 1. the dispatch is `workflow_dispatch` on `refs/heads/main`, and `source_sha` is the exact
    current tip of `main` and the commit the runner checked out;
 2. the working tree is clean;
-3. `.changeset/` contains no unreleased changeset, and `changeset status` proposes no
+3. `.changeset/` contains no unreleased changeset (including empty files), and the pinned Changesets library proposes no
    release — version intent belongs to a separate versioning PR (see below);
 4. every named package exists in the workspace, is not private, and already carries the
    exact version named in the dispatch;
@@ -166,15 +166,17 @@ something unparseable, reports no `refs/heads/main`, or reports it more than
 once, the run refuses rather than proceeding. The correct response to that is to
 find out why the remote is unreadable — not to remove the check.
 
-## Outstanding human approvals
+## Authorized version preparation
 
-None of these has been granted. Each is a person's decision, recorded where a reviewer can
-find it.
+Preparation of all eight packages at 0.2.0 is authorized in the separate version PR #28.
+This issue #27 repair changes the inventory and gate, and retains the existing package
+versions and intents. Preparation does not authorize merging, dispatching or publishing.
+The publication decisions below remain separate human approvals.
 
-1. **Version preparation.** Every publishable package is still `0.1.0` and three
-   changesets are pending, so a release cannot run today. A separate, reviewed release PR
-   must run `changeset version` and produce exactly this (from `pnpm changeset:status`,
-   `linked` keeps the eight in step):
+1. **Authorized version preparation.** This repair still has every publishable package
+   at `0.1.0` with three pending changesets. PR #28 prepares the following exact outcome
+   with `changeset version`; review and the full canonical matrix are still required.
+   The pinned release plan and `linked` configuration keep the eight in step:
 
    | Package                             | From  | To    | Bump  |
    | ----------------------------------- | ----- | ----- | ----- |
@@ -190,17 +192,22 @@ find it.
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
    `@relvo-labs/reference-app` is private and is never published. No version in this
-   repository has been changed to prepare that PR; deriving and reviewing it is step one.
+   repair is changed. The version candidate must pass against a baseline containing this
+   repair before it is ready for a human merge decision.
 
-2. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
+## Outstanding human approvals
+
+The following publication decisions remain unapproved, independently of version preparation.
+
+1. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
    the `NPM_TOKEN` secret (granular, write-limited to this scope, short-lived) and the
    environment's required reviewers are configured by a human outside this repository.
    Nothing here edits repository settings.
 
-3. **The first-release decision itself.** Publishing 0.2.0 makes the v0.4 contract
+2. **The first-release decision itself.** Publishing 0.2.0 makes the v0.4 contract
    public and immutable. That call is made against the evidence policy below.
 
-4. **Each dispatch.** Scope, dist-tag and confirmation are typed per run, and the
+3. **Each dispatch.** Scope, dist-tag and confirmation are typed per run, and the
    environment approval is given per run.
 
 ## First-release evidence policy
@@ -286,15 +293,48 @@ which one you have. Read the summary in these three categories:
 
 ## Local rehearsal
 
-Preflight is credential-free and can be run locally. Today it is expected to **refuse**,
-because version intent is still pending — that refusal is the control working, not a
-failure of the tooling:
+Preflight is credential-free and can be run locally against built, packed artifacts.
+Use the actual branch and an explicitly local event; never impersonate
+`workflow_dispatch` on `refs/heads/main`. A local run must refuse release eligibility.
+The 0.2.0 example targets the authorized preparation candidate, not this repair's 0.1.0
+manifests. On this repair it may fail while gathering artifacts before reporting findings;
+issue #26 tracks that diagnostic ordering separately.
 
 ```bash
-export RELEASE_EVENT_NAME=workflow_dispatch RELEASE_REF=refs/heads/main
+export RELEASE_EVENT_NAME=local_nonpublishing_verification
+export RELEASE_REF=$(git symbolic-ref -q HEAD || printf detached)
 export RELEASE_SOURCE_SHA=$(git rev-parse HEAD) RELEASE_RUNNER_SHA=$(git rev-parse HEAD)
-export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.1.0'
+export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.2.0'
 export RELEASE_DIST_TAG=latest
 export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
+
+The one-package example is diagnostic only; it is not the complete first-release scope.
+
+## Feature coverage and version-only proof
+
+The pinned Changesets 3.0.1 CLI can reject a correct version PR before writing status
+JSON: packages changed relative to `main`, but versioning consumed all intents. Release
+preflight therefore inventories the library release plan directly. An empty inventory
+means no planned release; it does not authorize a feature change or a publication.
+Publication still refuses raw pending files, including empty and malformed intents.
+
+`pnpm changeset:status` keeps the upstream CLI coverage assertion for feature branches
+and requires a real changeset naming each changed public package. For a dedicated version
+transition it reads baseline manifests and real intents from the configured branch's
+Git merge base and computes the expected versions using the pinned libraries. Every
+workspace manifest must match that baseline except for the exact planned version. It
+refuses unconsumed intents, missing or arbitrary bumps, package additions/deletions,
+source/test/build/tooling-input changes anywhere in the repository, other manifest
+edits and planning-config changes.
+READMEs may document release evidence; configured changelogs may carry release notes.
+Prerelease transitions and dependency-range rewrites are outside the current proof.
+No dummy intent, alternate comparison ref, label or environment bypass is used.
+
+The five directly imported planning libraries are exact catalog pins matching the
+existing Changesets CLI dependency graph. They add no transitive packages and replace
+CLI JSON inventory, not the CLI feature-coverage assertion. They are ESM packages from
+the existing Changesets/manypkg projects; removing them would require another reviewed
+inventory and baseline-planning implementation. The lockfile retains their existing
+resolutions and integrity hashes.
