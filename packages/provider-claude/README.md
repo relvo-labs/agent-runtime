@@ -45,6 +45,33 @@ force the download on every consumer, including those that inject their own bind
 Without it, `createSession` rejects with a retryable `provider_unavailable` error naming
 the package. Nothing else in the adapter changes.
 
+## Maturity
+
+**Pre-1.0, and deliberately narrow.** This package went from an explicit scaffold to a live
+adapter in the text-run vertical slice. Read the mapping and capability tables below as the
+complete list of what it does, not as a starting point.
+
+### Evidence classification
+
+`CLAUDE_ADAPTER_STATUS` is `'live'`. That describes the adapter, not the integration: it
+means this package implements and executes the SDK `query()` surface, not that the result
+has been observed against a real Claude model.
+
+| Claim                                       | Evidence                                                                                                                                                       |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implements the SDK `query()` surface        | Deterministic tests over the `ClaudeQuery` seam — correlation, interrupt settlement, disposal and error classification are exercised against scripted doubles. |
+| Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.            |
+
+The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.259**
+(`CLAUDE_AGENT_SDK_VERSION`), which is the pinned peer range. There is no captured
+live-model acceptance for this adapter anywhere in this repository, so a behaviour this
+adapter infers from the SDK's documented message shapes — correlation fields, interrupt
+receipts, terminal subtypes — is verified only to the extent that those shapes are what the
+SDK actually emits at that version.
+
+Do not read `'live'` as "verified against a live model". Those are different claims and
+only the first is made here.
+
 ## What it maps
 
 | SDK message                  | Provider event / outcome                            |

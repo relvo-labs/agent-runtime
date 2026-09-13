@@ -1,6 +1,6 @@
 {
   "name": "@relvo-labs/agent-provider-codex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex adapter for the neutral agent provider SPI, backed by the official Codex app-server stdio JSONL protocol.",
   "license": "Apache-2.0",
   "type": "module",
