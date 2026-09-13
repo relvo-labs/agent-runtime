@@ -3,10 +3,17 @@
 This repository has a reviewed, manual npm publication path. It has never published
 anything, and running it is a human decision, not an automated consequence of merging.
 
+**Version preparation is authorized; publication is not.** The eight public packages are
+prepared at `0.2.0` on a release branch, which is a reviewable proposal and nothing more.
+No approval below has been granted, no dispatch has been made, and preparing a version
+neither authorises a publication nor creates a presumption of one. The two decisions are
+kept apart on purpose: this document describes a path that is ready to be _asked_ to run.
+
 - Workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml)
 - Decision record: [ADR-0017](adr/ADR-0017-manual-npm-release.md)
 - Owning skill: `.agents/skills/npm-release/SKILL.md`
 - Structure is machine-checked by `pnpm release:check`, which the canonical gate runs.
+- What 0.2.0 contains: [release notes](release-notes.md)
 
 ## What the path guarantees
 
@@ -168,14 +175,14 @@ find out why the remote is unreadable — not to remove the check.
 
 ## Authorized version preparation
 
-Preparation of all eight packages at 0.2.0 is authorized in the separate version PR #28.
-This issue #27 repair changes the inventory and gate, and retains the existing package
-versions and intents. Preparation does not authorize merging, dispatching or publishing.
-The publication decisions below remain separate human approvals.
+Preparation of all eight packages at 0.2.0 is authorized, and PR #28 is where it happened.
+Its baseline contains the issue #27 gate repair, so the transition below is proven rather
+than asserted. Preparation does not authorize merging, dispatching or publishing. The
+publication decisions below remain separate human approvals.
 
-1. **Authorized version preparation.** This repair still has every publishable package
-   at `0.1.0` with three pending changesets. PR #28 prepares the following exact outcome
-   with `changeset version`; review and the full canonical matrix are still required.
+1. **Authorized version preparation.** _Prepared, pending review._ `changeset version`
+   consumed all three pending changesets and produced exactly the outcome the pinned
+   release plan predicted; review and the full canonical matrix are still required.
    The pinned release plan and `linked` configuration keep the eight in step:
 
    | Package                             | From  | To    | Bump  |
@@ -191,9 +198,28 @@ The publication decisions below remain separate human approvals.
 
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
-   `@relvo-labs/reference-app` is private and is never published. No version in this
-   repair is changed. The version candidate must pass against a baseline containing this
-   repair before it is ready for a human merge decision.
+   `.changeset/` now holds no pending intent. `@relvo-labs/reference-app` is private, was
+   deliberately left at `0.0.0`, and is never published. No other manifest field moved:
+   the version-only proof compares every workspace manifest against the baseline and
+   admits exactly the planned `version`.
+
+   `changelog: false` is set in `.changeset/config.json`, so `changeset version` generates
+   no `CHANGELOG.md`. The release information those three changesets carried — including
+   their `BREAKING:` notes — is preserved in [`release-notes.md`](release-notes.md)
+   instead. That file, not a generated changelog, is what a reviewer reads to see what
+   0.2.0 actually contains.
+
+   Preparing the versions is not permission to publish them, and a prepared branch is
+   **not dispatchable**. A release can only be dispatched against a commit that is the
+   exact current tip of `main`, with the canonical gate green on that commit and the
+   `npm-release` environment approval given for that run. Until this PR is merged, none of
+   those three conditions exists, and the approvals below remain outstanding regardless.
+
+   The gate step that once refused this shape of PR is issue #27, fixed in PR #29 and
+   present in this candidate's baseline: `pnpm changeset:status` now proves a dedicated
+   version transition instead of reading a bare CLI coverage answer. Issue #26 — preflight
+   gathering artifacts before it evaluates diagnostics — is a separate, still-open
+   limitation and is not addressed here.
 
 ## Outstanding human approvals
 
@@ -294,11 +320,12 @@ which one you have. Read the summary in these three categories:
 ## Local rehearsal
 
 Preflight is credential-free and can be run locally against built, packed artifacts.
-Use the actual branch and an explicitly local event; never impersonate
-`workflow_dispatch` on `refs/heads/main`. A local run must refuse release eligibility.
-The 0.2.0 example targets the authorized preparation candidate, not this repair's 0.1.0
-manifests. On this repair it may fail while gathering artifacts before reporting findings;
-issue #26 tracks that diagnostic ordering separately.
+Use the actual branch and an explicitly local event; never impersonate `workflow_dispatch`
+on `refs/heads/main`. That would spoof the two facts preflight exists to check, and a
+rehearsal that lies about its own context cannot tell you anything about a real one. A
+local run must refuse release eligibility. Packing still precedes diagnostic evaluation,
+so a rehearsal can fail while gathering artifacts before it reports any finding; issue #26
+tracks that ordering separately.
 
 ```bash
 export RELEASE_EVENT_NAME=local_nonpublishing_verification
@@ -311,6 +338,12 @@ node tools/release/preflight.ts --staging /tmp/release-staging
 ```
 
 The one-package example is diagnostic only; it is not the complete first-release scope.
+
+Read the findings rather than the exit code alone: the question a rehearsal answers is
+_which_ facts it could not establish, not merely that it said no. With honest inputs the
+dispatch-context findings — not a `workflow_dispatch`, not on `main`, and a `source_sha`
+that is not the remote tip — are among the answers you want to see, and they are separate
+from the package and inventory facts the same run does establish.
 
 ## Feature coverage and version-only proof
 
@@ -338,3 +371,10 @@ CLI JSON inventory, not the CLI feature-coverage assertion. They are ESM package
 the existing Changesets/manypkg projects; removing them would require another reviewed
 inventory and baseline-planning implementation. The lockfile retains their existing
 resolutions and integrity hashes.
+
+This candidate is what that proof was built for: it is a dedicated version transition on a
+baseline that already contains the proof, so `pnpm changeset:status` reports `version-only`
+rather than a coverage answer. The check reads `main` as a local ref, exactly as the gate
+workflow materializes it from `origin/main` before running — a stale local `main` compares
+against the wrong baseline and refuses, which is the check working, not a finding about
+the candidate.
