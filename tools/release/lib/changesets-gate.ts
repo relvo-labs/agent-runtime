@@ -45,7 +45,9 @@ export async function checkChangesets(root: string): Promise<'feature-coverage' 
   if (current.config.baseBranch !== 'main') throw new Error('Changesets baseline must remain main');
   const base = git(root, 'merge-base', current.config.baseBranch, 'HEAD').trim();
   const changed = new Set([
-    ...paths(git(root, 'diff', '--name-only', '-z', base, '--')),
+    // Rename detection reports only the destination with --name-only. Keep the
+    // deleted source endpoint even when its destination is allowed documentation.
+    ...paths(git(root, 'diff', '--no-renames', '--name-only', '-z', base, '--')),
     ...paths(git(root, 'ls-files', '--others', '--exclude-standard', '-z')),
   ]);
   const scratch = mkdtempSync(join(tmpdir(), 'relvo-changesets-baseline-'));
