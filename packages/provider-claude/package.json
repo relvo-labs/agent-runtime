@@ -1,6 +1,6 @@
 {
   "name": "@relvo-labs/agent-provider-claude",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude adapter for the neutral agent provider SPI, backed by the official Claude Agent SDK query surface.",
   "license": "Apache-2.0",
   "type": "module",

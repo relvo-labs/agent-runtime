@@ -3,10 +3,17 @@
 This repository has a reviewed, manual npm publication path. It has never published
 anything, and running it is a human decision, not an automated consequence of merging.
 
+**Version preparation is authorized; publication is not.** The eight public packages are
+prepared at `0.2.0` on a release branch, which is a reviewable proposal and nothing more.
+No approval below has been granted, no dispatch has been made, and preparing a version
+neither authorises a publication nor creates a presumption of one. The two decisions are
+kept apart on purpose: this document describes a path that is ready to be _asked_ to run.
+
 - Workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml)
 - Decision record: [ADR-0017](adr/ADR-0017-manual-npm-release.md)
 - Owning skill: `.agents/skills/npm-release/SKILL.md`
 - Structure is machine-checked by `pnpm release:check`, which the canonical gate runs.
+- What 0.2.0 contains: [release notes](release-notes.md)
 
 ## What the path guarantees
 
@@ -171,10 +178,10 @@ find out why the remote is unreadable — not to remove the check.
 None of these has been granted. Each is a person's decision, recorded where a reviewer can
 find it.
 
-1. **Version preparation.** Every publishable package is still `0.1.0` and three
-   changesets are pending, so a release cannot run today. A separate, reviewed release PR
-   must run `changeset version` and produce exactly this (from `pnpm changeset:status`,
-   `linked` keeps the eight in step):
+1. **Version preparation.** _Prepared, pending review._ The dedicated release PR for
+   issue #25 ran `changeset version`, which consumed all three pending changesets and
+   produced exactly the bumps `pnpm changeset:status` had predicted (`linked` keeps the
+   eight in step):
 
    | Package                             | From  | To    | Bump  |
    | ----------------------------------- | ----- | ----- | ----- |
@@ -189,8 +196,30 @@ find it.
 
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
-   `@relvo-labs/reference-app` is private and is never published. No version in this
-   repository has been changed to prepare that PR; deriving and reviewing it is step one.
+   `.changeset/` now holds no pending intent. `@relvo-labs/reference-app` is private, was
+   deliberately left at `0.0.0`, and is never published.
+
+   `changelog: false` is set in `.changeset/config.json`, so `changeset version` generates
+   no `CHANGELOG.md`. The release information those three changesets carried — including
+   their `BREAKING:` notes — is preserved in [`release-notes.md`](release-notes.md)
+   instead. That file, not a generated changelog, is what a reviewer reads to see what
+   0.2.0 actually contains.
+
+   Preparing the versions is not permission to publish them, and a prepared branch is
+   **not dispatchable**. A release can only be dispatched against a commit that is the
+   exact current tip of `main`, with the canonical gate green on that commit and the
+   `npm-release` environment approval given for that run. Until this PR is merged, none of
+   those three conditions exists, and approvals 2–4 below remain outstanding regardless.
+
+   Known blockers recorded against this preparation, neither of which is fixed here:
+   - **#27** — the canonical gate's `changesets` step fails on a version-only PR.
+     `changeset status` compares the branch against `main` and exits non-zero when
+     packages changed with no changeset pending, which is exactly the shape of a correct
+     version-preparation PR. It resolves once the branch is merged and `main` is the base
+     being compared against, so it does not affect a dispatch from `main`.
+   - **#26** — preflight's diagnostic ordering. `changeset status` is read while facts are
+     being gathered, before any finding is evaluated, so on a branch the #27 failure
+     surfaces as a crash rather than as a refusal that names its reason.
 
 2. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
    the `NPM_TOKEN` secret (granular, write-limited to this scope, short-lived) and the
@@ -286,15 +315,35 @@ which one you have. Read the summary in these three categories:
 
 ## Local rehearsal
 
-Preflight is credential-free and can be run locally. Today it is expected to **refuse**,
-because version intent is still pending — that refusal is the control working, not a
-failure of the tooling:
+Preflight is credential-free and can be run locally. It is expected to **refuse** anywhere
+except a clean checkout of `main`'s current tip; a refusal here is the control working
+rather than a failure of the tooling.
+
+Describe the run as what it is. A local rehearsal is not a dispatch, so do not hand it a
+`workflow_dispatch` event name or `refs/heads/main` — that spoofs the two facts preflight
+exists to check, and a rehearsal that lies about its own context cannot tell you anything
+about a real one. Pass the actual event and the actual branch:
 
 ```bash
-export RELEASE_EVENT_NAME=workflow_dispatch RELEASE_REF=refs/heads/main
+export RELEASE_EVENT_NAME=local_nonpublishing_verification
+export RELEASE_REF="$(git symbolic-ref HEAD)"
 export RELEASE_SOURCE_SHA=$(git rev-parse HEAD) RELEASE_RUNNER_SHA=$(git rev-parse HEAD)
-export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.1.0'
+export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.2.0'
 export RELEASE_DIST_TAG=latest
 export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
+
+Read the findings rather than the exit code alone: the question a rehearsal answers is
+_which_ facts it could not establish, not merely that it said no. With honest inputs the
+dispatch-context findings — not a `workflow_dispatch`, not on `main` — are among the
+answers you want to see.
+
+**What a local rehearsal cannot currently reach.** On a branch, preflight does not get as
+far as reporting findings at all. It reads `changeset status` while gathering facts, and
+on a version-preparation branch that command exits non-zero (blocker #27), which surfaces
+as a crash rather than a named refusal (blocker #26). So the stages past fact-gathering —
+packing, artifact identity, dependency closure and every registry question — are not
+exercised locally today. Run the rehearsal from `main` once this is merged if you want
+those stages observed before a dispatch, and do not read a local crash as evidence about
+them either way.

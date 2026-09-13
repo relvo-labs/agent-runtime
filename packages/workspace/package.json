@@ -1,6 +1,6 @@
 {
   "name": "@relvo-labs/agent-workspace",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Workspace SPI with borrowed and managed leases, and guarded local-filesystem cleanup.",
   "license": "Apache-2.0",
   "type": "module",

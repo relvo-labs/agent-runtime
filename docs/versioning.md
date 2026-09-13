@@ -11,4 +11,8 @@ intentionally parsed as a bounded string, then compared explicitly before regist
 
 Foundation v0.4 is the unreleased initial line, so release-blocker corrections are incorporated before its first publication rather than pretending the reviewed candidate was already a compatible public contract. After publication, the versioned compatibility fixtures are immutable.
 
-Nothing has been published yet. Version files and pending Changesets record intent only: a version bump is made by a separate reviewed release PR running `changeset version`, and publication is a manual, explicitly scoped dispatch of [`.github/workflows/release.yml`](../.github/workflows/release.yml) that refuses to run while any changeset is still pending. See the [release runbook](release.md).
+Nothing has been published yet. A version file records intent, not a release: a version bump is made by a separate reviewed release PR running `changeset version`, and publication is a manual, explicitly scoped dispatch of [`.github/workflows/release.yml`](../.github/workflows/release.yml) that refuses to run while any changeset is still pending.
+
+The eight public packages are prepared at `0.2.0` with no changeset pending. A prepared branch is **not dispatchable**: a release runs only against a commit that is the exact current tip of `main`, with the canonical gate green on that commit and the `npm-release` environment approval given for that run. Carrying a version number is one of those conditions and the weakest of them — it makes a line reviewable, not releasable. See the [release runbook](release.md) and the [release notes](release-notes.md).
+
+Because `.changeset/config.json` sets `changelog: false`, consuming a changeset does not leave a generated `CHANGELOG.md` behind. `docs/release-notes.md` carries that information forward per prepared version, including the `BREAKING:` notes that justify a pre-1.0 minor.

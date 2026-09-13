@@ -1,6 +1,6 @@
 {
   "name": "@relvo-labs/agent-workspace-git",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Git-backed agent workspaces with an injected git seam and no credential ownership.",
   "license": "Apache-2.0",
   "type": "module",

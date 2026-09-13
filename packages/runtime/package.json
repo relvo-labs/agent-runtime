@@ -1,6 +1,6 @@
 {
   "name": "@relvo-labs/agent-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Provider-neutral, No-PTY agent execution runtime: composition root, atomic store seam and replay-then-live subscriptions.",
   "license": "Apache-2.0",
   "type": "module",
