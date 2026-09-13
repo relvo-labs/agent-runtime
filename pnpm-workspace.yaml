@@ -65,6 +65,12 @@ catalog:
   publint: 0.3.24
   '@arethetypeswrong/cli': 0.18.5
   '@changesets/cli': 3.0.1
+  # Direct library imports match the already locked CLI dependency graph.
+  '@changesets/assemble-release-plan': 7.0.0
+  '@changesets/config': 4.0.0
+  '@changesets/pre': 3.0.0
+  '@changesets/read': 1.0.0
+  '@manypkg/get-packages': 3.1.0
 
   # Dev-only, examples/reference-app only: drives a system-supplied Chromium
   # for its optional browser check (`scripts/browser-check.ts`). `playwright-core`

@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.4.0
+version: 1.5.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -203,16 +203,28 @@ layout rather than trusting the local one — install the pinned pnpm executable
 `pnpm runtime set node <matrix version> -g` into a scratch `PNPM_HOME`, and run the gate
 with that `node` first on `PATH`.
 
-Dry-run the preflight locally against real packed artifacts (credential-free; it is
-expected to refuse while changesets are pending):
+Rehearse preflight locally against real packed artifacts, without credentials. Report
+local facts honestly: never supply `workflow_dispatch` or `refs/heads/main` to impersonate
+a hosted dispatch. The 0.2.0 scope below is an example for the separately authorized
+version-preparation candidate; this repair retains the current manifests and intents.
+A local run must refuse release eligibility even after that candidate is versioned.
+Packing still precedes diagnostic evaluation; issue #26 tracks that separate limitation.
 
 ```bash
-RELEASE_EVENT_NAME=workflow_dispatch RELEASE_REF=refs/heads/main \
-RELEASE_RUNNER_SHA=$(git rev-parse HEAD) RELEASE_SOURCE_SHA=$(git rev-parse HEAD) \
-RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.1.0' RELEASE_DIST_TAG=latest \
-RELEASE_CONFIRM="publish 1 package(s) from $(git rev-parse HEAD) to latest" \
+export RELEASE_EVENT_NAME=local_nonpublishing_verification
+export RELEASE_REF=$(git symbolic-ref -q HEAD || printf detached)
+export RELEASE_SOURCE_SHA=$(git rev-parse HEAD) RELEASE_RUNNER_SHA=$(git rev-parse HEAD)
+export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.2.0'
+export RELEASE_DIST_TAG=latest
+export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
+
+This one-package example is a diagnostic rehearsal, not the full first-release scope.
+Read `docs/release.md` for the eight-package preparation and separate publication decision.
+The library release inventory does not assert feature coverage: the gate owns that proof.
+Raw pending-file checks remain required so empty or malformed intent cannot authorize
+publication through an empty release plan.
 
 ## Provenance
 

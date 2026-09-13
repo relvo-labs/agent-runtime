@@ -64,7 +64,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `changesets-release`
 
-- **Version:** 1.1.0 (stable)
+- **Version:** 1.2.0 (stable)
 - **Path:** `.agents/skills/changesets-release/SKILL.md`
 - **Description:** Record version intent for pre-1.0 packages with Changesets, and keep versioning separate from the manual release workflow that publishes them.
 - **Tags:** `changelog`, `changesets`, `prerelease`, `semver`
@@ -82,7 +82,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `npm-release`
 
-- **Version:** 1.4.0 (stable)
+- **Version:** 1.5.0 (stable)
 - **Path:** `.agents/skills/npm-release/SKILL.md`
 - **Description:** Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
 - **Tags:** `npm`, `provenance`, `publish`, `registry`, `supply-chain`

@@ -37,12 +37,17 @@
     "release:check": "node tools/release/check-release-workflow.ts",
     "licenses:check": "node tools/repo/check-licenses.ts",
     "changeset": "changeset",
-    "changeset:status": "changeset status"
+    "changeset:status": "node tools/repo/check-changesets.ts"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "catalog:",
+    "@changesets/assemble-release-plan": "catalog:",
     "@changesets/cli": "catalog:",
+    "@changesets/config": "catalog:",
+    "@changesets/pre": "catalog:",
+    "@changesets/read": "catalog:",
     "@eslint/js": "catalog:",
+    "@manypkg/get-packages": "catalog:",
     "@types/node": "catalog:",
     "@vitest/coverage-v8": "catalog:",
     "ajv": "catalog:",
