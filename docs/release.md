@@ -102,7 +102,7 @@ Preflight refuses the release unless **all** of the following hold at the named 
 1. the dispatch is `workflow_dispatch` on `refs/heads/main`, and `source_sha` is the exact
    current tip of `main` and the commit the runner checked out;
 2. the working tree is clean;
-3. `.changeset/` contains no unreleased changeset, and `changeset status` proposes no
+3. `.changeset/` contains no unreleased changeset (including empty files), and the pinned Changesets library proposes no
    release — version intent belongs to a separate versioning PR (see below);
 4. every named package exists in the workspace, is not private, and already carries the
    exact version named in the dispatch;
@@ -173,15 +173,17 @@ something unparseable, reports no `refs/heads/main`, or reports it more than
 once, the run refuses rather than proceeding. The correct response to that is to
 find out why the remote is unreadable — not to remove the check.
 
-## Outstanding human approvals
+## Authorized version preparation
 
-None of these has been granted. Each is a person's decision, recorded where a reviewer can
-find it.
+Preparation of all eight packages at 0.2.0 is authorized, and PR #28 is where it happened.
+Its baseline contains the issue #27 gate repair, so the transition below is proven rather
+than asserted. Preparation does not authorize merging, dispatching or publishing. The
+publication decisions below remain separate human approvals.
 
-1. **Version preparation.** _Prepared, pending review._ The dedicated release PR for
-   issue #25 ran `changeset version`, which consumed all three pending changesets and
-   produced exactly the bumps `pnpm changeset:status` had predicted (`linked` keeps the
-   eight in step):
+1. **Authorized version preparation.** _Prepared, pending review._ `changeset version`
+   consumed all three pending changesets and produced exactly the outcome the pinned
+   release plan predicted; review and the full canonical matrix are still required.
+   The pinned release plan and `linked` configuration keep the eight in step:
 
    | Package                             | From  | To    | Bump  |
    | ----------------------------------- | ----- | ----- | ----- |
@@ -197,7 +199,9 @@ find it.
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
    `.changeset/` now holds no pending intent. `@relvo-labs/reference-app` is private, was
-   deliberately left at `0.0.0`, and is never published.
+   deliberately left at `0.0.0`, and is never published. No other manifest field moved:
+   the version-only proof compares every workspace manifest against the baseline and
+   admits exactly the planned `version`.
 
    `changelog: false` is set in `.changeset/config.json`, so `changeset version` generates
    no `CHANGELOG.md`. The release information those three changesets carried — including
@@ -209,27 +213,27 @@ find it.
    **not dispatchable**. A release can only be dispatched against a commit that is the
    exact current tip of `main`, with the canonical gate green on that commit and the
    `npm-release` environment approval given for that run. Until this PR is merged, none of
-   those three conditions exists, and approvals 2–4 below remain outstanding regardless.
+   those three conditions exists, and the approvals below remain outstanding regardless.
 
-   Known blockers recorded against this preparation, neither of which is fixed here:
-   - **#27** — the canonical gate's `changesets` step fails on a version-only PR.
-     `changeset status` compares the branch against `main` and exits non-zero when
-     packages changed with no changeset pending, which is exactly the shape of a correct
-     version-preparation PR. It resolves once the branch is merged and `main` is the base
-     being compared against, so it does not affect a dispatch from `main`.
-   - **#26** — preflight's diagnostic ordering. `changeset status` is read while facts are
-     being gathered, before any finding is evaluated, so on a branch the #27 failure
-     surfaces as a crash rather than as a refusal that names its reason.
+   The gate step that once refused this shape of PR is issue #27, fixed in PR #29 and
+   present in this candidate's baseline: `pnpm changeset:status` now proves a dedicated
+   version transition instead of reading a bare CLI coverage answer. Issue #26 — preflight
+   gathering artifacts before it evaluates diagnostics — is a separate, still-open
+   limitation and is not addressed here.
 
-2. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
+## Outstanding human approvals
+
+The following publication decisions remain unapproved, independently of version preparation.
+
+1. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
    the `NPM_TOKEN` secret (granular, write-limited to this scope, short-lived) and the
    environment's required reviewers are configured by a human outside this repository.
    Nothing here edits repository settings.
 
-3. **The first-release decision itself.** Publishing 0.2.0 makes the v0.4 contract
+2. **The first-release decision itself.** Publishing 0.2.0 makes the v0.4 contract
    public and immutable. That call is made against the evidence policy below.
 
-4. **Each dispatch.** Scope, dist-tag and confirmation are typed per run, and the
+3. **Each dispatch.** Scope, dist-tag and confirmation are typed per run, and the
    environment approval is given per run.
 
 ## First-release evidence policy
@@ -315,18 +319,17 @@ which one you have. Read the summary in these three categories:
 
 ## Local rehearsal
 
-Preflight is credential-free and can be run locally. It is expected to **refuse** anywhere
-except a clean checkout of `main`'s current tip; a refusal here is the control working
-rather than a failure of the tooling.
-
-Describe the run as what it is. A local rehearsal is not a dispatch, so do not hand it a
-`workflow_dispatch` event name or `refs/heads/main` — that spoofs the two facts preflight
-exists to check, and a rehearsal that lies about its own context cannot tell you anything
-about a real one. Pass the actual event and the actual branch:
+Preflight is credential-free and can be run locally against built, packed artifacts.
+Use the actual branch and an explicitly local event; never impersonate `workflow_dispatch`
+on `refs/heads/main`. That would spoof the two facts preflight exists to check, and a
+rehearsal that lies about its own context cannot tell you anything about a real one. A
+local run must refuse release eligibility. Packing still precedes diagnostic evaluation,
+so a rehearsal can fail while gathering artifacts before it reports any finding; issue #26
+tracks that ordering separately.
 
 ```bash
 export RELEASE_EVENT_NAME=local_nonpublishing_verification
-export RELEASE_REF="$(git symbolic-ref HEAD)"
+export RELEASE_REF=$(git symbolic-ref -q HEAD || printf detached)
 export RELEASE_SOURCE_SHA=$(git rev-parse HEAD) RELEASE_RUNNER_SHA=$(git rev-parse HEAD)
 export RELEASE_PACKAGES='@relvo-labs/agent-protocol@0.2.0'
 export RELEASE_DIST_TAG=latest
@@ -334,16 +337,44 @@ export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
 
+The one-package example is diagnostic only; it is not the complete first-release scope.
+
 Read the findings rather than the exit code alone: the question a rehearsal answers is
 _which_ facts it could not establish, not merely that it said no. With honest inputs the
-dispatch-context findings — not a `workflow_dispatch`, not on `main` — are among the
-answers you want to see.
+dispatch-context findings — not a `workflow_dispatch`, not on `main`, and a `source_sha`
+that is not the remote tip — are among the answers you want to see, and they are separate
+from the package and inventory facts the same run does establish.
 
-**What a local rehearsal cannot currently reach.** On a branch, preflight does not get as
-far as reporting findings at all. It reads `changeset status` while gathering facts, and
-on a version-preparation branch that command exits non-zero (blocker #27), which surfaces
-as a crash rather than a named refusal (blocker #26). So the stages past fact-gathering —
-packing, artifact identity, dependency closure and every registry question — are not
-exercised locally today. Run the rehearsal from `main` once this is merged if you want
-those stages observed before a dispatch, and do not read a local crash as evidence about
-them either way.
+## Feature coverage and version-only proof
+
+The pinned Changesets 3.0.1 CLI can reject a correct version PR before writing status
+JSON: packages changed relative to `main`, but versioning consumed all intents. Release
+preflight therefore inventories the library release plan directly. An empty inventory
+means no planned release; it does not authorize a feature change or a publication.
+Publication still refuses raw pending files, including empty and malformed intents.
+
+`pnpm changeset:status` keeps the upstream CLI coverage assertion for feature branches
+and requires a real changeset naming each changed public package. For a dedicated version
+transition it reads baseline manifests and real intents from the configured branch's
+Git merge base and computes the expected versions using the pinned libraries. Every
+workspace manifest must match that baseline except for the exact planned version. It
+refuses unconsumed intents, missing or arbitrary bumps, package additions/deletions,
+source/test/build/tooling-input changes anywhere in the repository, other manifest
+edits and planning-config changes.
+READMEs may document release evidence; configured changelogs may carry release notes.
+Prerelease transitions and dependency-range rewrites are outside the current proof.
+No dummy intent, alternate comparison ref, label or environment bypass is used.
+
+The five directly imported planning libraries are exact catalog pins matching the
+existing Changesets CLI dependency graph. They add no transitive packages and replace
+CLI JSON inventory, not the CLI feature-coverage assertion. They are ESM packages from
+the existing Changesets/manypkg projects; removing them would require another reviewed
+inventory and baseline-planning implementation. The lockfile retains their existing
+resolutions and integrity hashes.
+
+This candidate is what that proof was built for: it is a dedicated version transition on a
+baseline that already contains the proof, so `pnpm changeset:status` reports `version-only`
+rather than a coverage answer. The check reads `main` as a local ref, exactly as the gate
+workflow materializes it from `origin/main` before running — a stale local `main` compares
+against the wrong baseline and refuses, which is the check working, not a finding about
+the candidate.

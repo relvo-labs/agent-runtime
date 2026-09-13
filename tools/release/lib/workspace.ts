@@ -8,9 +8,9 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { readChangesetState } from './changesets.ts';
 import type { ChangesetRelease, GitFacts, WorkspacePackage } from './preflight.ts';
 
 export type CommandResult = { readonly code: number; readonly stdout: string; readonly stderr: string };
@@ -74,35 +74,17 @@ export function readPendingChangesetFiles(repoRoot: string): readonly string[] {
 }
 
 /**
- * `changeset status` is the authoritative answer to "is there version intent
- * that this release would skip?". It needs the workspace's dev dependencies,
- * so it only runs in the credential-free verify job; the gated job re-checks
- * the dependency-free `.changeset/*.md` inventory instead.
+ * Inventory the pinned library's release plan without asserting feature coverage.
+ * The CLI asserts coverage before emitting JSON and cannot inventory a version PR.
+ * Publication also checks the raw pending-file inventory, including empty intents.
  */
-export function readChangesetStatus(repoRoot: string): readonly ChangesetRelease[] {
-  const scratch = mkdtempSync(join(tmpdir(), 'relvo-changeset-'));
-  const output = join(scratch, 'status.json');
-  try {
-    const result = runCommand('pnpm', ['changeset', 'status', `--output=${output}`], repoRoot);
-    if (result.code !== 0) {
-      throw new Error(`changeset status failed with code ${result.code}\n${result.stdout}${result.stderr}`.trim());
-    }
-    const document = JSON.parse(readFileSync(output, 'utf8')) as unknown;
-    if (typeof document !== 'object' || document === null) throw new Error('changeset status produced no document');
-    const releases = (document as Record<string, unknown>).releases;
-    if (!Array.isArray(releases)) throw new Error('changeset status produced no releases array');
-    return releases.map((entry) => {
-      const release = entry as Record<string, unknown>;
-      return {
-        name: String(release.name),
-        type: String(release.type),
-        oldVersion: String(release.oldVersion),
-        newVersion: String(release.newVersion),
-      };
-    });
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
+export async function readChangesetStatus(repoRoot: string): Promise<readonly ChangesetRelease[]> {
+  const { plan } = await readChangesetState(repoRoot);
+  return plan.releases.flatMap((release) => {
+    if (release.type === 'none') return [];
+    const { name, type, oldVersion, newVersion } = release;
+    return [{ name, type, oldVersion, newVersion }];
+  });
 }
 
 export function readGitFacts(repoRoot: string, run: CommandRunner = runCommand): GitFacts {

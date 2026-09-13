@@ -72,7 +72,7 @@ try {
       context: readActionsContext(process.env),
       git: readGitFacts(repoRoot),
       pendingChangesetFiles: readPendingChangesetFiles(repoRoot),
-      changesetReleases: readChangesetStatus(repoRoot),
+      changesetReleases: await readChangesetStatus(repoRoot),
       workspace: readWorkspaceInventory(repoRoot),
       artifacts,
       registryUrl,
