@@ -9,6 +9,13 @@
  * token before it is printed, and any failure stops the run non-zero with an
  * exact account of what is already public.
  *
+ * Each upload is followed by a read-only visibility reconciliation, because npm
+ * scans a newly published package before serving it. That wait is bounded by
+ * `visibility.ts`, and the `publish` job's `timeout-minutes` in
+ * `.github/workflows/release.yml` is derived from the same constants, so the
+ * job can never be killed in the middle of a wait this program is still willing
+ * to make.
+ *
  * Usage:
  *   node tools/release/publish.ts --staging <directory>
  */
@@ -17,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import {
   checkSourceCurrency,
   readActionsContext,
@@ -162,6 +170,13 @@ try {
       registry: createHttpsRegistry(staging.plan.registry),
       log: write,
       sleep: (ms: number) => new Promise<void>((done) => setTimeout(done, ms)),
+      // Monotonic, not wall clock. The visibility budget is computed purely
+      // from differences between `now()` readings, and `Date.now()` can be
+      // stepped by NTP mid-wait: backwards it inflates the remaining budget
+      // (bounded then only by the job timeout), forwards it truncates the
+      // 20-minute bound the runbook states. `performance.now()` is unaffected
+      // by clock adjustment, so the bound applied is the bound documented.
+      now: () => performance.now(),
       revalidateSource: readSourceCurrency,
     },
     { tarballPath: staging.tarballPath, userconfig },

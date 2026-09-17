@@ -6,6 +6,12 @@
  *
  *   - one explicit tarball per `npm publish` invocation, never a directory,
  *     never `--workspaces`, never `changeset publish`;
+ *   - exactly one invocation per package per run. A zero exit makes the version
+ *     accepted, immutable and possibly already public, so the upload command is
+ *     never repeated — not on a slow registry, not during reconciliation, not
+ *     anywhere. There is one upload call site, it is guarded by `uploaded` in
+ *     `publishRelease`, reconciliation is given no way to upload, and the tests
+ *     assert the upload count per subject;
  *   - dependency order, so a dependent is never resolvable before the
  *     dependency it needs;
  *   - a full registry recheck immediately before *each* upload, so nothing that
@@ -29,13 +35,22 @@
  * accepted-but-unverified upload as "not published" would invite exactly the
  * wrong recovery — a second dispatch naming a version that is already public
  * and can never be overwritten.
+ *
+ * That second property is what run 34753860073 attempt 3 tested. npm accepted
+ * `@relvo-labs/agent-protocol@0.2.0`; the registry, which scans a new package
+ * before serving it, answered 404 for another 466 seconds; and the readback
+ * window was about twelve seconds. So the moment npm exits zero the version is
+ * recorded as `accepted_pending` and is reconciled — read-only, on a bounded
+ * deterministic schedule (`visibility.ts`) — into `verified`, or left explicitly
+ * pending for a human. It is never described as unpublished, and it is never
+ * uploaded again.
  */
 
 import { compareExactVersions, exactVersionOfRange } from './graph.ts';
 import type { Finding } from './plan.ts';
 import type { PlanEntry, ReleasePlan } from './preflight.ts';
 import type { RegistryLookup, RegistryPort } from './registry.ts';
-import { verifyReadback } from './readback.ts';
+import { DEFAULT_VISIBILITY_POLICY, describeBudget, reconcileVisibility, type VisibilityPolicy } from './visibility.ts';
 
 export type CommandOutcome = {
   readonly code: number;
@@ -47,8 +62,20 @@ export type PublishPorts = {
   /** Runs `npm` with the given argv. Must never echo its environment. */
   readonly npm: (argv: readonly string[]) => Promise<CommandOutcome>;
   readonly registry: RegistryPort;
+  /**
+   * Bounded, already-redacted output sink. In production this is the writer in
+   * `publish.ts`, which puts every line through `redactSecrets` before it
+   * reaches a public log, so a receipt written here cannot carry the token. It
+   * is given plan facts only — never command output, npmrc contents or the
+   * environment.
+   */
   readonly log: (line: string) => void;
   readonly sleep: (ms: number) => Promise<void>;
+  /**
+   * Monotonic clock for the visibility budget, read only as differences.
+   * Production passes `performance.now()`; tests advance it virtually.
+   */
+  readonly now: () => number;
   /**
    * Re-reads the facts about *this checkout* that authorised the release, and
    * returns a finding for each one that no longer holds.
@@ -68,8 +95,8 @@ export type PublishOptions = {
   readonly tarballPath: (entry: PlanEntry) => string;
   /** Temporary npmrc holding only an env-interpolated auth line. */
   readonly userconfig: string;
-  readonly readbackAttempts?: number;
-  readonly readbackDelayMs?: number;
+  /** Read-only post-acceptance reconciliation schedule and bound. */
+  readonly visibility?: VisibilityPolicy;
 };
 
 export type PublishFailure = {
@@ -83,14 +110,19 @@ export type PublishFailure = {
  * What the registry did with the bytes, as distinct from what we could confirm
  * about them afterwards.
  *
- *   - `accepted`  — npm reported success, or the version was observed on the
- *                   registry afterwards. It is public and immutable.
- *   - `rejected`  — npm failed *and* the registry definitively does not carry
- *                   the version. Nothing was published.
- *   - `unknown`   — npm failed and the registry could not be consulted. The
- *                   version may or may not be public; a human must look.
+ *   - `accepted`          — the version was observed on the registry. It is
+ *                           public and immutable.
+ *   - `accepted_pending`  — npm exited zero. The registry has the bytes and the
+ *                           version is immutable, but this run could not (yet)
+ *                           confirm what is served. It is *never* "unpublished",
+ *                           and it is never uploaded again.
+ *   - `rejected`          — npm failed *and* the registry definitively does not
+ *                           carry the version. Nothing was published.
+ *   - `unknown`           — npm failed and the registry could not be consulted.
+ *                           The version may or may not be public; a human must
+ *                           look.
  */
-export type UploadState = 'accepted' | 'rejected' | 'unknown';
+export type UploadState = 'accepted' | 'accepted_pending' | 'rejected' | 'unknown';
 
 export type PublishOutcome = {
   readonly name: string;
@@ -104,8 +136,12 @@ export type PublishReport = {
   readonly ok: boolean;
   /** `name@version` values uploaded *and* verified against the registry. */
   readonly published: readonly string[];
-  /** Uploaded and public, but readback could not confirm what is served. */
-  readonly acceptedUnverified: readonly string[];
+  /**
+   * Accepted by npm — or observed on the registry after npm failed — without a
+   * confirmed readback. Public or becoming public, immutable either way, and
+   * never nameable in a recovery dispatch.
+   */
+  readonly acceptedPending: readonly string[];
   /** Attempted, and not even known to have failed. Requires reconciliation. */
   readonly unknown: readonly string[];
   /** Every package the run touched, in publication order. */
@@ -262,17 +298,31 @@ export async function publishRelease(
   ports: PublishPorts,
   options: PublishOptions,
 ): Promise<PublishReport> {
-  const attempts = options.readbackAttempts ?? 5;
-  const delayMs = options.readbackDelayMs ?? 3_000;
+  const policy = options.visibility ?? DEFAULT_VISIBILITY_POLICY;
   const published: string[] = [];
-  const acceptedUnverified: string[] = [];
+  const acceptedPending: string[] = [];
   const unknown: string[] = [];
   const outcomes: PublishOutcome[] = [];
+  /**
+   * Subjects whose bytes have already been handed to `npm publish` in this run.
+   *
+   * Scope, stated exactly, because it is easy to claim more than it does: this
+   * guards *the one* `ports.npm(argv)` call site below, and nothing else. It
+   * cannot stop a future edit that adds a second call site elsewhere — an
+   * upload added inside the reconciliation branches would never consult this
+   * Set. What actually keeps "never republish" true is three things together:
+   * there is exactly one upload call site in this function, `reconcileVisibility`
+   * is handed no way to upload at all, and the tests assert an exact upload
+   * count per subject in every delayed-visibility and expiry scenario. If a
+   * second call site ever becomes necessary, route it through here rather than
+   * trusting that guard by proximity.
+   */
+  const uploaded = new Set<string>();
 
   const report = (ok: boolean, failure: PublishFailure | undefined, index: number): PublishReport => ({
     ok,
     published,
-    acceptedUnverified,
+    acceptedPending,
     unknown,
     outcomes,
     failure,
@@ -293,7 +343,7 @@ export async function publishRelease(
   ): PublishReport => {
     const subject = `${entry.name}@${entry.version}`;
     outcomes.push({ name: entry.name, version: entry.version, upload, verified: false, detail: message });
-    if (upload === 'accepted') acceptedUnverified.push(subject);
+    if (upload === 'accepted' || upload === 'accepted_pending') acceptedPending.push(subject);
     if (upload === 'unknown') unknown.push(subject);
     return report(false, { name: entry.name, version: entry.version, code, message }, index);
   };
@@ -337,7 +387,7 @@ export async function publishRelease(
     const dependencyProblem = await checkDependenciesStillAvailable(
       entry,
       plan,
-      new Set([...published, ...acceptedUnverified]),
+      new Set([...published, ...acceptedPending]),
       ports,
     );
     if (dependencyProblem !== undefined) {
@@ -351,6 +401,18 @@ export async function publishRelease(
       registry: plan.registry,
       userconfig: options.userconfig,
     });
+    // The one upload call site. Reaching it twice for the same subject would
+    // mean this loop grew a retry; refuse rather than re-upload a version the
+    // registry may already hold.
+    if (uploaded.has(subject)) {
+      return refuse(
+        entry,
+        'upload_already_attempted',
+        `${subject} was already handed to \`npm publish\` in this run; an accepted version is immutable and is never uploaded again`,
+        index,
+      );
+    }
+    uploaded.add(subject);
     const outcome = await ports.npm(argv);
     if (outcome.code !== 0) {
       // A non-zero exit is not proof that nothing was uploaded: npm can fail
@@ -368,6 +430,11 @@ export async function publishRelease(
         );
       }
       if (after.kind === 'found' || after.kind === 'absent') {
+        // npm failed and the registry does not carry the version. Note for the
+        // reader: this is the one place the run says "nothing was published"
+        // about an attempted upload, and it says so on a single read. A
+        // recovery dispatch naming it is still checked against the registry by
+        // preflight, which refuses the moment the version does appear.
         outcomes.push({ name: entry.name, version: entry.version, upload: 'rejected', verified: false, detail });
         return report(
           false,
@@ -384,27 +451,55 @@ export async function publishRelease(
       );
     }
 
-    let readback: readonly Finding[] = [];
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      readback = verifyReadback(entry, plan.distTag, await ports.registry.lookup(entry.name));
-      if (readback.length === 0) break;
-      if (attempt < attempts) await ports.sleep(delayMs);
-    }
-    if (readback.length > 0) {
+    // Zero exit. From this line on the version is accepted and immutable, and
+    // the only remaining question is what the registry serves. The receipt is
+    // one bounded line of plan facts, written through the redacting sink.
+    ports.log(
+      `[release] accepted_pending ${subject}: npm accepted the upload; reconciling public visibility read-only ` +
+        `within ${describeBudget(policy)} — this version is never uploaded again`,
+    );
+    const visibility = await reconcileVisibility(entry, plan.distTag, ports, policy);
+    const elapsed = `${(visibility.elapsedMs / 1000).toFixed(1)}s`;
+    const reasons = visibility.findings.map((finding) => finding.message).join('; ');
+
+    if (visibility.kind === 'unavailable') {
+      // Not a "not yet": a registry that will not answer is not a registry that
+      // is still scanning, so the budget is not spent re-asking it.
       return settle(
         entry,
-        'accepted',
+        'accepted_pending',
+        'readback_unavailable',
+        `npm accepted ${subject}, but the registry could not be read back (${reasons}); the version is accepted and ` +
+          'immutable — establish its public state by hand, and never republish it',
+        index,
+      );
+    }
+    if (visibility.kind === 'mismatch') {
+      return settle(
+        entry,
+        'accepted_pending',
         'readback_mismatch',
-        `npm accepted ${subject}, but registry readback failed after ${attempts} attempts: ${readback
-          .map((finding) => finding.message)
-          .join('; ')}`,
+        `npm accepted ${subject}, and the registry answered with something other than the reviewed artifact after ` +
+          `${String(visibility.reads)} read(s) in ${elapsed}: ${reasons}`,
+        index,
+      );
+    }
+    if (visibility.kind === 'not_yet_visible') {
+      return settle(
+        entry,
+        'accepted_pending',
+        'visibility_not_confirmed',
+        `npm accepted ${subject}, and it was still not publicly visible after ${String(visibility.reads)} read(s) ` +
+          `over ${elapsed} (bound ${describeBudget(policy)}): ${reasons}. The version is accepted and immutable; it ` +
+          'must never be republished. Check the npm account notifications for a manual-review or blocked-package ' +
+          'notice, then reconcile it by hand before any further dispatch',
         index,
       );
     }
 
+    ports.log(`[release] verified ${subject} on the registry after ${String(visibility.reads)} read(s) in ${elapsed}`);
     published.push(subject);
     outcomes.push({ name: entry.name, version: entry.version, upload: 'accepted', verified: true, detail: undefined });
-    ports.log(`[release] verified ${subject} on the registry`);
   }
 
   return report(true, undefined, plan.packages.length - 1);
@@ -419,9 +514,13 @@ export function summarizeReport(report: PublishReport): string {
   const list = (values: readonly string[]): string => (values.length === 0 ? '<none>' : values.join(', '));
   const lines: string[] = [];
   lines.push(`published and verified: ${list(report.published)}`);
-  if (report.acceptedUnverified.length > 0) {
-    lines.push(`published but NOT verified: ${list(report.acceptedUnverified)}`);
-    lines.push('  these versions are public and immutable; they must never be named in a recovery dispatch');
+  if (report.acceptedPending.length > 0) {
+    lines.push(`accepted_pending — npm accepted, visibility NOT confirmed: ${list(report.acceptedPending)}`);
+    lines.push(
+      '  npm has these bytes; the versions are immutable and are public or becoming public. They must never be ' +
+        'republished and never named in a recovery dispatch. If one is still not visible, read the npm account ' +
+        'notifications for a manual-review or blocked-package notice and use the appeal path it offers.',
+    );
   }
   if (report.unknown.length > 0) {
     lines.push(`outcome unknown: ${list(report.unknown)}`);
@@ -436,7 +535,7 @@ export function summarizeReport(report: PublishReport): string {
   }
   lines.push(`not attempted: ${list(report.notAttempted)}`);
 
-  const unresolved = report.acceptedUnverified.length + report.unknown.length > 0;
+  const unresolved = report.acceptedPending.length + report.unknown.length > 0;
   lines.push(
     unresolved
       ? 'recovery: nothing was unpublished or overwritten, but this run did not establish the full registry state. ' +

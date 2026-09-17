@@ -1,13 +1,21 @@
 # Release runbook
 
-This repository has a reviewed, manual npm publication path. It has never published
-anything, and running it is a human decision, not an automated consequence of merging.
+This repository has a reviewed, manual npm publication path. Running it is a human
+decision, not an automated consequence of merging.
 
-**Version preparation is authorized; publication is not.** The eight public packages are
-prepared at `0.2.0` on a release branch, which is a reviewable proposal and nothing more.
-No approval below has been granted, no dispatch has been made, and preparing a version
-neither authorises a publication nor creates a presumption of one. The two decisions are
-kept apart on purpose: this document describes a path that is ready to be _asked_ to run.
+**One version is public, and it is immutable.** `@relvo-labs/agent-protocol@0.2.0` was
+accepted and published by run 34753860073 attempt 3; the registry serves it, with
+integrity, shasum and tarball digest matching the reviewed artifact. Never name it in any
+dispatch, never republish it, and do not treat unpublishing as a recovery plan. The other
+seven packages of that scope were **not attempted**: they are future work that needs a
+fresh plan from the current tip of `main`, fresh reconciliation of every exact version and
+dist-tag immediately before dispatch, new explicit human authority for that scope, and a
+new environment approval. Preparing a version still authorises nothing by itself.
+
+That same run is why this document now has a section on
+[what happens when npm accepts a version it does not serve yet](#when-npm-accepts-a-version-it-does-not-serve-yet):
+the upload succeeded and the job failed anyway, because it stopped reading the registry
+about twelve seconds later.
 
 - Workflow: [`.github/workflows/release.yml`](../.github/workflows/release.yml)
 - Decision record: [ADR-0017](adr/ADR-0017-manual-npm-release.md)
@@ -32,6 +40,8 @@ kept apart on purpose: this document describes a path that is ready to be _asked
 | provenance                  | `--provenance` with `id-token: write` granted only to the publish job              |
 | no overwrite                | preflight and the publish step both refuse an existing version                     |
 | verified outcome            | registry readback of identity, integrity, dependencies and dist-tag                |
+| accepted ≠ visible          | a zero exit is `accepted_pending`, reconciled read-only within a bounded budget    |
+| never republished           | one `npm publish` per package per run, enforced in `publishRelease` itself         |
 
 ### How the artifact actually gets from `verify` to `publish`
 
@@ -51,6 +61,77 @@ matter most, and they run inside the gated job before the credential exists:
 every tarball is re-hashed and re-read from the archive, and the plan is
 re-hashed and compared against `plan-digest`, which `verify` recorded as a job
 output before the approval was requested.
+
+### When npm accepts a version it does not serve yet
+
+npm scans a newly published package before it is available to install. npm
+documents the delay as usually about five minutes, and says it can be fifteen
+minutes or more. That gap is invisible to the publisher, and it is what run
+34753860073 attempt 3 appears to have fallen into:
+`@relvo-labs/agent-protocol@0.2.0` was accepted, the job read the registry five
+times separated by 3000 ms — about twelve seconds — and failed. The version was
+still answering 404 publicly 251 s after the registry's own internal version
+timestamp, and first answered 200 at 466 s, with integrity, shasum and tarball
+digest matching the reviewed artifact exactly.
+
+**Read that as the best-supported cause, not an observed one.** Anonymous public
+endpoints do not expose npm's internal scan state, so ordinary publish-time
+scanning cannot be distinguished from another transient availability gate from
+outside. It is the best-supported reading because the version cleared with no
+human action, inside the delay range npm documents, and npm reported no incident
+that day. The practical consequence is the one that matters at 3 a.m.: **a long
+absence is not evidence that nothing is wrong.** An accepted version can equally
+be held for manual review or blocked, and those look identical from here — which
+is why the wait below is bounded and its expiry sends you to the account's
+notifications rather than to a longer wait.
+
+So the moment `npm publish` exits zero, the version is **`accepted_pending`**:
+
+- the registry has the bytes, the version is immutable, and it is public or
+  becoming public. It is never reported as unpublished, and it is never uploaded
+  again — `publishRelease` refuses to hand the same `name@version` to
+  `npm publish` twice in one run, and reconciliation has no upload port at all;
+- reconciliation is **read-only**: exact registry lookups on a deterministic
+  backoff (5 s, doubling to a 30 s cap, the final delay clipped to the bound)
+  for **20 minutes per package** — deliberately longer than the fifteen minutes
+  npm documents, because a bound equal to the documented worst case fails on
+  exactly the runs it exists to survive;
+- only the two expected post-acceptance answers are waited on: the package
+  absent (404), or a well-formed packument that does not yet list the exact
+  version. Everything else stops the run immediately:
+
+  | Registry answer during reconciliation                                   | Result                     |
+  | ----------------------------------------------------------------------- | -------------------------- |
+  | 404, or packument without the exact version                             | wait, within the budget    |
+  | network failure, timeout, 5xx, rate limit, 401/403, malformed packument | `readback_unavailable`     |
+  | identity, integrity, shasum, dependencies, peer dependencies, dist-tag  | `readback_mismatch`        |
+  | budget expired, still not visible                                       | `visibility_not_confirmed` |
+
+  An unanswerable registry is not a registry that is still scanning, so an auth
+  or transport failure never spends the delay budget; and an answered mismatch
+  cannot be made true by reading again.
+
+Each of the last three stops the run non-zero **before the next package is
+attempted**, leaves the version `accepted_pending`, and preserves every other
+guard — artifact identity, plan digest, main-tip currency, dist-tag, dependency
+order and the pinned npm.
+
+The `publish` job's `timeout-minutes` is derived from the same numbers rather
+than chosen: 8 × (20 m visibility budget + 2 m upload and pre-upload rechecks) +
+14 m setup, download and staged-artifact verification = **190 minutes**.
+`pnpm release:check` asserts that exact value, so the workflow cannot drift below
+the wait the publisher is willing to make. A shorter timeout would be the same
+defect as a short readback window, with the runner abandoning an accepted upload
+instead of the program.
+
+**If the budget expires.** The version is accepted and immutable. Do not
+republish it, do not name it in a recovery dispatch, and do not rotate the token
+on the strength of a 404. Establish its public state by hand, and — because a
+package held beyond the normal scan window may be in manual review or blocked —
+read the publishing npm account's email and npmjs.com notifications for a
+manual-review or blocked-package notice, then use the appeal path it offers.
+Only once that is resolved does a new, separately approved dispatch make sense,
+and its scope must name only packages confirmed still unpublished.
 
 ### Which npm publishes
 
@@ -230,8 +311,12 @@ The following publication decisions remain unapproved, independently of version 
    environment's required reviewers are configured by a human outside this repository.
    Nothing here edits repository settings.
 
-2. **The first-release decision itself.** Publishing 0.2.0 makes the v0.4 contract
-   public and immutable. That call is made against the evidence policy below.
+2. **The remaining seven packages of the 0.2.0 scope.** `agent-protocol@0.2.0` is already
+   public and immutable; the other seven were never uploaded. Publishing them makes the
+   rest of the v0.4 contract public and immutable, and that call is made again, against
+   the evidence policy below, with a plan regenerated from the current tip of `main` and
+   every exact version and dist-tag reconciled against the registry immediately before
+   dispatch. Nothing in this repair authorises it.
 
 3. **Each dispatch.** Scope, dist-tag and confirmation are typed per run, and the
    environment approval is given per run.
@@ -269,14 +354,23 @@ accurately. This policy is not weakened by the existence of a release path.
 4. Read the `verify` job output: it prints the full plan, the plan digest, the publication
    order, each tarball's integrity, and every publishable package left **out** of scope.
 5. Approve the `npm-release` environment only if that plan is exactly what you intended.
-6. Read the `publish` job output: each package is published and then verified against the
-   registry before the next one is attempted.
+6. Read the `publish` job output: each package is uploaded once, recorded as
+   `accepted_pending`, and then reconciled against the registry — read-only, for up to
+   20 minutes — before the next one is attempted. A run that sits quietly for minutes
+   after an upload is doing exactly what it should; npm is still scanning the package.
+   Expect the job to take longer than the upload time suggests, and never cancel it to
+   "retry": the versions it has already uploaded are immutable.
 
-## What the first dispatch will establish
+## What the first dispatch established
 
-Everything above is verified locally and in the gate, but four facts can only be observed
-the first time this workflow actually runs. Expect to read the logs carefully, and treat a
-failure in any of them as a workflow bug rather than a reason to retry with a wider scope:
+Everything above is verified locally and in the gate, but four facts could only be
+observed the first time this workflow actually ran. Run 34753860073 observed all four
+holding — the artifact download by id, the anonymous remote read, the pinned npm minting
+provenance with the granular token, and the environment's reviewers — and then failed on
+the one thing no local test covered: the delay between npm accepting a version and the
+registry serving it. That is now modelled above; the list is kept because it is what a
+reader of a future first-of-its-kind dispatch should still watch for, and because a
+failure in any of them is a workflow bug rather than a reason to retry with a wider scope:
 
 - that the gated job can download the verify job's artifact by id with only
   `contents: read` (same-run downloads use the run's own token, not `actions: read`);
@@ -303,16 +397,27 @@ A zero exit from `npm publish` and a confirmed registry readback are **different
 and the summary keeps them apart, because the recovery instruction depends entirely on
 which one you have. Read the summary in these three categories:
 
-| Summary line                 | What it means                                             | What to do                                                     |
-| ---------------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
-| `published and verified`     | uploaded, and the registry serves what was reviewed       | done; never name it again in any dispatch                      |
-| `published but NOT verified` | uploaded and public, but readback could not confirm it    | investigate the registry state; never name it again either     |
-| `outcome unknown`            | upload attempted, and the registry could not be consulted | establish whether it is public **before** dispatching anything |
+| Summary line             | What it means                                                     | What to do                                                     |
+| ------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------- |
+| `published and verified` | uploaded, and the registry serves what was reviewed               | done; never name it again in any dispatch                      |
+| `accepted_pending`       | npm accepted the bytes; this run could not confirm what is served | never republish; reconcile it by hand (see below)              |
+| `outcome unknown`        | upload attempted, and the registry could not be consulted         | establish whether it is public **before** dispatching anything |
+
+`accepted_pending` is the line to read most carefully, because it is the one a
+hurried reader turns into a second dispatch. It means the registry has the
+bytes. The version is immutable whether or not it is visible yet, so the
+failure code tells you what to do next: `visibility_not_confirmed` (the bounded
+wait expired — check the npm account's notifications for a manual-review or
+blocked-package notice), `readback_unavailable` (the registry would not answer —
+find out why before anything else), or `readback_mismatch` (the registry served
+something other than the reviewed artifact — treat that as a supply-chain
+incident, not a retry).
 
 - Nothing is unpublished or overwritten. Do not attempt to "fix" a published version.
 - Recovery is a **new** dispatch whose scope names only the packages that are confirmed
   still unpublished, at the same versions, reviewed and approved again.
-- A version in either of the lower two rows is, or may be, public and immutable. Naming
+- A version in either of the two rows below `published and verified` is, or may be,
+  public and immutable. Naming
   it in a recovery dispatch cannot succeed — preflight will refuse it once the registry
   lists it, which is the intended behaviour, and is why the summary never folds an
   attempted upload into "nothing was published".

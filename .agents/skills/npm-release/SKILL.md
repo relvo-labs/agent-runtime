@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.5.0
+version: 1.6.0
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -26,7 +26,9 @@ Do not use this skill when:
 - you are changing what a package ships — use `package-artifact-validation`
 - you are changing the canonical gate or the validation workflow — use `local-ci-parity`
 - you want to publish _now_: publication is a human decision with an environment approval,
-  not something an agent may initiate. Nothing in this repository has been published yet.
+  not something an agent may initiate. Exactly one version is public —
+  `@relvo-labs/agent-protocol@0.2.0` — and it is immutable: it is never republished and
+  never named in a dispatch again.
 
 ## Owns
 
@@ -167,34 +169,83 @@ Do not use this skill when:
    is followed by a registry readback of identity, integrity, dependency ranges and
    dist-tag before the next package is attempted.
 
-8. **Partial failure stays partial, and acceptance is not verification.** On any failure
+8. **A zero exit is `accepted_pending`, immediately, and the upload never happens twice.**
+   npm scans a newly published package before serving it: usually about five minutes,
+   documented as possibly fifteen or more. Run 34753860073 attempt 3 read the registry
+   five times separated by 3000 ms — four sleeps, about twelve seconds — and failed a
+   publication that had already succeeded; `@relvo-labs/agent-protocol@0.2.0` first
+   answered 200 publicly 466 s later, byte-identical to the reviewed artifact. So the
+   moment `npm publish` exits zero the version is recorded as `accepted_pending` and is
+   **never** described as unpublished, and `publishRelease` refuses to hand the same
+   subject to `npm publish` a second time in a run.
+
+   What follows is **read-only reconciliation** (`tools/release/lib/visibility.ts`): exact
+   registry lookups on a deterministic backoff — 5 s doubling to a 30 s cap, the last
+   delay clipped to the bound — for a budget of 20 minutes per package, deliberately
+   longer than the 15 minutes npm documents, because a bound equal to the documented worst
+   case fails on exactly the runs it exists to survive. Only the two expected
+   post-acceptance answers are retried: the package absent (404), or a well-formed
+   packument that does not yet list the exact version. A network failure, 5xx, timeout,
+   rate limit, auth failure or malformed packument ends it at once (`readback_unavailable`)
+   — an unanswerable registry is not a registry that is still scanning, and spending the
+   delay budget on a 401 turns a credential problem into a job timeout. An identity,
+   integrity, shasum, dependency, peer-dependency or dist-tag mismatch ends it at once too
+   (`readback_mismatch`): the registry answered, and more reads cannot change the answer.
+   `classifyReadback` is fail-closed — an unrecognised finding code is a stop, not a wait.
+
+   The bound is a bound. When it expires the run stops non-zero as
+   `visibility_not_confirmed`, before any dependent is attempted, and reconciliation
+   becomes a human step: check the npm account's notifications for a manual-review or
+   blocked-package notice and use the appeal path offered. Never republish.
+
+   `.github/workflows/release.yml`'s `publish` job timeout is derived from the same
+   constants — 8 × (20 m budget + 2 m upload and pre-upload rechecks) + 14 m setup,
+   download and staged verification = **190 minutes** — and `workflow-policy.ts` asserts
+   that exact number. A timeout below the wait the publisher is willing to make is the
+   same defect as a readback window below the scan delay, with the runner rather than the
+   program abandoning an accepted upload.
+
+9. **Partial failure stays partial, and acceptance is not verification.** On any failure
    the run stops non-zero. A zero exit from `npm publish` means the registry accepted the
    bytes; a readback means it serves what was reviewed. The report keeps those apart —
-   `published`, `acceptedUnverified`, and `unknown` for an upload it could not
+   `published`, `acceptedPending`, and `unknown` for an upload it could not
    adjudicate — because reporting an accepted-but-unconfirmed upload as "not published"
    invites a recovery dispatch naming a version that is already public and immutable.
    Nothing is unpublished, no version is overwritten, and recovery is a _new_
    human-reviewed dispatch whose scope names only what is _confirmed_ still unpublished.
+   Anything logged about an upload is a bounded line of plan facts written through the
+   redacting sink in `publish.ts`; never command output, npmrc contents or the environment.
 
-9. **Changing this path is a reviewed change.** `pnpm release:check` describes the
-   reviewed workflow as an exact structure: allowed job and step keys, exact job `env`
-   and `outputs` bindings, exact action inputs, the exact command sequence per job, and
-   an allow-list of every `${{ … }}` expression that may appear anywhere in the file. It
-   is exhaustive on purpose — a field the policy does not assert is a field an attacker
-   chooses, and `continue-on-error`, a `shell:` override, an extra `run:`, a constant in
-   place of a dispatch input and `secrets['NPM_TOKEN']` were each demonstrated to pass a
-   policy that only checked a list of properties. Editing the workflow therefore means
-   editing `EXPECTED_JOBS` in `workflow-policy.ts` too; that is the review step. Add a
-   new action to `ALLOWED_ACTIONS` only with an independently verified commit SHA, and
-   never pass an action input the pinned revision does not declare.
+10. **Changing this path is a reviewed change.** `pnpm release:check` describes the
+    reviewed workflow as an exact structure: allowed job and step keys, exact job `env`
+    and `outputs` bindings, exact action inputs, the exact command sequence per job, and
+    an allow-list of every `${{ … }}` expression that may appear anywhere in the file. It
+    is exhaustive on purpose — a field the policy does not assert is a field an attacker
+    chooses, and `continue-on-error`, a `shell:` override, an extra `run:`, a constant in
+    place of a dispatch input and `secrets['NPM_TOKEN']` were each demonstrated to pass a
+    policy that only checked a list of properties. Editing the workflow therefore means
+    editing `EXPECTED_JOBS` in `workflow-policy.ts` too; that is the review step. Add a
+    new action to `ALLOWED_ACTIONS` only with an independently verified commit SHA, and
+    never pass an action input the pinned revision does not declare. Job timeouts are part
+    of that structure: `EXPECTED_JOB_TIMEOUT_MINUTES` asserts each one exactly, and the
+    gated job's value is computed from the visibility constants rather than typed, so the
+    workflow and the publisher cannot drift apart.
 
 ## Verification
 
 ```bash
-pnpm release:check                 # structural policy for the release workflow
-pnpm exec vitest run tools/release # tool identity, preflight, ordering, registry, readback
+pnpm release:check                 # structural policy for the release workflow, job timeouts included
+pnpm exec vitest run tools/release # tool identity, preflight, ordering, registry, readback, visibility
 pnpm gate                          # both of the above, plus everything else CI runs
 ```
+
+Visibility reconciliation is tested through `publishRelease` itself — the function
+`tools/release/publish.ts` calls — with the upload and registry transports replaced and a
+virtual clock, so a beyond-15-minute delay and a bounded expiry are both asserted in
+milliseconds of real time and no npm process exists. Keep it that way: a test that only
+exercises a polling helper proves nothing about the orchestrator that waits, and the
+property worth protecting is "exactly one upload, however long the wait". Never add a test
+that can reach a real registry, and never assert visibility by publishing something.
 
 A local `pnpm gate` passing proves less about the release path than it looks like it does
 if your Node came from nvm or a system package: that layout has a bundled npm, and the
@@ -229,9 +280,13 @@ publication through an empty release plan.
 ## Provenance
 
 - Source: independent — authored for this repository against the npm CLI documentation
-  (`publish`, `dist-tag`, `--provenance`, `--userconfig`), the npm registry packument
-  format, and the GitHub Actions documentation for `workflow_dispatch` inputs,
-  environments, job outputs and artifact digests.
+  (`publish`, `dist-tag`, `--provenance`, `--userconfig`), npm's documented publish-time
+  malware-scanning availability delay (usually about five minutes, possibly fifteen or
+  more), the npm registry packument format, and the GitHub Actions documentation for
+  `workflow_dispatch` inputs, environments, job outputs and artifact digests.
+- Observed-evidence: run 34753860073 attempt 3 of this repository — accepted upload,
+  466 s to public visibility, matching integrity — is the case the visibility budget and
+  the derived job timeout are sized against.
 - Reviewed-not-copied: `actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`
   — its `action.yml` contract and `src/download-artifact.ts` were read to establish that
   the pinned revision declares no `digest` input and derives the expected hash from

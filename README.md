@@ -49,7 +49,9 @@ Install the exact pnpm version declared by `packageManager` before running these
 Corepack is not required. Node `^22.18.0`, `^24.11.0`, and `^26.0.0` are supported and
 exercised in CI. Node 20 and Node 27+ are not supported.
 
-No package has been published yet. Publication is manual, explicitly scoped and approved
+One version is public — `@relvo-labs/agent-protocol@0.2.0`, which is immutable and is
+never republished; the rest of the 0.2.0 scope was not attempted and needs fresh human
+authority. Publication is manual, explicitly scoped and approved
 per run through [`.github/workflows/release.yml`](.github/workflows/release.yml); see the
 [release runbook](docs/release.md) for what it proves before anything reaches the registry
 and which human approvals are still outstanding.

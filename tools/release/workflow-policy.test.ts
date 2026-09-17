@@ -1,7 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { evaluateReleaseWorkflowPolicy } from './lib/workflow-policy.ts';
+import {
+  NPM_DOCUMENTED_SCAN_DELAY_MINUTES,
+  PUBLISH_JOB_TIMEOUT_MINUTES,
+  VERIFY_JOB_TIMEOUT_MINUTES,
+} from './lib/visibility.ts';
+import { EXPECTED_JOB_TIMEOUT_MINUTES, evaluateReleaseWorkflowPolicy } from './lib/workflow-policy.ts';
 import { asMapping, asSequence, asString, parseYamlSubset } from './lib/yaml.ts';
 
 const repoRoot = resolve(import.meta.dirname, '../..');
@@ -329,6 +334,37 @@ describe('reproduced policy bypasses', () => {
       ),
       /must not pass a `digest` input/u,
     );
+  });
+
+  /**
+   * The gated job waits for npm to make each accepted version publicly
+   * visible. A timeout below that budget kills the job mid-wait and leaves an
+   * accepted, immutable upload that nothing adjudicated — issue #30's failure
+   * with the runner, rather than the readback window, cutting the wait short.
+   * So the number is derived from `visibility.ts` and asserted exactly.
+   */
+  it('rejects a gated job whose timeout is not the derived visibility budget', () => {
+    expectRejected(
+      mutate(
+        `    timeout-minutes: ${String(PUBLISH_JOB_TIMEOUT_MINUTES)}`,
+        `    timeout-minutes: ${String(NPM_DOCUMENTED_SCAN_DELAY_MINUTES)}`,
+      ),
+      /job `publish` must set timeout-minutes/u,
+    );
+    expectRejected(
+      mutate(
+        `    timeout-minutes: ${String(PUBLISH_JOB_TIMEOUT_MINUTES)}`,
+        `    timeout-minutes: ${String(PUBLISH_JOB_TIMEOUT_MINUTES + 1)}`,
+      ),
+      /visibility budget/u,
+    );
+    expectRejected(
+      mutate(`    timeout-minutes: ${String(VERIFY_JOB_TIMEOUT_MINUTES)}`, '    timeout-minutes: 44'),
+      /job `verify` must set timeout-minutes: 45/u,
+    );
+    // The reviewed file agrees with the constants the publisher waits by.
+    expect(EXPECTED_JOB_TIMEOUT_MINUTES.publish).toBe(PUBLISH_JOB_TIMEOUT_MINUTES);
+    expect(releaseWorkflow).toContain(`    timeout-minutes: ${String(PUBLISH_JOB_TIMEOUT_MINUTES)}\n`);
   });
 
   it('rejects a per-step timeout or working directory that the review never saw', () => {
