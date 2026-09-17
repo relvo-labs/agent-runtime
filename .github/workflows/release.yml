@@ -95,11 +95,18 @@ jobs:
           overwrite: false
           include-hidden-files: false
 
+  # timeout-minutes is derived, not chosen: 8 package(s) x (20m visibility
+  # budget + 2m upload and pre-upload rechecks) + 14m setup, download and
+  # staged-artifact verification. npm scans a newly published package before
+  # serving it — usually about five minutes, documented as possibly fifteen or
+  # more — so the job must outlast the bounded read-only reconciliation the
+  # publisher performs. See tools/release/lib/visibility.ts, which the policy
+  # check derives this exact number from.
   publish:
     name: publish
     needs: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 190
     environment: npm-release
     permissions:
       contents: read

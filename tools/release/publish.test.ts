@@ -9,8 +9,9 @@ import {
   type PublishPorts,
 } from './lib/publish.ts';
 import type { PlanEntry, ReleasePlan } from './lib/preflight.ts';
-import type { RegistryLookup } from './lib/registry.ts';
+import { parsePackument, type RegistryLookup } from './lib/registry.ts';
 import { inspectTarball, tarballFileName } from './lib/tarball.ts';
+import { NPM_DOCUMENTED_SCAN_DELAY_MINUTES, VISIBILITY_BUDGET_MS, type VisibilityPolicy } from './lib/visibility.ts';
 import { buildPackageTarball, fakeRegistry, published, type RegistryScript } from './testing/fixtures.ts';
 
 const PROTOCOL = '@relvo-labs/agent-protocol';
@@ -77,6 +78,8 @@ type Harness = {
   readonly logs: string[];
   readonly sleeps: number[];
   readonly revalidations: number[];
+  /** Virtual wall clock, advanced only by `sleep`. No test ever really waits. */
+  readonly clock: { ms: number };
 };
 
 function harness(
@@ -88,12 +91,14 @@ function harness(
   const logs: string[] = [];
   const sleeps: number[] = [];
   const revalidations: number[] = [];
+  const clock = { ms: 0 };
   const registry = fakeRegistry(script);
   return {
     commands,
     logs,
     sleeps,
     revalidations,
+    clock,
     ports: {
       npm: (argv) => {
         commands.push([...argv]);
@@ -103,8 +108,10 @@ function harness(
       log: (line) => logs.push(line),
       sleep: (ms) => {
         sleeps.push(ms);
+        clock.ms += ms;
         return Promise.resolve();
       },
+      now: () => clock.ms,
       revalidateSource: () => {
         revalidations.push(revalidations.length + 1);
         return revalidate?.(revalidations.length) ?? [];
@@ -114,6 +121,9 @@ function harness(
 }
 
 const options = { tarballPath: (target: PlanEntry) => `/staging/tarballs/${target.tarball}`, userconfig: '/tmp/npmrc' };
+
+/** A budget small enough to expire inside a test, with the same shape as the real one. */
+const briefBudget: VisibilityPolicy = { budgetMs: 10, initialDelayMs: 1, maxDelayMs: 4, factor: 2 };
 
 describe('publish argv', () => {
   it('publishes one explicit tarball with provenance, an explicit tag and no lifecycle scripts', () => {
@@ -148,7 +158,7 @@ describe('ordered publication', () => {
 
     expect(report.ok).toBe(true);
     expect(report.published).toEqual([`${PROTOCOL}@0.2.0`, `${RUNTIME}@0.2.0`]);
-    expect(report.acceptedUnverified).toEqual([]);
+    expect(report.acceptedPending).toEqual([]);
     expect(report.unknown).toEqual([]);
     expect(commands.map((argv) => argv[1])).toEqual([
       `/staging/tarballs/${tarballFileName(PROTOCOL, '0.2.0')}`,
@@ -177,15 +187,15 @@ describe('ordered publication', () => {
     expect(sleeps.length).toBeGreaterThan(0);
   });
 
-  it('reports an upload the registry never confirms as public but unverified, never as unpublished', async () => {
+  it('reports an upload the registry never confirms as accepted_pending, never as unpublished', async () => {
     const neverLands: RegistryScript = { ...successfulReadback, [PROTOCOL]: { kind: 'absent' } };
     const { ports, commands } = harness(neverLands);
-    const report = await publishRelease(plan, ports, { ...options, readbackAttempts: 2, readbackDelayMs: 1 });
+    const report = await publishRelease(plan, ports, { ...options, visibility: briefBudget });
 
     expect(report.ok).toBe(false);
-    expect(report.failure?.code).toBe('readback_mismatch');
+    expect(report.failure?.code).toBe('visibility_not_confirmed');
     expect(report.published).toEqual([]);
-    expect(report.acceptedUnverified).toEqual([`${PROTOCOL}@0.2.0`]);
+    expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
     expect(report.notAttempted).toEqual([`${RUNTIME}@0.2.0`]);
     expect(commands).toHaveLength(1); // the dependent was never attempted
   });
@@ -209,12 +219,12 @@ describe('ordered publication', () => {
 
     for (const mismatch of [wrongBytes, wrongDependencies, wrongTag]) {
       const { ports } = harness({ ...successfulReadback, [PROTOCOL]: [{ kind: 'absent' }, mismatch] });
-      const report = await publishRelease(plan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+      const report = await publishRelease(plan, ports, { ...options, visibility: briefBudget });
       expect(report.ok).toBe(false);
       expect(report.failure?.code).toBe('readback_mismatch');
       // The upload itself succeeded. Calling it unpublished would invite a
       // recovery dispatch naming a version that can never be overwritten.
-      expect(report.acceptedUnverified).toEqual([`${PROTOCOL}@0.2.0`]);
+      expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
       expect(report.published).toEqual([]);
     }
   });
@@ -431,6 +441,7 @@ describe('in-scope dependencies are re-established, not remembered', () => {
         },
         log: () => undefined,
         sleep: () => Promise.resolve(),
+        now: () => 0,
         revalidateSource: () => [],
       },
     };
@@ -440,7 +451,7 @@ describe('in-scope dependencies are re-established, not remembered', () => {
     const { plan: threePlan, bytes } = threePackagePlan();
     // agent-protocol disappears while agent-provider is being published.
     const { ports, commands, lookups } = mutableRegistry(bytes, PROVIDER);
-    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+    const report = await publishRelease(threePlan, ports, { ...options, visibility: briefBudget });
 
     expect(report.ok).toBe(false);
     expect(report.failure).toMatchObject({ name: RUNTIME, code: 'dependency_unpublished' });
@@ -456,7 +467,7 @@ describe('in-scope dependencies are re-established, not remembered', () => {
   it('still publishes all three when the dependency stays where this run put it', async () => {
     const { plan: threePlan, bytes } = threePackagePlan();
     const { ports, commands } = mutableRegistry(bytes, undefined);
-    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+    const report = await publishRelease(threePlan, ports, { ...options, visibility: briefBudget });
 
     expect(report.ok).toBe(true);
     expect(commands).toEqual([PROTOCOL, PROVIDER, RUNTIME]);
@@ -493,9 +504,10 @@ describe('in-scope dependencies are re-established, not remembered', () => {
       },
       log: () => undefined,
       sleep: () => Promise.resolve(),
+      now: () => 0,
       revalidateSource: () => [],
     };
-    const report = await publishRelease(threePlan, ports, { ...options, readbackAttempts: 1, readbackDelayMs: 1 });
+    const report = await publishRelease(threePlan, ports, { ...options, visibility: briefBudget });
 
     expect(report.failure).toMatchObject({ name: RUNTIME, code: 'registry_unavailable' });
     expect(commands).toEqual([PROTOCOL, PROVIDER]);
@@ -526,11 +538,11 @@ describe('upload accounting', () => {
     const report = await publishRelease(plan, ports, options);
 
     expect(report.failure?.code).toBe('publish_failed_version_public');
-    expect(report.acceptedUnverified).toEqual([`${PROTOCOL}@0.2.0`]);
+    expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
     expect(report.published).toEqual([]);
     const summary = summarizeReport(report);
-    expect(summary).toContain('published but NOT verified');
-    expect(summary).toContain('never be named in a recovery dispatch');
+    expect(summary).toContain('accepted_pending — npm accepted, visibility NOT confirmed');
+    expect(summary).toContain('never named in a recovery dispatch');
   });
 
   it('classifies an upload it cannot adjudicate as unknown rather than as failed', async () => {
@@ -558,7 +570,7 @@ describe('upload accounting', () => {
 
     expect(report.failure?.code).toBe('publish_failed');
     expect(report.published).toEqual([]);
-    expect(report.acceptedUnverified).toEqual([]);
+    expect(report.acceptedPending).toEqual([]);
     expect(report.unknown).toEqual([]);
     expect(report.outcomes).toEqual([
       { name: PROTOCOL, version: '0.2.0', upload: 'rejected', verified: false, detail: expect.any(String) },
@@ -570,7 +582,7 @@ describe('upload accounting', () => {
       summarizeReport({
         ok: true,
         published: [`${PROTOCOL}@0.2.0`],
-        acceptedUnverified: [],
+        acceptedPending: [],
         unknown: [],
         outcomes: [],
         failure: undefined,
@@ -610,6 +622,207 @@ describe('source currency at the moment of upload', () => {
     expect(report.published).toEqual([`${PROTOCOL}@0.2.0`]);
     expect(commands).toHaveLength(1);
     expect(report.notAttempted).toEqual([]);
+  });
+});
+
+/**
+ * Regression for issue #30, reproduced through the production orchestrator.
+ *
+ * Run 34753860073 attempt 3: npm accepted `@relvo-labs/agent-protocol@0.2.0`,
+ * the job read the registry five times separated by 3000 ms — about twelve
+ * seconds — and failed. The version first answered 200 publicly 466 seconds
+ * after the registry's own internal version timestamp, with integrity matching
+ * the reviewed artifact exactly. npm documents this: a newly published package
+ * is scanned before it is available, usually for about five minutes and
+ * possibly for fifteen or more.
+ *
+ * These tests run `publishRelease` itself — the function `tools/release/
+ * publish.ts` calls — with the upload and registry transports replaced, so no
+ * npm process exists and nothing can be published. The clock is virtual: the
+ * suite asserts elapsed release time without spending any.
+ */
+describe('post-acceptance visibility reconciliation', () => {
+  const ABSENT: RegistryLookup = { kind: 'absent' };
+  const protocolVisible = published(
+    PROTOCOL,
+    { '0.2.0': { dependencies: { zod: '4.5.4' }, tarball: protocolBytes } },
+    { latest: '0.2.0' },
+  );
+  const runtimeVisible = published(
+    RUNTIME,
+    { '0.2.0': { dependencies: { [PROTOCOL]: '^0.2.0' }, tarball: runtimeBytes } },
+    { latest: '0.2.0' },
+  );
+  /** The other expected not-yet-visible answer: the package exists, the version does not. */
+  const versionMissing = published(PROTOCOL, { '0.1.0': {} }, { latest: '0.1.0' });
+  /** A registry answer this tooling cannot account for: no `dist-tags` at all. */
+  const malformed = parsePackument(PROTOCOL, {
+    name: PROTOCOL,
+    versions: { '0.2.0': { name: PROTOCOL, version: '0.2.0', dist: {} } },
+  });
+  const wrongIntegrity = published(
+    PROTOCOL,
+    { '0.2.0': { dependencies: { zod: '4.5.4' }, tarball: runtimeBytes } },
+    { latest: '0.2.0' },
+  );
+
+  type Scripted = {
+    /** What the registry answers about the accepted version until it is visible. */
+    readonly pending: RegistryLookup;
+    /** Virtual milliseconds after which the registry serves it, or never. */
+    readonly visibleAfterMs?: number;
+    /** What it serves then; the reviewed packument unless stated otherwise. */
+    readonly settled?: RegistryLookup;
+  };
+
+  function scriptedRun(script: Scripted): {
+    readonly ports: PublishPorts;
+    readonly commands: string[][];
+    readonly logs: string[];
+    readonly sleeps: number[];
+    readonly clock: { ms: number };
+    readonly uploadsOf: (name: string) => number;
+  } {
+    const clock = { ms: 0 };
+    const commands: string[][] = [];
+    const logs: string[] = [];
+    const sleeps: number[] = [];
+    const uploaded = new Set<string>();
+    const nameOf = (argv: readonly string[]): string => (argv[1]?.includes('protocol') === true ? PROTOCOL : RUNTIME);
+    return {
+      commands,
+      logs,
+      sleeps,
+      clock,
+      uploadsOf: (name) => commands.filter((argv) => nameOf(argv) === name).length,
+      ports: {
+        npm: (argv) => {
+          commands.push([...argv]);
+          uploaded.add(nameOf(argv));
+          return Promise.resolve({ code: 0, stdout: '+ accepted', stderr: '' });
+        },
+        registry: {
+          lookup: (name) => {
+            if (name === 'zod') return Promise.resolve(zodPublished);
+            if (name === RUNTIME) return Promise.resolve(uploaded.has(RUNTIME) ? runtimeVisible : ABSENT);
+            if (!uploaded.has(PROTOCOL)) return Promise.resolve(ABSENT);
+            if (script.visibleAfterMs !== undefined && clock.ms >= script.visibleAfterMs) {
+              return Promise.resolve(script.settled ?? protocolVisible);
+            }
+            return Promise.resolve(script.pending);
+          },
+        },
+        log: (line) => logs.push(line),
+        sleep: (ms) => {
+          sleeps.push(ms);
+          clock.ms += ms;
+          return Promise.resolve();
+        },
+        now: () => clock.ms,
+        revalidateSource: () => [],
+      },
+    };
+  }
+
+  it('waits out a 404 that clears well beyond npm’s documented fifteen minutes, uploading exactly once', async () => {
+    // Sixteen minutes: past the documented worst case, inside the budget.
+    const visibleAfterMs = 16 * 60_000;
+    expect(visibleAfterMs).toBeGreaterThan(NPM_DOCUMENTED_SCAN_DELAY_MINUTES * 60_000);
+    const run = scriptedRun({ pending: ABSENT, visibleAfterMs });
+    const report = await publishRelease(plan, run.ports, options);
+
+    expect(report.ok).toBe(true);
+    expect(report.published).toEqual([`${PROTOCOL}@0.2.0`, `${RUNTIME}@0.2.0`]);
+    expect(report.acceptedPending).toEqual([]);
+    // The whole point: the bytes were handed to npm once, and the delay was
+    // absorbed by reads, not by a second upload.
+    expect(run.uploadsOf(PROTOCOL)).toBe(1);
+    expect(run.uploadsOf(RUNTIME)).toBe(1);
+    expect(run.clock.ms).toBeGreaterThanOrEqual(visibleAfterMs);
+    expect(run.clock.ms).toBeLessThanOrEqual(VISIBILITY_BUDGET_MS);
+    // The acceptance receipt is written the moment npm exits zero, before any
+    // reconciliation, and never calls the version unpublished.
+    const receipt = run.logs.find((line) => line.includes('accepted_pending'));
+    expect(receipt).toContain(`${PROTOCOL}@0.2.0`);
+    expect(receipt).toContain('never uploaded again');
+    expect(run.logs.join('\n')).not.toMatch(/unpublished|not published/u);
+  });
+
+  it('waits out a packument that does not yet list the exact version', async () => {
+    const visibleAfterMs = 17 * 60_000;
+    const run = scriptedRun({ pending: versionMissing, visibleAfterMs });
+    const report = await publishRelease(plan, run.ports, options);
+
+    expect(report.ok).toBe(true);
+    expect(report.published).toContain(`${PROTOCOL}@0.2.0`);
+    expect(run.uploadsOf(PROTOCOL)).toBe(1);
+    expect(run.clock.ms).toBeGreaterThanOrEqual(visibleAfterMs);
+  });
+
+  it('expires the budget exactly, keeps the version accepted_pending and stops before the dependent', async () => {
+    const run = scriptedRun({ pending: ABSENT });
+    const report = await publishRelease(plan, run.ports, options);
+
+    expect(report.ok).toBe(false);
+    expect(report.failure?.code).toBe('visibility_not_confirmed');
+    expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
+    expect(report.published).toEqual([]);
+    expect(report.outcomes).toEqual([
+      { name: PROTOCOL, version: '0.2.0', upload: 'accepted_pending', verified: false, detail: expect.any(String) },
+    ]);
+    // Bounded: the wait is the stated budget, not "until the job is killed".
+    expect(run.clock.ms).toBe(VISIBILITY_BUDGET_MS);
+    expect(run.uploadsOf(PROTOCOL)).toBe(1);
+    expect(run.uploadsOf(RUNTIME)).toBe(0);
+    expect(report.notAttempted).toEqual([`${RUNTIME}@0.2.0`]);
+
+    expect(report.failure?.message).toContain('must never be republished');
+    expect(report.failure?.message).toContain('manual-review or blocked-package');
+    const summary = summarizeReport(report);
+    expect(summary).toContain(`accepted_pending — npm accepted, visibility NOT confirmed: ${PROTOCOL}@0.2.0`);
+    expect(summary).toContain('never be republished');
+  });
+
+  /**
+   * The budget belongs to the delay it was sized for. An unanswerable registry
+   * is a different fact from a package that is still being scanned, and
+   * spending twenty minutes re-asking a 401 would turn a credential problem
+   * into a job timeout with an unadjudicated upload behind it.
+   */
+  it('fails closed at once on a network, auth or malformed answer without spending the budget', async () => {
+    const unanswerable: readonly RegistryLookup[] = [
+      { kind: 'error', detail: 'ETIMEDOUT' },
+      { kind: 'error', detail: 'registry returned 503' },
+      { kind: 'unauthorized', detail: 'registry returned 401; credentials or access changed' },
+      malformed,
+    ];
+    expect(malformed.kind).toBe('error');
+
+    for (const answer of unanswerable) {
+      const run = scriptedRun({ pending: answer });
+      const report = await publishRelease(plan, run.ports, options);
+
+      expect(report.ok).toBe(false);
+      expect(report.failure?.code).toBe('readback_unavailable');
+      expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
+      expect(report.failure?.message).toContain('never republish it');
+      expect(run.sleeps).toEqual([]);
+      expect(run.clock.ms).toBe(0);
+      expect(run.uploadsOf(PROTOCOL)).toBe(1);
+    }
+  });
+
+  it('fails closed at once when the registry serves different bytes than were reviewed', async () => {
+    const run = scriptedRun({ pending: wrongIntegrity });
+    const report = await publishRelease(plan, run.ports, options);
+
+    expect(report.ok).toBe(false);
+    expect(report.failure?.code).toBe('readback_mismatch');
+    expect(report.failure?.message).toMatch(/integrity|shasum/u);
+    expect(report.acceptedPending).toEqual([`${PROTOCOL}@0.2.0`]);
+    // An answered mismatch is never retried: more reads cannot make it match.
+    expect(run.sleeps).toEqual([]);
+    expect(run.uploadsOf(PROTOCOL)).toBe(1);
   });
 });
 

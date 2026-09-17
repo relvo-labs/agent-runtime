@@ -38,6 +38,14 @@
  */
 
 import {
+  PER_PACKAGE_UPLOAD_MINUTES,
+  PUBLISH_JOB_SETUP_MINUTES,
+  PUBLISH_JOB_TIMEOUT_MINUTES,
+  RELEASE_SCOPE_PACKAGES,
+  VERIFY_JOB_TIMEOUT_MINUTES,
+  VISIBILITY_BUDGET_MINUTES,
+} from './visibility.ts';
+import {
   asMapping,
   asSequence,
   asString,
@@ -258,6 +266,30 @@ const EXPECTED_JOBS: Readonly<Record<string, ExpectedJob>> = {
       { run: PUBLISH_COMMAND, env: { NPM_TOKEN: SECRET_REFERENCE } },
     ],
   },
+};
+
+/**
+ * Job timeouts are reviewed values, not free numbers.
+ *
+ * The gated job waits for npm to make each accepted version publicly visible,
+ * which npm documents as usually about five minutes and possibly fifteen or
+ * more. A timeout below that budget is the same defect as a readback window
+ * below it — the only difference is that the runner, rather than the program,
+ * abandons an accepted upload no one has adjudicated. So the reviewed value is
+ * derived from the same constants the publisher waits by, and this policy
+ * asserts the exact number rather than "some number".
+ */
+export const EXPECTED_JOB_TIMEOUT_MINUTES: Readonly<Record<string, number>> = {
+  verify: VERIFY_JOB_TIMEOUT_MINUTES,
+  publish: PUBLISH_JOB_TIMEOUT_MINUTES,
+};
+
+const TIMEOUT_RATIONALE: Readonly<Record<string, string>> = {
+  verify: 'the credential-free job runs the gate, packs and plans; it waits on no registry',
+  publish:
+    `${String(RELEASE_SCOPE_PACKAGES)} package(s) × (${String(VISIBILITY_BUDGET_MINUTES)}m visibility budget + ` +
+    `${String(PER_PACKAGE_UPLOAD_MINUTES)}m upload and pre-upload rechecks) + ${String(PUBLISH_JOB_SETUP_MINUTES)}m ` +
+    'setup, download and staged-artifact verification',
 };
 
 type Step = { readonly index: number; readonly job: string; readonly mapping: YamlMapping };
@@ -671,7 +703,16 @@ function checkJobEnvelope(jobs: YamlMapping, name: string, problems: string[]): 
     problems.push(`job \`${name}\` carries unreviewed key \`${key}\``);
   }
   if (asString(job['runs-on']) !== 'ubuntu-latest') problems.push(`job \`${name}\` must run on ubuntu-latest`);
-  if (typeof job['timeout-minutes'] !== 'number') problems.push(`job \`${name}\` must set timeout-minutes`);
+  const timeout = job['timeout-minutes'];
+  const expectedTimeout = EXPECTED_JOB_TIMEOUT_MINUTES[name];
+  if (typeof timeout !== 'number') {
+    problems.push(`job \`${name}\` must set timeout-minutes`);
+  } else if (expectedTimeout !== undefined && timeout !== expectedTimeout) {
+    problems.push(
+      `job \`${name}\` must set timeout-minutes: ${String(expectedTimeout)}, found ${String(timeout)} — ` +
+        (TIMEOUT_RATIONALE[name] ?? 'the reviewed bound'),
+    );
+  }
   return job;
 }
 

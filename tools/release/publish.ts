@@ -9,6 +9,13 @@
  * token before it is printed, and any failure stops the run non-zero with an
  * exact account of what is already public.
  *
+ * Each upload is followed by a read-only visibility reconciliation, because npm
+ * scans a newly published package before serving it. That wait is bounded by
+ * `visibility.ts`, and the `publish` job's `timeout-minutes` in
+ * `.github/workflows/release.yml` is derived from the same constants, so the
+ * job can never be killed in the middle of a wait this program is still willing
+ * to make.
+ *
  * Usage:
  *   node tools/release/publish.ts --staging <directory>
  */
@@ -162,6 +169,7 @@ try {
       registry: createHttpsRegistry(staging.plan.registry),
       log: write,
       sleep: (ms: number) => new Promise<void>((done) => setTimeout(done, ms)),
+      now: () => Date.now(),
       revalidateSource: readSourceCurrency,
     },
     { tarballPath: staging.tarballPath, userconfig },

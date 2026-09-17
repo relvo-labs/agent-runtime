@@ -7,6 +7,10 @@
  * were uploaded: identity, integrity, the dependency ranges consumers will
  * resolve, and the dist-tag the operator asked for. Anything it cannot
  * confirm is a failure — never a warning, and never repaired by republishing.
+ *
+ * A single readback is one observation. `classifyReadback` says which kind of
+ * observation it was, which is what decides whether repeating it could ever
+ * change the answer: see `visibility.ts`.
  */
 
 import type { Finding } from './plan.ts';
@@ -44,6 +48,34 @@ function compareRanges(
       });
     }
   }
+}
+
+/**
+ * The only two findings a *successful* publication may still produce while npm
+ * finishes scanning it: the package is not listed at all, or the packument is
+ * well-formed and does not yet carry the exact version.
+ */
+export const PENDING_VISIBILITY_CODES: readonly string[] = ['readback_absent', 'readback_version_missing'];
+
+/** A registry that would not answer at all. Never a "not yet" answer. */
+export const READBACK_UNAVAILABLE_CODE = 'readback_unavailable';
+
+export type ReadbackVerdict = 'verified' | 'not_yet_visible' | 'unavailable' | 'mismatch';
+
+/**
+ * Classify one readback.
+ *
+ * Fail-closed by construction: `mismatch` is the default, so a finding code
+ * added later is treated as a reason to stop rather than as a reason to wait.
+ * The order matters — an unanswerable registry is checked before anything else,
+ * because an auth failure or a malformed document must never be spent as if it
+ * were the 404 of a package that is still being scanned.
+ */
+export function classifyReadback(findings: readonly Finding[]): ReadbackVerdict {
+  if (findings.length === 0) return 'verified';
+  if (findings.some((finding) => finding.code === READBACK_UNAVAILABLE_CODE)) return 'unavailable';
+  if (findings.every((finding) => PENDING_VISIBILITY_CODES.includes(finding.code))) return 'not_yet_visible';
+  return 'mismatch';
 }
 
 export function verifyReadback(entry: PlanEntry, distTag: string, lookup: RegistryLookup): readonly Finding[] {
