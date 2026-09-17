@@ -9,8 +9,9 @@
  *   - exactly one invocation per package per run. A zero exit makes the version
  *     accepted, immutable and possibly already public, so the upload command is
  *     never repeated — not on a slow registry, not during reconciliation, not
- *     anywhere. The guard is structural, not a convention: see `uploaded` in
- *     `publishRelease`;
+ *     anywhere. There is one upload call site, it is guarded by `uploaded` in
+ *     `publishRelease`, reconciliation is given no way to upload, and the tests
+ *     assert the upload count per subject;
  *   - dependency order, so a dependent is never resolvable before the
  *     dependency it needs;
  *   - a full registry recheck immediately before *each* upload, so nothing that
@@ -70,7 +71,10 @@ export type PublishPorts = {
    */
   readonly log: (line: string) => void;
   readonly sleep: (ms: number) => Promise<void>;
-  /** Clock for the visibility budget. Injected so the bound is testable. */
+  /**
+   * Monotonic clock for the visibility budget, read only as differences.
+   * Production passes `performance.now()`; tests advance it virtually.
+   */
   readonly now: () => number;
   /**
    * Re-reads the facts about *this checkout* that authorised the release, and
@@ -302,9 +306,16 @@ export async function publishRelease(
   /**
    * Subjects whose bytes have already been handed to `npm publish` in this run.
    *
-   * This is the structural half of "never republish". Reconciliation is
-   * read-only by construction, and this makes a second upload impossible even
-   * from a future edit somewhere else in this loop.
+   * Scope, stated exactly, because it is easy to claim more than it does: this
+   * guards *the one* `ports.npm(argv)` call site below, and nothing else. It
+   * cannot stop a future edit that adds a second call site elsewhere — an
+   * upload added inside the reconciliation branches would never consult this
+   * Set. What actually keeps "never republish" true is three things together:
+   * there is exactly one upload call site in this function, `reconcileVisibility`
+   * is handed no way to upload at all, and the tests assert an exact upload
+   * count per subject in every delayed-visibility and expiry scenario. If a
+   * second call site ever becomes necessary, route it through here rather than
+   * trusting that guard by proximity.
    */
   const uploaded = new Set<string>();
 
@@ -390,9 +401,9 @@ export async function publishRelease(
       registry: plan.registry,
       userconfig: options.userconfig,
     });
-    // One upload per subject, per run. Reaching this twice would mean some
-    // other part of this loop grew a retry; refuse rather than re-upload a
-    // version the registry may already hold.
+    // The one upload call site. Reaching it twice for the same subject would
+    // mean this loop grew a retry; refuse rather than re-upload a version the
+    // registry may already hold.
     if (uploaded.has(subject)) {
       return refuse(
         entry,

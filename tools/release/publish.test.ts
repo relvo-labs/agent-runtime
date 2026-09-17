@@ -125,6 +125,29 @@ const options = { tarballPath: (target: PlanEntry) => `/staging/tarballs/${targe
 /** A budget small enough to expire inside a test, with the same shape as the real one. */
 const briefBudget: VisibilityPolicy = { budgetMs: 10, initialDelayMs: 1, maxDelayMs: 4, factor: 2 };
 
+/**
+ * A clock whose only source of time is `sleep`, for harnesses that do not need
+ * to record the individual delays.
+ *
+ * Every harness in this file must advance its clock. A frozen `now` never
+ * exhausts the visibility budget, so a scenario that later started returning
+ * `not_yet_visible` would spin forever instead of failing the test — a hang is
+ * a much worse failure mode than a red assertion.
+ */
+function virtualClock(): {
+  readonly sleep: (ms: number) => Promise<void>;
+  readonly now: () => number;
+} {
+  let ms = 0;
+  return {
+    sleep: (delay) => {
+      ms += delay;
+      return Promise.resolve();
+    },
+    now: () => ms,
+  };
+}
+
 describe('publish argv', () => {
   it('publishes one explicit tarball with provenance, an explicit tag and no lifecycle scripts', () => {
     expect(
@@ -412,6 +435,7 @@ describe('in-scope dependencies are re-established, not remembered', () => {
     const uploaded = new Set<string>();
     const commands: string[] = [];
     const lookups: string[] = [];
+    const timing = virtualClock();
     let removed = false;
     return {
       commands,
@@ -440,8 +464,8 @@ describe('in-scope dependencies are re-established, not remembered', () => {
           return Promise.resolve({ code: 0, stdout: '', stderr: '' });
         },
         log: () => undefined,
-        sleep: () => Promise.resolve(),
-        now: () => 0,
+        sleep: timing.sleep,
+        now: timing.now,
         revalidateSource: () => [],
       },
     };
@@ -476,6 +500,7 @@ describe('in-scope dependencies are re-established, not remembered', () => {
   it('refuses the dependent when the in-scope lookup is merely inconclusive', async () => {
     const { plan: threePlan, bytes } = threePackagePlan();
     const uploaded = new Set<string>();
+    const timing = virtualClock();
     let poisoned = false;
     const commands: string[] = [];
     const ports: PublishPorts = {
@@ -503,8 +528,8 @@ describe('in-scope dependencies are re-established, not remembered', () => {
         return Promise.resolve({ code: 0, stdout: '', stderr: '' });
       },
       log: () => undefined,
-      sleep: () => Promise.resolve(),
-      now: () => 0,
+      sleep: timing.sleep,
+      now: timing.now,
       revalidateSource: () => [],
     };
     const report = await publishRelease(threePlan, ports, { ...options, visibility: briefBudget });

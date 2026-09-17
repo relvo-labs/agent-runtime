@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import {
   checkSourceCurrency,
   readActionsContext,
@@ -169,7 +170,13 @@ try {
       registry: createHttpsRegistry(staging.plan.registry),
       log: write,
       sleep: (ms: number) => new Promise<void>((done) => setTimeout(done, ms)),
-      now: () => Date.now(),
+      // Monotonic, not wall clock. The visibility budget is computed purely
+      // from differences between `now()` readings, and `Date.now()` can be
+      // stepped by NTP mid-wait: backwards it inflates the remaining budget
+      // (bounded then only by the job timeout), forwards it truncates the
+      // 20-minute bound the runbook states. `performance.now()` is unaffected
+      // by clock adjustment, so the bound applied is the bound documented.
+      now: () => performance.now(),
       revalidateSource: readSourceCurrency,
     },
     { tarballPath: staging.tarballPath, userconfig },

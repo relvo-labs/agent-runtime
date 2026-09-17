@@ -66,13 +66,24 @@ output before the approval was requested.
 
 npm scans a newly published package before it is available to install. npm
 documents the delay as usually about five minutes, and says it can be fifteen
-minutes or more. That gap is normal, it is invisible to the publisher, and it is
-what run 34753860073 attempt 3 fell into: `@relvo-labs/agent-protocol@0.2.0` was
-accepted, the job read the registry five times separated by 3000 ms — about
-twelve seconds — and failed. The version was still answering 404 publicly 251 s
-after the registry's own internal version timestamp, and first answered 200 at
-466 s, with integrity, shasum and tarball digest matching the reviewed artifact
-exactly. Nothing was wrong except the window.
+minutes or more. That gap is invisible to the publisher, and it is what run
+34753860073 attempt 3 appears to have fallen into:
+`@relvo-labs/agent-protocol@0.2.0` was accepted, the job read the registry five
+times separated by 3000 ms — about twelve seconds — and failed. The version was
+still answering 404 publicly 251 s after the registry's own internal version
+timestamp, and first answered 200 at 466 s, with integrity, shasum and tarball
+digest matching the reviewed artifact exactly.
+
+**Read that as the best-supported cause, not an observed one.** Anonymous public
+endpoints do not expose npm's internal scan state, so ordinary publish-time
+scanning cannot be distinguished from another transient availability gate from
+outside. It is the best-supported reading because the version cleared with no
+human action, inside the delay range npm documents, and npm reported no incident
+that day. The practical consequence is the one that matters at 3 a.m.: **a long
+absence is not evidence that nothing is wrong.** An accepted version can equally
+be held for manual review or blocked, and those look identical from here — which
+is why the wait below is bounded and its expiry sends you to the account's
+notifications rather than to a longer wait.
 
 So the moment `npm publish` exits zero, the version is **`accepted_pending`**:
 

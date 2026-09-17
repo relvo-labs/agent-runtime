@@ -14,8 +14,18 @@
  * five times separated by 3000 ms — four sleeps, about twelve seconds — and
  * then failed. The version was still answering 404 publicly 251 s after the
  * registry's own internal version timestamp and first answered 200 at 466 s.
- * The artifact was byte-identical to the reviewed one. Nothing was wrong except
- * the window.
+ * The artifact was byte-identical to the reviewed one.
+ *
+ * Normal publish-time scanning is the *best-supported* explanation for that
+ * gap, not an observed one: anonymous public endpoints do not expose the
+ * provider's internal scan state, so ordinary scanning cannot be told apart
+ * from another transient availability gate from outside. It is the best-
+ * supported reading because the version cleared without any human action,
+ * inside the delay range npm documents, and npm reported no incident that day.
+ * The consequence for this module is that a long absence is *not* proof that
+ * nothing is wrong — an accepted version can also be held for manual review or
+ * blocked — which is exactly why the budget below is bounded and its expiry
+ * ends in a human check rather than in more waiting.
  *
  * ## What reconciliation is, and what it is not
  *
@@ -138,7 +148,14 @@ export function nextVisibilityDelayMs(
 export type VisibilityPorts = {
   readonly registry: RegistryPort;
   readonly sleep: (ms: number) => Promise<void>;
-  /** Monotonic-enough clock. Injected so the budget is testable without waiting. */
+  /**
+   * Milliseconds from an arbitrary origin, read only as differences.
+   *
+   * It must be **monotonic**: production passes `performance.now()`, not
+   * `Date.now()`, because an NTP step during a wait would otherwise inflate or
+   * truncate the budget stated in `docs/release.md`. Injected so tests can
+   * advance it deterministically instead of waiting.
+   */
   readonly now: () => number;
 };
 
