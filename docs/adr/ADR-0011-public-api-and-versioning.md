@@ -12,4 +12,4 @@ Use package semver/Changesets for exported JavaScript and TypeScript surfaces. U
 
 ## Consequences
 
-Package and wire versions do not have to move together. Consumers negotiate exact wire-minor compatibility rather than comparing npm versions or assuming unknown data is ignored. The unreleased initial v0.4 candidate may absorb release-blocker corrections before its schemas are first published; a published line is immutable.
+Package and wire versions do not have to move together. Consumers negotiate exact wire-minor compatibility rather than comparing npm versions or assuming unknown data is ignored. The v0.4 wire line was published in `@relvo-labs/agent-protocol@0.2.0` and is now immutable; any further wire-schema change requires a new wire minor under this decision.

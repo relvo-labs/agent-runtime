@@ -1,6 +1,6 @@
 # Security policy
 
-This foundation is pre-1.0 and has not been published. Report suspected vulnerabilities privately through GitHub's security-advisory flow for `relvo-labs/agent-runtime`; do not include credentials, customer data, or exploit secrets in a public issue.
+This foundation is pre-1.0, and all eight public packages have an immutable `0.2.0` release. Report suspected vulnerabilities privately through GitHub's security-advisory flow for `relvo-labs/agent-runtime`; do not include credentials, customer data, or exploit secrets in a public issue.
 
 The runtime is an orchestration library, not a sandbox. In-process provider adapters execute with the host process's privileges. Capability and approval descriptors communicate provider-declared behavior to the host UI; they do not enforce filesystem, process, or network isolation.
 
