@@ -26,9 +26,8 @@ Do not use this skill when:
 - you are changing what a package ships — use `package-artifact-validation`
 - you are changing the canonical gate or the validation workflow — use `local-ci-parity`
 - you want to publish _now_: publication is a human decision with an environment approval,
-  not something an agent may initiate. Exactly one version is public —
-  `@relvo-labs/agent-protocol@0.2.0` — and it is immutable: it is never republished and
-  never named in a dispatch again.
+  not something an agent may initiate. All eight public packages have an immutable `0.2.0`
+  version; none is ever republished or named in a dispatch again.
 
 ## Owns
 
@@ -256,9 +255,9 @@ with that `node` first on `PATH`.
 
 Rehearse preflight locally against real packed artifacts, without credentials. Report
 local facts honestly: never supply `workflow_dispatch` or `refs/heads/main` to impersonate
-a hosted dispatch. The 0.2.0 scope below is an example for the separately authorized
-version-preparation candidate; this repair retains the current manifests and intents.
-A local run must refuse release eligibility even after that candidate is versioned.
+a hosted dispatch. The 0.2.0 scope below deliberately names an already-published immutable
+version so registry preflight must reject it; never copy it into a real dispatch.
+A local run must refuse release eligibility.
 Packing still precedes diagnostic evaluation; issue #26 tracks that separate limitation.
 
 ```bash
@@ -271,8 +270,8 @@ export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
 
-This one-package example is a diagnostic rehearsal, not the full first-release scope.
-Read `docs/release.md` for the eight-package preparation and separate publication decision.
+This one-package example is a rejection-only diagnostic rehearsal, not a release scope.
+Read `docs/release.md` for publication policy and current registry status.
 The library release inventory does not assert feature coverage: the gate owns that proof.
 Raw pending-file checks remain required so empty or malformed intent cannot authorize
 publication through an empty release plan.

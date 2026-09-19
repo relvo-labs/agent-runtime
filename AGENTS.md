@@ -64,9 +64,8 @@ structure without being able to publish anything.
   otherwise destructively mutate a borrowed workspace.
 - Zod schemas are authoritative. TypeScript types are inferred from them; JSON Schema is
   generated from them. Never hand-write a type or a `.json` schema that duplicates one.
-- Exactly one version has been published from this repository —
-  `@relvo-labs/agent-protocol@0.2.0`, which is public and immutable and must never be
-  named in a dispatch again. Nothing else has. Publication happens only through
+- All eight public packages have a published, immutable `0.2.0` version and none of those
+  versions may ever be named in a dispatch again. Publication happens only through
   `.github/workflows/release.yml`: manual `workflow_dispatch` on `main`, an explicitly
   typed `name@version` scope, a credential-free gate and fail-closed preflight first, then
   an `npm-release` environment approval. It refuses to run while any version intent is

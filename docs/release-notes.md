@@ -9,25 +9,28 @@ Notes are written when a version is **prepared**. A version appearing here has n
 itself, been published: publication is a separate manual dispatch described in the
 [release runbook](release.md).
 
-## 0.2.0 — prepared, not published
+## 0.2.0 — all eight packages published
 
 The first line of Foundation v0.4 prepared for publication. All eight public packages move
 together from `0.1.0`; `linked` in the Changesets config keeps them in step, and every
 internal dependency in the packed tarballs resolves to `^0.2.0`. `@relvo-labs/reference-app`
 is private and is not part of this or any release.
 
-Prepared is not published, and not yet approved for publication. Whether this line may be
-published is decided against the [first-release evidence policy](release.md#first-release-evidence-policy)
-by a person, after the canonical gate has been run against the merged commit.
+Registry readback on 2026-09-18 confirmed that all eight packages below are public at
+`0.2.0`, carry registry integrity metadata, and have `latest` pointing to `0.2.0`. Every
+exact version is immutable and must never be republished or named in another dispatch.
+Every future version and scope needs fresh human authority and is decided against the
+[release evidence policy](release.md#first-release-evidence-policy) after the canonical gate has
+run against the exact current commit.
 
-- `@relvo-labs/agent-protocol`
-- `@relvo-labs/agent-executor`
-- `@relvo-labs/agent-provider`
-- `@relvo-labs/agent-provider-codex`
-- `@relvo-labs/agent-provider-claude`
-- `@relvo-labs/agent-runtime`
-- `@relvo-labs/agent-workspace`
-- `@relvo-labs/agent-workspace-git`
+- [`@relvo-labs/agent-protocol@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-protocol/v/0.2.0)
+- [`@relvo-labs/agent-executor@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-executor/v/0.2.0)
+- [`@relvo-labs/agent-provider@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider/v/0.2.0)
+- [`@relvo-labs/agent-provider-codex@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider-codex/v/0.2.0)
+- [`@relvo-labs/agent-provider-claude@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider-claude/v/0.2.0)
+- [`@relvo-labs/agent-runtime@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-runtime/v/0.2.0)
+- [`@relvo-labs/agent-workspace@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-workspace/v/0.2.0)
+- [`@relvo-labs/agent-workspace-git@0.2.0`](https://www.npmjs.com/package/@relvo-labs/agent-workspace-git/v/0.2.0)
 
 Prepared by consuming three changesets: `foundation-runtime-v0-4`,
 `codex-provider-text-run` and `claude-provider-text-run`. Because these packages are
@@ -67,8 +70,7 @@ Git operations require nominal provider-issued leases. Generated schemas describ
 Zod input, including conditional behavior after default-filled omissions.
 `validateWorkspaceLease` is asynchronous, to perform canonical path validation.
 
-Release-blocker corrections were folded into this still-unpublished candidate line rather
-than pretending the reviewed candidate was already a compatible public contract. None of
+Release-blocker corrections were folded into the 0.2.0 candidate before publication. None of
 them change the set of documents Zod accepts: the `InteractionSettlement` "responded iff
 response" conditional is no longer dropped when the shared sub-schema is given its stable
 `$defs` name, so every published root that embeds it enforces the invariant; a git `ref`
@@ -206,8 +208,9 @@ dependency changed.
 
 Version preparation moves versions. It produces no new provider evidence, and it does not
 upgrade the evidence the adapters already had. The
-[first-release evidence policy](release.md#first-release-evidence-policy) governs whether
-this line may be published at all; restated here so the two do not drift:
+[release evidence policy](release.md#first-release-evidence-policy) governed whether this line
+could be published and remains the gate for future versions; it is restated here so the two
+do not drift:
 
 | Claim                                        | Evidence                                                                                                                                                                                                                                                                                                                                                                                        |
 | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
