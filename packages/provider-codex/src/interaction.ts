@@ -1,18 +1,24 @@
 /**
- * The approval bridge: one pinned native request shape, one neutral approval.
+ * The interaction bridge: pinned native request shapes, neutral interactions.
  *
- * The app-server asks the client to decide things. This module decides which of
- * those questions can be asked of a host **without losing anything**, turns
- * exactly those into the neutral `interaction.requested` the protocol already
- * defines, and declines the rest on their own native request id.
+ * The app-server asks the client to decide things and to ask the user things.
+ * This module decides which of those can be put to a host **without losing
+ * anything**, turns exactly those into the neutral `interaction.requested` the
+ * protocol already defines, and declines the rest on their own native request
+ * id.
+ *
+ * Each bridge is opted into separately (`InteractionRegistryOptions`). A
+ * session that enabled questions still declines command approvals, because a
+ * question is the model asking the *user* something and an approval is the
+ * model asking permission to *act*.
  *
  * ## The mapping table, pinned to codex-cli 0.153.4 (stable surface only)
  *
  * | `ServerRequest` method                   | Bridged | Why                                                                                                                          |
  * | ---------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
- * | `item/commandExecution/requestApproval`  | **yes** | Carries its own reviewable subject (`command`, `cwd`, `reason`), and `accept`/`acceptForSession`/`decline` map onto `once`/`session`/denied. |
+ * | `item/commandExecution/requestApproval`  | **with `approvals: 'bridge'`** | Carries its own reviewable subject (`command`, `cwd`, `reason`), and `accept`/`acceptForSession`/`decline` map onto `once`/`session`/denied. |
+ * | `item/tool/requestUserInput`             | **with `questions: 'bridge'`** | A keyed question *list*, which `question_set` carries exactly: native `id` → adapter key, `header`, `options` → choices, `isOther` → `allowFreeText`, `isSecret` → `sensitive` (ADR-0018). It is **not** gated behind `InitializeCapabilities.experimentalApi`: the pinned stable dump contains `ToolRequestUserInput*` byte-identical to the experimental one while genuinely experimental methods are filtered out of it, so `capabilities: null` is both sufficient and safer. |
  * | `item/fileChange/requestApproval`        | no      | `FileChangeRequestApprovalParams` names no files. The change set lives in the `itemId` item, which this adapter does not surface (`streaming.toolActivity: false`), so the approval would have no reviewable subject. |
- * | `item/tool/requestUserInput`             | no      | Every `ToolRequestUserInput*` type is annotated EXPERIMENTAL and is gated behind `InitializeCapabilities.experimentalApi`, which this adapter never opts into (`capabilities: null`). Its payload is also a question *list* with `isSecret` / `isOther` / `autoResolutionMs` facts the single neutral `QuestionRequest` cannot carry. |
  * | `item/permissions/requestApproval`       | no      | `PermissionsRequestApprovalResponse` requires a `GrantedPermissionProfile` and a `PermissionGrantScope`, and has no decline variant at all. A neutral approval response carries a decision and a mode. |
  * | `mcpServer/elicitation/request`          | no      | An arbitrary multi-field form (`McpElicitationSchema`), with a *nullable* `turnId` — so neither the one-question mapping nor run correlation holds. |
  * | `item/tool/call`                         | no      | Asks the client to execute a tool. Not an interaction.                                                                        |
@@ -21,11 +27,16 @@
  * | `applyPatchApproval` (legacy)            | no      | Carries `conversationId` / `callId` and **no `turnId`**, so it cannot be bound to the active run.                              |
  * | `execCommandApproval` (legacy)           | no      | Same: no `turnId`, so it cannot be correlated.                                                                                |
  *
+ * `serverRequest/resolved` is a *notification*, not a request, and is the one
+ * inbound frame that retires an entry without a reply: see `resolveNative`.
+ *
  * ## What this module guarantees
  *
  *  1. **No silent drop and no automatic approval.** Every request is answered
  *     exactly once — by a host decision, by an explicit typed decline, or by a
- *     `decline` at teardown. Nothing is granted that a host did not grant.
+ *     `decline` at teardown — unless the server retires it itself with
+ *     `serverRequest/resolved`, in which case nothing is written at all.
+ *     Nothing is granted that a host did not grant.
  *  2. **Lossless or refused.** A command approval is bridged only when its
  *     whole decision survives the round trip. A request that proposes an
  *     execpolicy or network-policy amendment is refused rather than answered
@@ -45,15 +56,20 @@ import { z } from 'zod';
 
 import {
   agentError,
+  checkResponseAgainstRequest,
   InteractionResponseSchema,
+  QuestionSetRequestSchema,
+  type ApprovalRequest,
   type InteractionResponse,
   type JsonObject,
   type JsonValue,
   type QuestionItem,
+  type QuestionSetRequest,
 } from '@relvo-labs/agent-protocol';
 import { ProviderRejection, type ProviderEventSink } from '@relvo-labs/agent-provider';
 
 import { INVALID_PARAMS, INVALID_REQUEST } from './protocol.ts';
+import type { CodexRequestId } from './seam.ts';
 import { sameTurn, type TurnCorrelation } from './translate.ts';
 
 /** The one server-initiated method this adapter answers with a host decision. */
@@ -252,7 +268,14 @@ export type QuestionRefusal =
   | 'question_count'
   | 'duplicate_question_id'
   | 'duplicate_option_label'
-  | 'detail_too_large';
+  | 'detail_too_large'
+  /**
+   * Well formed for the app-server, invalid as a neutral batch: a prompt,
+   * header, option label or description past its bound, or an option count
+   * above the neutral maximum. `ToolRequestUserInputParams` declares no
+   * lengths and no option limit, so only the neutral schema can say.
+   */
+  | 'neutral_bounds';
 
 /**
  * Private native schema derived from the 0.153.4 generated
@@ -310,7 +333,14 @@ export type QuestionTranslation =
   | {
       readonly kind: 'request';
       readonly correlation: TurnCorrelation;
-      readonly questions: readonly QuestionItem[];
+      /**
+       * The complete neutral request, already parsed by
+       * `QuestionSetRequestSchema`. Retaining the whole validated request is
+       * what makes settlement checkable against what was asked, and what
+       * guarantees the runtime is never handed a batch it would discard as a
+       * malformed provider event while the app-server waits forever.
+       */
+      readonly request: QuestionSetRequest;
       readonly plan: readonly QuestionPlanEntry[];
     }
   | { readonly kind: 'refused'; readonly reason: QuestionRefusal };
@@ -391,10 +421,19 @@ export function translateUserInputRequest(params: unknown): QuestionTranslation 
   // request is refused and the server is told so.
   if (JSON.stringify(questions).length > MAX_QUESTION_DETAIL_CHARS) return refusedQuestion('detail_too_large');
 
+  // The aggregate bound above says nothing about an individual field. An
+  // 8001-character prompt is comfortably inside 16000 characters of batch JSON
+  // and outside `QuestionItem.prompt`; 65 options is a legal native list and an
+  // illegal neutral choice list. The neutral schema is therefore the last gate,
+  // applied to the whole translated request before any entry is retained or
+  // any event emitted.
+  const parsedRequest = QuestionSetRequestSchema.safeParse({ kind: 'question_set', questions });
+  if (!parsedRequest.success) return refusedQuestion('neutral_bounds');
+
   return {
     kind: 'request',
     correlation: { threadId: record.threadId, turnId: record.turnId },
-    questions,
+    request: parsedRequest.data,
     plan,
   };
 }
@@ -405,28 +444,34 @@ export function translateUserInputRequest(params: unknown): QuestionTranslation 
  * The runtime has already proven the response answers every question exactly
  * once, so this cannot produce a partial map — and it throws rather than
  * omitting a key if that guarantee is ever violated by a direct SPI caller.
+ *
+ * Assembled with `Object.fromEntries`, which defines each key as an **own data
+ * property**. The native key is the server's question `id`, an arbitrary
+ * string: `answers[id] = …` would reassign the object's prototype for an `id`
+ * of `__proto__` and serialise as `{"answers":{}}` — a reply that answers
+ * nothing while this adapter reports the batch settled.
  */
 export function nativeUserInputAnswers(
   plan: readonly QuestionPlanEntry[],
   response: Extract<InteractionResponse, { kind: 'question_set' }>,
 ): JsonObject {
-  const answers: Record<string, JsonValue> = {};
+  const pairs: [string, JsonValue][] = [];
   for (const entry of plan) {
     const answer = response.answers[entry.key];
     if (answer === undefined) {
       throw rejection('invalid_request', 'every question in this codex batch must be answered');
     }
     if (answer.type === 'text') {
-      answers[entry.questionId] = { answers: [answer.text] };
+      pairs.push([entry.questionId, { answers: [answer.text] }]);
       continue;
     }
     const labels = answer.values.map((value) => entry.labels.get(value));
     if (labels.some((label) => label === undefined)) {
       throw rejection('invalid_request', 'a selection named a choice this codex question does not offer');
     }
-    answers[entry.questionId] = { answers: labels as string[] };
+    pairs.push([entry.questionId, { answers: labels as string[] }]);
   }
-  return { answers };
+  return { answers: Object.fromEntries(pairs) };
 }
 
 /** Neutral response → the pinned `CommandExecutionApprovalDecision`. */
@@ -446,10 +491,16 @@ function nativeDecision(response: Extract<InteractionResponse, { kind: 'approval
 /**
  * One server-initiated request, with its reply held behind closures.
  *
- * The native `RequestId` is deliberately absent: the client layer owns it and
- * hands out only the ability to answer it once.
+ * The client layer still owns the reply: `respond`/`reject` are the only way to
+ * write on this id, and they answer at most once. The `id` itself is carried
+ * because `serverRequest/resolved` correlates by native request id and by
+ * nothing else — there is no `turnId` on it — so a registry that cannot see the
+ * id cannot tell which of its entries the server just retired. It is
+ * adapter-private, compared and never published: no neutral event, error or
+ * diagnostic in this module carries it.
  */
 export type CodexServerRequestOffer = {
+  readonly id: CodexRequestId;
   readonly method: string;
   readonly params: unknown;
   /** Answer with a result. Returns false if it was already answered. */
@@ -480,6 +531,21 @@ export type CodexInteractionRegistry = {
    * and the caller should decline it.
    */
   offer(request: CodexServerRequestOffer, owner: ApprovalOwner | undefined): OfferVerdict;
+  /**
+   * The server resolved one of its own requests (`serverRequest/resolved`).
+   *
+   * Two cases, both handled without writing anything on that native id:
+   *
+   *  - the entry was already answered by a host — this is the server
+   *    *confirming* that answer, and the entry is simply forgotten;
+   *  - the entry was never answered — the server has withdrawn it, so the
+   *    entry is fenced against any later reply and the Runtime interaction it
+   *    raised is withdrawn, freeing the run.
+   *
+   * An id this registry never tracked is ignored: it names another client's
+   * request or one already retired.
+   */
+  resolveNative(requestId: CodexRequestId): void;
   /** Apply one settled neutral response. Throws `ProviderRejection` if it cannot. */
   settle(providerRef: string, response: InteractionResponse): void;
   /** Decline and forget everything one run raised. Safe to call repeatedly. */
@@ -492,6 +558,15 @@ export type CodexInteractionRegistry = {
 
 type Entry = {
   readonly ownerKey: object;
+  /**
+   * The native request id this entry answers. Adapter-private correlation for
+   * `serverRequest/resolved`; never published and never echoed.
+   */
+  readonly nativeId: CodexRequestId;
+  /** The run's own sink, so a withdrawal reaches the run that asked. */
+  readonly sink: ProviderEventSink;
+  /** The adapter's correlation token, echoed on a withdrawal. */
+  readonly providerRef: string;
   readonly respond: (result: JsonValue) => boolean;
   /**
    * The answer already applied, canonicalized. Present means the one native
@@ -500,8 +575,8 @@ type Entry = {
    */
   applied: string | undefined;
 } & (
-  | { readonly kind: 'approval'; readonly plan?: undefined }
-  | { readonly kind: 'question'; readonly plan: readonly QuestionPlanEntry[] }
+  | { readonly kind: 'approval'; readonly request: ApprovalRequest; readonly plan?: undefined }
+  | { readonly kind: 'question'; readonly request: QuestionSetRequest; readonly plan: readonly QuestionPlanEntry[] }
 );
 
 function rejection(code: Parameters<typeof agentError>[0], message: string, details?: JsonObject): ProviderRejection {
@@ -527,6 +602,17 @@ function appliedQuestionKey(response: Extract<InteractionResponse, { kind: 'ques
 
 export type InteractionRegistryOptions = {
   /**
+   * Whether `item/commandExecution/requestApproval` is bridged. When false the
+   * method is reported `unhandled` and the caller declines it with `-32601`,
+   * which is the fail-closed posture a provider that declares no approval
+   * capability must keep.
+   *
+   * Independent of `questions` on purpose: a question is the model asking the
+   * *user* something, and an approval is the model asking permission to *act*.
+   * Enabling the first must never quietly enable the second.
+   */
+  readonly approvals: boolean;
+  /**
    * Whether `item/tool/requestUserInput` is bridged. When false the method is
    * reported `unhandled`, so the caller declines it with `-32601` exactly as
    * before — an unbridged blocking request must still be answered, never
@@ -537,10 +623,20 @@ export type InteractionRegistryOptions = {
 
 export function createInteractionRegistry(
   sessionSink: ProviderEventSink,
-  options: InteractionRegistryOptions = { questions: false },
+  options: InteractionRegistryOptions = { approvals: true, questions: false },
 ): CodexInteractionRegistry {
+  const bridgesApprovals = options.approvals;
   const bridgesQuestions = options.questions;
   const entries = new Map<string, Entry>();
+  /**
+   * Native request id → this registry's reference.
+   *
+   * `serverRequest/resolved` names a request by native id and carries no turn,
+   * so without this map a resolution cannot be attributed to an entry at all.
+   * It is maintained in lockstep with `entries`, so it is bounded by the same
+   * `MAX_TRACKED_APPROVALS`.
+   */
+  const byNativeId = new Map<CodexRequestId, string>();
   /**
    * This registry's own reference namespace.
    *
@@ -559,6 +655,7 @@ export function createInteractionRegistry(
   /** Decline one entry that was never answered, then forget it. */
   function retireEntry(providerRef: string, entry: Entry): void {
     entries.delete(providerRef);
+    byNativeId.delete(entry.nativeId);
     if (entry.applied !== undefined) return;
     entry.applied = RETIRED;
     // Best effort: once the stream has ended nothing can be written, but the
@@ -615,17 +712,16 @@ export function createInteractionRegistry(
     entries.set(providerRef, {
       kind: 'question',
       ownerKey: owner.key,
+      nativeId: request.id,
+      sink,
+      providerRef,
+      request: translation.request,
       plan: translation.plan,
       respond: (result: JsonValue) => request.respond(result),
       applied: undefined,
     });
-    sink.emit({
-      payload: {
-        type: 'interaction.requested',
-        providerRef,
-        request: { kind: 'question_set', questions: [...translation.questions] },
-      },
-    });
+    byNativeId.set(request.id, providerRef);
+    sink.emit({ payload: { type: 'interaction.requested', providerRef, request: translation.request } });
     return 'taken';
   }
 
@@ -635,7 +731,10 @@ export function createInteractionRegistry(
         if (!bridgesQuestions) return 'unhandled';
         return offerQuestion(request, owner);
       }
-      if (request.method !== CODEX_BRIDGED_APPROVAL) return 'unhandled';
+      // Each native method is gated by its *own* flag. A session that only
+      // asked for questions still declines every command approval with
+      // `-32601`, matching the `approval: {}` capability it advertises.
+      if (request.method !== CODEX_BRIDGED_APPROVAL || !bridgesApprovals) return 'unhandled';
 
       const sink = owner?.sink ?? sessionSink;
       const translation = translateCommandApproval(request.params);
@@ -666,30 +765,52 @@ export function createInteractionRegistry(
 
       issued += 1;
       const providerRef = `approval-${namespace}-${String(issued)}`;
+      const approvalRequest: ApprovalRequest = {
+        kind: 'approval',
+        subject: translation.subject,
+        allowedModes: [...CODEX_APPROVAL_MODES],
+        // A UX ordering hint, not a security classification: this is
+        // provider-declared intent and the runtime enforces nothing
+        // (ADR-0009).
+        riskHint: 'high',
+      };
       entries.set(providerRef, {
         kind: 'approval',
         ownerKey: owner.key,
+        nativeId: request.id,
+        sink,
+        providerRef,
+        request: approvalRequest,
         // Wrapped rather than passed by reference: the offer owns the native
         // id and the at-most-once guard, and this keeps `this` bound to it.
         respond: (result: JsonValue) => request.respond(result),
         applied: undefined,
       });
-      sink.emit({
-        payload: {
-          type: 'interaction.requested',
-          providerRef,
-          request: {
-            kind: 'approval',
-            subject: translation.subject,
-            allowedModes: [...CODEX_APPROVAL_MODES],
-            // A UX ordering hint, not a security classification: this is
-            // provider-declared intent and the runtime enforces nothing
-            // (ADR-0009).
-            riskHint: 'high',
-          },
-        },
-      });
+      byNativeId.set(request.id, providerRef);
+      sink.emit({ payload: { type: 'interaction.requested', providerRef, request: approvalRequest } });
       return 'taken';
+    },
+
+    resolveNative(requestId: CodexRequestId): void {
+      const providerRef = byNativeId.get(requestId);
+      if (providerRef === undefined) return;
+      // The native id is retired either way: the server will not use it again,
+      // and a second resolution must not find an entry a third time.
+      byNativeId.delete(requestId);
+      const entry = entries.get(providerRef);
+      if (entry === undefined) return;
+      // Already answered: this is the server confirming the reply this adapter
+      // already wrote. Harmless, and the entry stays tracked so an identical
+      // redelivery of that answer remains a no-op rather than becoming an
+      // `unknown_interaction`. Writing on the id again is what would be wrong.
+      if (entry.applied !== undefined) return;
+      // Never answered: the server resolved it by itself. Fence the entry so a
+      // later response cannot write on a retired native id, and tell the
+      // Runtime, which is otherwise left holding a pending interaction and a
+      // run parked in `awaiting_interaction` for the rest of its life.
+      entries.delete(providerRef);
+      entry.applied = RETIRED;
+      entry.sink.emit({ payload: { type: 'interaction.withdrawn', providerRef: entry.providerRef } });
     },
 
     settle(providerRef: string, response: InteractionResponse): void {
@@ -711,6 +832,16 @@ export function createInteractionRegistry(
             capability: 'interaction.kind',
             supported: ['question_set'],
           });
+        }
+        // `respondToInteraction` is public SPI, so the full request-aware
+        // check runs here too and not only inside the Runtime: exact key set,
+        // cardinality, duplicate selections, known choice values, and free
+        // text only where `isOther` (or an option-less question) permitted it.
+        // The reason is a bounded classification; it never carries an answer
+        // value or an unknown key.
+        const mismatch = checkResponseAgainstRequest(entry.request, response);
+        if (mismatch !== undefined) {
+          throw rejection('invalid_request', `this codex question batch was answered invalidly: ${mismatch}`);
         }
         // Validation completes before settlement is consumed, so a response
         // this adapter cannot apply leaves the batch answerable.
@@ -746,6 +877,15 @@ export function createInteractionRegistry(
 
       if (response.decision === 'denied' && response.mode !== undefined) {
         throw rejection('invalid_request', 'a denial must not carry an approval mode');
+      }
+
+      // The same request-aware backstop the question branch applies, run after
+      // the capability-specific checks above so the more precise classification
+      // wins. It is redundant only for as long as this adapter's
+      // `allowedModes` and `CODEX_APPROVAL_MODES` stay identical.
+      const approvalMismatch = checkResponseAgainstRequest(entry.request, response);
+      if (approvalMismatch !== undefined) {
+        throw rejection('invalid_request', `this codex approval was answered invalidly: ${approvalMismatch}`);
       }
 
       // Validation completes before settlement is consumed, so a response this

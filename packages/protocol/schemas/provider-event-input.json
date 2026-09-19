@@ -371,6 +371,25 @@
         {
           "additionalProperties": false,
           "properties": {
+            "providerRef": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "interaction.withdrawn",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "providerRef"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "detail": {
               "additionalProperties": {
                 "$ref": "#/$defs/json-value"

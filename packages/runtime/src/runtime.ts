@@ -618,6 +618,45 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         if (!run || (run.termination !== undefined && payload.type !== 'interaction.requested')) return;
       }
 
+      if (payload.type === 'interaction.withdrawn') {
+        // A withdrawal names an interaction *this* provider raised on *this*
+        // run, by the same reference the request carried. Anything else is
+        // silently ignored: a provider must not be able to settle an
+        // interaction it does not own, and a withdrawal of something already
+        // gone is a no-op rather than a diagnostic it can flood.
+        if (runId === undefined) return;
+        const session = live.get(sessionId);
+        const run = tx.session(sessionId).runs.get(runId);
+        if (!session || !run) return;
+        const interactionId = session.refToInteraction.get(payload.providerRef);
+        if (interactionId === undefined || session.interactionRuns.get(interactionId) !== runId) return;
+        // A response that already reached the provider is logically ahead of a
+        // withdrawal even when its first persistence attempt failed, so the
+        // retained settlement keeps its claim and its routing. The adapters
+        // never withdraw an entry they already applied; this is the runtime's
+        // own guard against a provider that does.
+        if (pendingResponsesByInteraction.has(interactionId)) return;
+        const interaction = tx.session(sessionId).interactions.get(interactionId);
+        if (interaction?.status === 'pending') {
+          tx.emit({
+            sessionId,
+            runId,
+            payload: {
+              type: 'interaction.settled',
+              interactionId,
+              turnId: interaction.turnId,
+              settlement: { outcome: 'withdrawn', settledAt: clock.now() },
+            },
+          });
+        }
+        // Routing goes with the settlement: the reference can no longer be
+        // answered, and the run is free to reach its own terminal state.
+        session.interactionRefs.delete(interactionId);
+        session.refToInteraction.delete(payload.providerRef);
+        session.interactionRuns.delete(interactionId);
+        return;
+      }
+
       if (payload.type === 'interaction.requested') {
         if (runId === undefined) return;
         const interactionId = idFactory.next('interaction') as InteractionId;

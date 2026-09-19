@@ -40,10 +40,18 @@ import {
 } from '@relvo-labs/agent-provider';
 
 import { createCodexClient, isAuthoritativeRejection, type CodexClient, type CodexClientEnd } from './client.ts';
-import { CODEX_METHOD, CODEX_NOTIFICATION, CODEX_SERVER_REQUEST, asId, asRecord } from './protocol.ts';
+import {
+  CODEX_METHOD,
+  CODEX_NOTIFICATION,
+  CODEX_SERVER_REQUEST,
+  asId,
+  asRecord,
+  asServerRequestResolved,
+} from './protocol.ts';
 import {
   CODEX_APPROVAL_MODES,
   CODEX_BRIDGED_APPROVAL,
+  CODEX_BRIDGED_QUESTION,
   createInteractionRegistry,
   type ApprovalOwner,
   type CodexInteractionRegistry,
@@ -333,6 +341,24 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
   }
 
   function onNotification(method: string, params: unknown): void {
+    // Handled before correlation, because it is the one notification that
+    // carries no `turnId`: `serverRequest/resolved` is `{ threadId, requestId }`
+    // and is correlated by the native request id the registry retained. It
+    // both confirms an answer this adapter already sent and retires one the
+    // server resolved itself — the app-server's withdrawal signal. Dropping it
+    // for want of a `turnId` is what leaves a withdrawn question pending in
+    // the Runtime while the adapter keeps a reply channel it must not use.
+    if (method === CODEX_NOTIFICATION.serverRequestResolved) {
+      const resolved = asServerRequestResolved(params);
+      if (resolved === undefined) return;
+      if (resolved.threadId !== threadId) {
+        noteForeignTraffic();
+        return;
+      }
+      interactions?.resolveNative(resolved.requestId);
+      return;
+    }
+
     const correlation = correlationOf(params);
     if (correlation === undefined) {
       // Thread- and app-scoped notifications carry no turn. Nothing in the
@@ -1028,12 +1054,17 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
       declaredSandboxMode: options.sandboxMode ?? 'read-only',
       /**
        * The approval policy this adapter will request from the app-server, and
-       * the exact server-initiated methods it bridges. Every other
-       * `ServerRequest` method is declined on its own native request id — see
-       * the mapping table in `interaction.ts`.
+       * the exact server-initiated methods it bridges — each listed only when
+       * its own bridge was opted into, so the list always matches what this
+       * session will actually answer. Every other `ServerRequest` method is
+       * declined on its own native request id — see the mapping table in
+       * `interaction.ts`.
        */
       declaredApprovalPolicy: bridgesApprovals ? 'on-request' : 'never',
-      bridgedServerRequests: bridgesApprovals ? [CODEX_BRIDGED_APPROVAL] : [],
+      bridgedServerRequests: [
+        ...(bridgesApprovals ? [CODEX_BRIDGED_APPROVAL] : []),
+        ...(bridgesQuestions ? [CODEX_BRIDGED_QUESTION] : []),
+      ],
       /**
        * `CommandExecutionRequestApprovalResponse` carries `decision` and
        * nothing else, so a host's denial `reason` cannot be transmitted to the
@@ -1178,9 +1209,12 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
           sink: init.sink,
           // One registry per session: references never cross sessions, and a
           // session's teardown retires exactly its own.
+          // Each native method is gated by its own flag, so enabling questions
+          // cannot quietly re-enable the approval bridge the descriptor says
+          // is off.
           interactions:
             bridgesApprovals || bridgesQuestions
-              ? createInteractionRegistry(init.sink, { questions: bridgesQuestions })
+              ? createInteractionRegistry(init.sink, { approvals: bridgesApprovals, questions: bridgesQuestions })
               : undefined,
         },
         {

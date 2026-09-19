@@ -21,9 +21,31 @@ Refused **whole**, with `-32602` on the request's own native id and raising no i
 `isBlocking: false` (a turn that does not wait cannot be resumed by an answer), any
 `autoResolutionMs` (it asks the client to answer _for_ the user; this adapter never
 fabricates an answer and imposes no settlement deadline), duplicate question `id` or option
-`label` (both are native answer keys), an empty or oversized batch, and any unknown member.
-A request that does not name the active turn, has no run to own it, or exceeds the
-per-session bound is refused with `-32600`.
+`label` (both are native answer keys), an empty or oversized batch, any unknown member, and
+anything the neutral `question_set` schema refuses — a prompt, header, option label or
+description past its bound, or more options than a neutral choice list carries
+(`neutral_bounds`). `ToolRequestUserInputParams` declares no lengths and no option limit, so
+the complete translated batch is parsed through `QuestionSetRequestSchema` before any entry
+is retained: retaining first would leave a blocking native request waiting forever on an
+interaction the Runtime discarded as malformed. A request that does not name the active
+turn, has no run to own it, or exceeds the per-session bound is refused with `-32600`.
+
+**Withdrawal is now bridged.** `serverRequest/resolved` (`{ threadId, requestId }`) carries
+no `turnId`, so it is correlated by the native request id the interaction registry retains.
+A resolution confirming an answer this adapter already sent is harmless and does nothing;
+a resolution of an _unanswered_ request is the app-server withdrawing it, so the adapter
+writes nothing on that native id, fences it against every later reply, and emits
+`interaction.withdrawn` to the Runtime — which settles the interaction `withdrawn`, clears
+routing and lets the turn continue instead of parking the run in `awaiting_interaction`
+forever. Duplicate resolutions are no-ops. This corrects this package's previous statement
+that the protocol has no withdrawal for this request.
+
+**Each bridge stays independently opt-in.** `questions: 'bridge'` no longer enables the
+approval bridge as a side effect of creating the interaction registry: with `approvals`
+unset, `item/commandExecution/requestApproval` is still declined with `-32601`, no approval
+interaction is raised and no `decision` is ever sent, matching the `approval: {}` capability
+the descriptor advertises. `extensions.bridgedServerRequests` now lists each enabled method
+and only those, so it names `item/tool/requestUserInput` when questions are bridged.
 
 **No experimental capability is enabled.** `initialize.params.capabilities` stays `null`.
 This corrects a previous claim in this package that `ToolRequestUserInput*` is gated behind
@@ -40,6 +62,15 @@ model asking the user something, not permission to act.
 
 The default is unchanged: with `questions` unset the method is declined with `-32601` on
 its own request id, so a blocking request still cannot stall a turn.
+
+`respondToInteraction` applies the full request-aware check before consuming the single
+settlement, not only inside the Runtime: the closed response schema, then the exact key set,
+cardinality, duplicate selections, known choice values and free text only where `isOther`
+(or an option-less question) permitted it, against the batch this adapter actually asked.
+An invalid direct SPI call is `invalid_request` and leaves the batch answerable. The native
+answer map is built with `Object.fromEntries`, so a native question `id` of `__proto__`
+becomes an own property instead of a prototype assignment that would reply
+`{"answers":{}}`.
 
 Settlement is process-local and exactly-once: an identical redelivery writes no second
 reply (key order is normalized), a conflicting one is `interaction_already_settled`, and a

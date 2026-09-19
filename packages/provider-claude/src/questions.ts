@@ -37,15 +37,31 @@
  *     tokens; no prompt, option or answer text reaches an error or a log.
  *  4. **Exactly once, in process.** A reference settles one callback one time.
  *     An identical redelivery is a no-op; a different answer is refused.
- *  5. **No dangling callback.** Every entry belongs to a run. When that run
- *     ends, or when the SDK withdraws the call by aborting its signal, the
- *     entry is denied once, detached and retired.
+ *  5. **No dangling callback, and no dangling interaction.** Every entry
+ *     belongs to a run. When that run ends, the entry is denied once, detached
+ *     and retired, and the Runtime cancels the interaction as part of the
+ *     run's terminal commit. When the SDK withdraws the call by aborting its
+ *     signal while the run continues, the entry is denied *and* an
+ *     `interaction.withdrawn` is emitted on the run's sink, so the Runtime
+ *     settles the interaction `withdrawn`, clears its routing and lets the run
+ *     leave `awaiting_interaction`. Retiring only the adapter's own entry
+ *     would park the run forever and turn its eventual success into a
+ *     `provider_contract_violation`.
  */
 
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
-import { agentError, type InteractionResponse, type JsonObject, type QuestionItem } from '@relvo-labs/agent-protocol';
+import {
+  agentError,
+  checkResponseAgainstRequest,
+  InteractionResponseSchema,
+  QuestionSetRequestSchema,
+  type InteractionResponse,
+  type JsonObject,
+  type QuestionItem,
+  type QuestionSetRequest,
+} from '@relvo-labs/agent-protocol';
 import { ProviderRejection, type ProviderEventSink } from '@relvo-labs/agent-provider';
 
 import type { ClaudePermissionResult } from './seam.ts';
@@ -92,7 +108,14 @@ export type QuestionRefusal =
   | 'duplicate_question'
   | 'duplicate_option'
   | 'preview_unsupported'
-  | 'answers_prefilled';
+  | 'answers_prefilled'
+  /**
+   * The translation is well formed for the *tool* but violates the neutral
+   * contract — a prompt, header, label or description past its bound, or a
+   * count the batch schema refuses. The pinned tool declares no length limits,
+   * so this is not theoretical: the input is model-authored text.
+   */
+  | 'neutral_bounds';
 
 /**
  * Private native schema for the pinned `AskUserQuestionInput`.
@@ -143,7 +166,15 @@ export type QuestionPlanEntry = {
 export type QuestionTranslation =
   | {
       readonly kind: 'request';
-      readonly questions: readonly QuestionItem[];
+      /**
+       * The complete neutral request, already parsed by
+       * `QuestionSetRequestSchema`. Holding the whole validated request — not
+       * just its questions — is what lets settlement be checked against what
+       * was actually asked, and guarantees the runtime is never handed a batch
+       * it would discard as malformed while this adapter waits forever for the
+       * answer to an interaction that was never raised.
+       */
+      readonly request: QuestionSetRequest;
       readonly plan: readonly QuestionPlanEntry[];
       readonly input: AskUserQuestionInput;
     }
@@ -225,7 +256,17 @@ export function translateAskUserQuestion(input: unknown): QuestionTranslation {
     plan.push({ key, questionText: question.question, multiSelect: question.multiSelect, labels });
   }
 
-  return { kind: 'request', questions, plan, input: native };
+  // The last gate, and the only one that speaks the neutral contract: the whole
+  // translated batch is parsed before a single entry is retained or a single
+  // event is emitted. `AskUserQuestionInput` bounds counts but not lengths, so
+  // an 8001-character prompt is a well-formed tool call and an invalid
+  // `question_set`. Emitting it anyway would leave the runtime discarding a
+  // malformed provider event as a diagnostic while this module keeps the SDK
+  // blocked on a question no host can ever be shown.
+  const parsedRequest = QuestionSetRequestSchema.safeParse({ kind: 'question_set', questions });
+  if (!parsedRequest.success) return refused('neutral_bounds');
+
+  return { kind: 'request', request: parsedRequest.data, plan, input: native };
 }
 
 /**
@@ -233,28 +274,34 @@ export function translateAskUserQuestion(input: unknown): QuestionTranslation {
  *
  * The caller has already proven the response answers every question exactly
  * once (`checkResponseAgainstRequest`), so this cannot produce a partial map.
+ *
+ * The map is assembled with `Object.fromEntries`, which defines every key as an
+ * **own data property**. The native key is the question *text* — model-authored
+ * and completely unconstrained — so `answers[text] = value` would silently
+ * reassign the object's prototype for a question literally called `__proto__`
+ * and serialise as `{}`, answering nothing while reporting success.
  */
 export function nativeAnswers(
   plan: readonly QuestionPlanEntry[],
   response: Extract<InteractionResponse, { kind: 'question_set' }>,
 ): Record<string, string> {
-  const answers: Record<string, string> = {};
+  const pairs: [string, string][] = [];
   for (const entry of plan) {
     const answer = response.answers[entry.key];
     if (answer === undefined) {
       throw rejection('invalid_request', 'every question in this claude batch must be answered');
     }
     if (answer.type === 'text') {
-      answers[entry.questionText] = answer.text;
+      pairs.push([entry.questionText, answer.text]);
       continue;
     }
     const labels = answer.values.map((value) => entry.labels.get(value));
     if (labels.some((label) => label === undefined)) {
       throw rejection('invalid_request', 'a selection named a choice this claude question does not offer');
     }
-    answers[entry.questionText] = (labels as string[]).join(MULTI_SELECT_JOIN);
+    pairs.push([entry.questionText, (labels as string[]).join(MULTI_SELECT_JOIN)]);
   }
-  return answers;
+  return Object.fromEntries(pairs);
 }
 
 function rejection(code: Parameters<typeof agentError>[0], message: string, details?: JsonObject): ProviderRejection {
@@ -264,8 +311,14 @@ function rejection(code: Parameters<typeof agentError>[0], message: string, deta
 type Entry = {
   /** The run that owns this question. Identity only; never inspected here. */
   readonly owner: object;
+  /** The run's own sink, so a withdrawal reaches the run that asked. */
+  readonly sink: ProviderEventSink;
+  /** The adapter's correlation token, echoed on a withdrawal. */
+  readonly providerRef: string;
   readonly settle: (result: ClaudePermissionResult) => void;
   readonly plan: readonly QuestionPlanEntry[];
+  /** What was actually asked. Settlement is checked against exactly this. */
+  readonly request: QuestionSetRequest;
   readonly input: AskUserQuestionInput;
   /** Canonicalized applied answer, telling redelivery from conflict. */
   applied: string | undefined;
@@ -316,19 +369,38 @@ export function createQuestionRegistry(): QuestionRegistry {
   const namespace = randomUUID();
   let issued = 0;
 
-  function retire(providerRef: string, entry: Entry, message: string): void {
+  /**
+   * Retire one entry, denying the SDK call if nobody answered it.
+   *
+   * `withdraw` says whether the Runtime interaction this entry raised must be
+   * withdrawn too. It is set exactly when the *SDK* took the question away
+   * while its run is still alive — the abort path — because then nobody else
+   * will ever settle that interaction: the run keeps going, so run completion
+   * will not cancel it, and the host would be left holding a question the
+   * agent has stopped listening for while the run sits in
+   * `awaiting_interaction` forever.
+   *
+   * It is deliberately *not* set on teardown. There the run is ending and the
+   * Runtime settles every interaction the run still owns as `cancelled` inside
+   * the same terminal commit; emitting a withdrawal into a sink whose run is
+   * being finalized would race that commit to describe the same event twice.
+   */
+  function retire(providerRef: string, entry: Entry, message: string, withdraw: boolean): void {
     entries.delete(providerRef);
     entry.release?.();
     entry.release = undefined;
     if (entry.applied !== undefined) return;
     entry.applied = RETIRED;
+    if (withdraw) {
+      entry.sink.emit({ payload: { type: 'interaction.withdrawn', providerRef: entry.providerRef } });
+    }
     entry.settle({ behavior: 'deny', message });
   }
 
   function clear(owner: object | undefined): void {
     for (const [providerRef, entry] of [...entries]) {
       if (owner !== undefined && entry.owner !== owner) continue;
-      retire(providerRef, entry, TEARDOWN_DENIAL);
+      retire(providerRef, entry, TEARDOWN_DENIAL, false);
     }
   }
 
@@ -366,8 +438,11 @@ export function createQuestionRegistry(): QuestionRegistry {
       return new Promise<ClaudePermissionResult>((resolve) => {
         const entry: Entry = {
           owner,
+          sink,
+          providerRef,
           settle: resolve,
           plan: translation.plan,
+          request: translation.request,
           input: translation.input,
           applied: undefined,
           release: undefined,
@@ -375,20 +450,17 @@ export function createQuestionRegistry(): QuestionRegistry {
         entries.set(providerRef, entry);
         if (signal !== undefined) {
           const onAbort = (): void => {
-            retire(providerRef, entry, CANCELLED_DENIAL);
+            // The SDK has stopped waiting. Withdraw the interaction as well as
+            // the callback, so the run leaves `awaiting_interaction` and its
+            // later success is a success rather than a contract violation.
+            retire(providerRef, entry, CANCELLED_DENIAL, true);
           };
           signal.addEventListener('abort', onAbort, { once: true });
           entry.release = () => {
             signal.removeEventListener('abort', onAbort);
           };
         }
-        sink.emit({
-          payload: {
-            type: 'interaction.requested',
-            providerRef,
-            request: { kind: 'question_set', questions: [...translation.questions] },
-          },
-        });
+        sink.emit({ payload: { type: 'interaction.requested', providerRef, request: translation.request } });
       });
     },
 
@@ -399,11 +471,31 @@ export function createQuestionRegistry(): QuestionRegistry {
       // durable error.
       if (entry === undefined) return false;
 
+      // `respondToInteraction` is public SPI. The Runtime validates a response
+      // against its own copy of the request before it ever calls a provider,
+      // but a host may hold a `ProviderSession` and call this directly, so the
+      // same two checks are applied here against the request this adapter
+      // actually asked: the closed response schema, then the request-aware
+      // semantics — exact key set, cardinality, duplicate selections, known
+      // choice values and where free text is permitted.
+      const parsed = InteractionResponseSchema.safeParse(response);
+      if (!parsed.success) {
+        throw rejection('invalid_request', 'the claude interaction response is malformed');
+      }
+      response = parsed.data;
+
       if (response.kind !== 'question_set') {
         throw rejection('capability_unsupported', 'the claude adapter answers this interaction with a question batch', {
           capability: 'interaction.kind',
           supported: ['question_set'],
         });
+      }
+
+      // The reason is a bounded classification produced from the request and
+      // the answer *shape*; it never carries an answer value or an unknown key.
+      const mismatch = checkResponseAgainstRequest(entry.request, response);
+      if (mismatch !== undefined) {
+        throw rejection('invalid_request', `this claude question batch was answered invalidly: ${mismatch}`);
       }
 
       // Validation completes before settlement is consumed, so a response this

@@ -366,9 +366,15 @@ export type AgentInteraction = z.infer<typeof AgentInteractionSchema>;
  *
  * All-or-nothing by construction: the key sets must match exactly before any
  * individual answer is looked at, so an adapter never sees a batch it would
- * have to answer partially. Messages name the offending `key` — an
- * adapter-assigned token — and never the prompt or the answer text, both of
- * which are untrusted and may be sensitive.
+ * have to answer partially.
+ *
+ * Every message here is a *bounded classification*. It may name a `key` the
+ * request itself published — an adapter-assigned token already in the durable
+ * event log — and it may state how many things were wrong. It must never carry
+ * a value the caller supplied: a rejected answer is echoed straight into an
+ * `AgentError` and a command receipt, and an answer may be a secret
+ * (`QuestionItem.sensitive`) or attacker-influenced text. An unknown answer
+ * *key* is caller-controlled too, so it is counted rather than repeated.
  */
 function checkQuestionSetAnswers(request: QuestionSetRequest, response: QuestionSetResponse): string | undefined {
   const asked = new Map(request.questions.map((question) => [question.key, question]));
@@ -379,7 +385,7 @@ function checkQuestionSetAnswers(request: QuestionSetRequest, response: Question
   }
   const extra = Object.keys(response.answers).filter((key) => !asked.has(key));
   if (extra.length > 0) {
-    return `answer(s) for question(s) that ${extra.length === 1 ? 'was' : 'were'} not asked: ${extra.join(', ')}`;
+    return `the response carries ${String(extra.length)} answer(s) for question(s) that ${extra.length === 1 ? 'was' : 'were'} not asked`;
   }
 
   for (const question of request.questions) {
@@ -408,7 +414,7 @@ function checkQuestionSetAnswers(request: QuestionSetRequest, response: Question
     const permitted = new Set(question.choices.map((choice) => choice.value));
     const unknown = answer.values.filter((value) => !permitted.has(value));
     if (unknown.length > 0) {
-      return `question \`${question.key}\` has unknown choice value(s): ${unknown.join(', ')}`;
+      return `question \`${question.key}\` names ${String(unknown.length)} choice value(s) it does not offer`;
     }
   }
 
@@ -445,7 +451,8 @@ export function checkResponseAgainstRequest(
     const permitted = new Set(choices.map((choice) => choice.value));
     const unknown = selected.filter((value) => !permitted.has(value));
     if (unknown.length > 0) {
-      return `unknown choice value(s): ${unknown.join(', ')}`;
+      // Counted, never echoed: a rejected answer reaches a durable receipt.
+      return `the answer names ${String(unknown.length)} choice value(s) this question does not offer`;
     }
     return undefined;
   }

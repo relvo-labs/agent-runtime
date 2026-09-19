@@ -234,6 +234,23 @@ const corpus: readonly ParityCase[] = [
       },
     },
   },
+  // Withdrawal: a provider-only payload carrying nothing but the reference it
+  // was given. It must not be able to smuggle a settlement, a timestamp or an
+  // interaction id, all of which belong to the runtime.
+  { schema: 'provider-event-input', value: { payload: { type: 'interaction.withdrawn', providerRef: 'question-1' } } },
+  { schema: 'provider-event-input', value: { payload: { type: 'interaction.withdrawn', providerRef: '' } } },
+  {
+    schema: 'provider-event-input',
+    value: {
+      payload: { type: 'interaction.withdrawn', providerRef: 'question-1', settledAt: timestamp },
+    },
+  },
+  {
+    schema: 'provider-event-input',
+    value: {
+      payload: { type: 'interaction.withdrawn', providerRef: 'question-1', interactionId: 'int_0000000000000001' },
+    },
+  },
   { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
   { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.6' } },
   { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.5' } },

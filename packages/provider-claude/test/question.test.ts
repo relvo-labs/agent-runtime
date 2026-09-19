@@ -551,6 +551,13 @@ describe('claude question lifecycle', () => {
       behavior: 'deny',
       message: 'claude withdrew this question before it was answered',
     });
+
+    // Retiring only this module's own entry would leave the Runtime holding a
+    // pending interaction and the run parked in `awaiting_interaction` for the
+    // rest of its life, so the withdrawal is propagated on the same reference.
+    const withdrawn = bridged.events.filter((event) => event.payload.type === 'interaction.withdrawn');
+    expect(withdrawn).toHaveLength(1);
+    expect(withdrawn[0]?.payload).toStrictEqual({ type: 'interaction.withdrawn', providerRef });
     // The reference is retired, so a host cannot answer into a withdrawn call.
     const error = await rejectionOf(
       bridged.session.respondToInteraction(providerRef, {
@@ -641,3 +648,220 @@ function duplicateOptions(): Record<string, unknown> {
     multiSelect: false,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Neutral bounds, prototype-sensitive keys, and request-aware settlement
+//
+// Three classes of defect that a schema-shaped `AskUserQuestionInput` cannot
+// catch: a tool call that is legal for the *tool* and illegal for the neutral
+// contract, a native answer key that is legal text and hostile as a JavaScript
+// property, and a response that is a valid `InteractionResponse` but not a
+// valid answer to *this* batch.
+// ---------------------------------------------------------------------------
+
+/** Longer than `QuestionItem.prompt`'s 8000-character bound. */
+const OVERLONG_PROMPT = 'p'.repeat(8001);
+
+function boundedInput(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    questions: [
+      {
+        question: 'Which?',
+        header: 'H',
+        options: [
+          { label: 'A', description: 'a' },
+          { label: 'B', description: 'b' },
+        ],
+        multiSelect: false,
+        ...overrides,
+      },
+    ],
+  };
+}
+
+describe('claude neutral-bound refusals', () => {
+  const cases: readonly [string, Record<string, unknown>][] = [
+    ['a prompt past the neutral bound', boundedInput({ question: OVERLONG_PROMPT })],
+    ['a header past the neutral bound', boundedInput({ header: 'h'.repeat(201) })],
+    [
+      'an option label past the neutral bound',
+      boundedInput({
+        options: [
+          { label: 'L'.repeat(401), description: 'a' },
+          { label: 'B', description: 'b' },
+        ],
+      }),
+    ],
+    [
+      'an option description past the neutral bound',
+      boundedInput({
+        options: [
+          { label: 'A', description: 'd'.repeat(2001) },
+          { label: 'B', description: 'b' },
+        ],
+      }),
+    ],
+  ];
+
+  for (const [name, input] of cases) {
+    it(`refuses ${name} whole, raising nothing`, async () => {
+      const fake = createFakeQuery();
+      const bridged = await boundRun(fake);
+
+      // The pinned tool declares counts but no lengths, so this is a perfectly
+      // well-formed `AskUserQuestionInput`. Only the neutral schema can refuse
+      // it — and it must refuse before any entry is retained, or the runtime
+      // discards the malformed event as a diagnostic while the SDK stays
+      // blocked on a question no host will ever see.
+      const result = await fake.requestPermission(CLAUDE_QUESTION_TOOL, input);
+      await flush();
+      expect(result).toStrictEqual({
+        behavior: 'deny',
+        message: 'this host cannot display that question faithfully; ask in your reply instead',
+      });
+      expect(requestsIn(bridged.events)).toHaveLength(0);
+
+      const diagnostics = bridged.events.filter((event) => event.payload.type === 'diagnostic');
+      expect(diagnostics).toHaveLength(1);
+      const message = (diagnostics[0]?.payload as { message: string }).message;
+      expect(message).toContain('neutral_bounds');
+      // A bounded token, never the model-authored text that caused it.
+      expect(message).not.toContain('pppp');
+    });
+  }
+
+  it('stays able to raise the next, valid question', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    await fake.requestPermission(CLAUDE_QUESTION_TOOL, boundedInput({ question: OVERLONG_PROMPT }));
+    await flush();
+
+    const { batch } = await ask(fake, bridged);
+    expect(batch.questions).toHaveLength(2);
+  });
+});
+
+describe('claude prototype-sensitive native answer keys', () => {
+  const hostile = (text: string): Record<string, unknown> => ({
+    question: text,
+    header: 'H',
+    options: [
+      { label: 'A', description: 'a' },
+      { label: 'B', description: 'b' },
+    ],
+    multiSelect: false,
+  });
+
+  it('answers questions whose text is `__proto__`, `constructor` or ordinary', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const { decision, providerRef, batch } = await ask(fake, bridged, {
+      questions: [hostile('__proto__'), hostile('constructor'), hostile('Which database?')],
+    });
+
+    expect(bridged.session.respondToInteraction(providerRef, firstChoiceAnswers(batch))).toBeInstanceOf(Promise);
+    const result = (await decision) as { behavior: string; updatedInput?: { answers?: Record<string, string> } };
+    expect(result.behavior).toBe('allow');
+    const answers = result.updatedInput?.answers ?? {};
+
+    // Own data properties, not a reassigned prototype: `answers.__proto__ = x`
+    // would leave `{}` here and answer nothing while reporting success.
+    expect(Object.hasOwn(answers, '__proto__')).toBe(true);
+    expect(Object.hasOwn(answers, 'constructor')).toBe(true);
+    expect(Object.hasOwn(answers, 'Which database?')).toBe(true);
+    // Compared through JSON rather than an object literal, because a literal
+    // `{ __proto__: 'A' }` is itself a prototype assignment — the very trap
+    // this test exists for.
+    const serialized = JSON.parse(JSON.stringify(answers)) as Record<string, string>;
+    // A `Map` so the lookup itself cannot be confused with a prototype read.
+    const byKey = new Map(Object.entries(serialized));
+    expect([...byKey.keys()].sort()).toStrictEqual(['Which database?', '__proto__', 'constructor']);
+    expect(byKey.get('__proto__')).toBe('A');
+    expect(byKey.get('constructor')).toBe('A');
+    expect(byKey.get('Which database?')).toBe('A');
+    // The object's own prototype is untouched.
+    expect(Object.getPrototypeOf(answers)).toBe(Object.prototype);
+  });
+});
+
+describe('claude request-aware settlement at the public SPI', () => {
+  /**
+   * `ProviderSession.respondToInteraction` is publicly callable. The Runtime
+   * validates against its own copy of the request first, but a host holding a
+   * session can call this directly, so the adapter applies the same
+   * request-aware checks before consuming its one settlement.
+   */
+  const invalid: readonly [string, () => InteractionResponse][] = [
+    [
+      'an answer for a question that was not asked',
+      () => ({
+        kind: 'question_set',
+        answers: {
+          q1: { type: 'selection', values: ['o1'] },
+          q2: { type: 'selection', values: ['o1'] },
+          EXTRA_KEY: { type: 'text', text: 'smuggled' },
+        },
+      }),
+    ],
+    [
+      'two selections on a single-select question',
+      () => ({
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1', 'o2'] }, q2: { type: 'selection', values: ['o1'] } },
+      }),
+    ],
+    [
+      'a repeated selection',
+      () => ({
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1'] }, q2: { type: 'selection', values: ['o1', 'o1'] } },
+      }),
+    ],
+    [
+      'a choice value this question does not offer',
+      () => ({
+        kind: 'question_set',
+        answers: {
+          q1: { type: 'selection', values: ['SYNTHETIC_SECRET_MARKER'] },
+          q2: { type: 'selection', values: ['o1'] },
+        },
+      }),
+    ],
+  ];
+
+  for (const [name, build] of invalid) {
+    it(`rejects ${name} and leaves the question answerable`, async () => {
+      const fake = createFakeQuery();
+      const bridged = await boundRun(fake);
+      const { decision, providerRef, batch } = await ask(fake, bridged);
+      const settled = pendingMarker(decision);
+
+      const error = await rejectionOf(bridged.session.respondToInteraction(providerRef, build()));
+      expect(error.code).toBe('invalid_request');
+      // Bounded classification only: no answer value, no unknown key.
+      expect(error.message).not.toContain('SYNTHETIC_SECRET_MARKER');
+      expect(error.message).not.toContain('EXTRA_KEY');
+      expect(error.message).not.toContain('smuggled');
+      await flush();
+      // The single settlement was not consumed by an answer nobody can act on.
+      expect(settled.settled).toBe(false);
+
+      await bridged.session.respondToInteraction(providerRef, firstChoiceAnswers(batch));
+      const result = (await decision) as { behavior: string };
+      expect(result.behavior).toBe('allow');
+    });
+  }
+
+  it('rejects a response that is not an interaction response at all', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const { providerRef } = await ask(fake, bridged);
+    const error = await rejectionOf(
+      bridged.session.respondToInteraction(providerRef, {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: [] } },
+      } as unknown as InteractionResponse),
+    );
+    expect(error.code).toBe('invalid_request');
+  });
+});

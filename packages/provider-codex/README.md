@@ -114,24 +114,49 @@ one neutral `question_set` interaction on the run that owns `(threadId, turnId)`
 request is replied to with the whole `{ answers: { [questionId]: { answers } } }` map. It
 is not a follow-up turn and not an approval.
 
-| Native form                          | Bridged            | Notes                                                                                                                                                                                      |
-| ------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| choice question (`options`)          | **yes**            | Single-select only — see below. The native answer is the option's `label`.                                                                                                                 |
-| free-text question (`options: null`) | **yes**            | Carried as a question with no choices; the answer is a one-element array holding the typed text.                                                                                           |
-| `isOther: true`                      | **yes**            | Carried as `allowFreeText: true`: choices plus typed text. The user's text is sent verbatim.                                                                                               |
-| `isSecret: true`                     | **yes**            | Carried as `sensitive: true` so a host can mask input. Advisory display guidance, not an enforced control.                                                                                 |
-| several questions in one request     | **yes**            | Raised as one ordered batch, answered as one unit. A partial answer is refused before any native reply is written.                                                                         |
-| multi-select                         | no — not offered   | `ToolRequestUserInputQuestion` has no field permitting several answers. The reply array can hold them; the request never says they are allowed, so none is offered rather than guessed at. |
-| `isBlocking: false`                  | no — refused whole | A turn that does not wait cannot be resumed by an answer, so asking a host for one would be misleading.                                                                                    |
-| `autoResolutionMs` (deprecated)      | no — refused whole | It asks the client to answer _for_ the user after an interval. This adapter never fabricates an answer and imposes no settlement deadline.                                                 |
-| duplicate question `id`              | no — refused whole | The native answer map is keyed by it, so duplicates cannot both be answered.                                                                                                               |
-| duplicate option `label`             | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                                                                                                   |
-| cancellation / withdrawal            | n/a                | The protocol has no withdrawal for this request. Turn completion, interrupt, disposal and EOF retire it — see below.                                                                       |
+| Native form                          | Bridged            | Notes                                                                                                                                                                                                                                                                                             |
+| ------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| choice question (`options`)          | **yes**            | Single-select only — see below. The native answer is the option's `label`.                                                                                                                                                                                                                        |
+| free-text question (`options: null`) | **yes**            | Carried as a question with no choices; the answer is a one-element array holding the typed text.                                                                                                                                                                                                  |
+| `isOther: true`                      | **yes**            | Carried as `allowFreeText: true`: choices plus typed text. The user's text is sent verbatim.                                                                                                                                                                                                      |
+| `isSecret: true`                     | **yes**            | Carried as `sensitive: true` so a host can mask input. Advisory display guidance, not an enforced control.                                                                                                                                                                                        |
+| several questions in one request     | **yes**            | Raised as one ordered batch, answered as one unit. A partial answer is refused before any native reply is written.                                                                                                                                                                                |
+| multi-select                         | no — not offered   | `ToolRequestUserInputQuestion` has no field permitting several answers. The reply array can hold them; the request never says they are allowed, so none is offered rather than guessed at.                                                                                                        |
+| `isBlocking: false`                  | no — refused whole | A turn that does not wait cannot be resumed by an answer, so asking a host for one would be misleading.                                                                                                                                                                                           |
+| `autoResolutionMs` (deprecated)      | no — refused whole | It asks the client to answer _for_ the user after an interval. This adapter never fabricates an answer and imposes no settlement deadline.                                                                                                                                                        |
+| duplicate question `id`              | no — refused whole | The native answer map is keyed by it, so duplicates cannot both be answered.                                                                                                                                                                                                                      |
+| duplicate option `label`             | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                                                                                                                                                                                                          |
+| cancellation / withdrawal            | **yes**            | `serverRequest/resolved` (`{ threadId, requestId }`) retires a request the server settled itself. The batch is withdrawn on the Runtime, the run leaves `awaiting_interaction`, and nothing is written on the native id. Turn completion, interrupt, disposal and EOF also retire it — see below. |
+
+A request whose translation is valid for the app-server but invalid as a neutral
+`question_set` — a prompt, header, option label or description past the neutral bound, or
+more options than a neutral choice list carries — is refused on the same terms
+(`neutral_bounds`). `ToolRequestUserInputParams` declares no lengths and no option limit,
+so the neutral schema is the only thing that can say, and the whole translated request is
+validated **before** any entry is retained or any interaction raised: a batch the Runtime
+would discard as malformed must never leave a blocking native request waiting for an
+answer no host was ever shown.
 
 A refused request is declined with `-32602` on its own native id and **raises no
 interaction**; one that does not name the active turn, has no run to own it, or exceeds the
 per-session bound is declined with `-32600`. The refusal diagnostic carries a bounded
 reason token and no prompt, option or answer text.
+
+**Withdrawal.** `serverRequest/resolved` is a notification carrying `{ threadId, requestId }`
+and no `turnId`, so it is correlated by the native request id this adapter retained. It
+confirms an answer already sent — harmless, nothing further is written — and it retires a
+request the server resolved by itself. In the second case the adapter writes nothing on
+that id, fences it against any later reply, and emits `interaction.withdrawn` to the
+Runtime, which settles the interaction `withdrawn`, clears its routing and lets the turn
+continue. Retiring only the adapter's own entry would leave the run parked in
+`awaiting_interaction` for the rest of its life and turn its eventual completion into a
+`provider_contract_violation`.
+
+**Each bridge is opted into separately.** `questions: 'bridge'` does not enable the
+approval bridge: with `approvals` unset, `item/commandExecution/requestApproval` is still
+declined with `-32601` and no approval interaction is raised, which is what the descriptor's
+`interaction.approval` and `extensions.bridgedServerRequests` say. Each enabled method is
+listed in `bridgedServerRequests`, and only the enabled ones.
 
 **No experimental capability is enabled.** `initialize.params.capabilities` stays `null`.
 The types were previously believed to be gated behind `InitializeCapabilities.experimentalApi`;

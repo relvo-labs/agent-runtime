@@ -279,6 +279,11 @@ export function createCodexClient(
           return true;
         };
         const offer: CodexServerRequestOffer = {
+          // Adapter-private correlation for `serverRequest/resolved`, which
+          // names a request by this id and nothing else. The reply itself
+          // still goes through the closures below, so handing the id over
+          // cannot produce a second reply on it.
+          id: message.id,
           method: message.method,
           params: message.params,
           respond: (result: JsonValue) => reply({ id: message.id, result }),

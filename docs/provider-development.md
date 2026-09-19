@@ -49,6 +49,28 @@ Four rules an adapter bridging questions must follow:
 4. **Do not invent a deadline.** If a native request asks the client to auto-resolve after
    an interval, refuse it unless the contract has an expiry semantic to map it onto.
    Answering late, or answering for the user, are both fabrications.
+5. **Validate the translation, not just the native request.** Parse your complete
+   translated `QuestionSetRequest` through the protocol schema before retaining a callback
+   or emitting an event. Native surfaces bound counts, not text lengths, so a well-formed
+   native request can translate to an invalid neutral one. The runtime discards a malformed
+   provider event as a diagnostic — so retaining first and validating later does not
+   produce a refusal, it produces a hang: a blocking native request waiting forever on an
+   interaction nobody was ever shown.
+6. **Propagate withdrawal, not just retirement.** When the native surface takes a question
+   back while the run continues — an aborted `AbortSignal`, a `serverRequest/resolved` for
+   an unanswered request — retiring your own entry is only half of it. Emit
+   `{ type: 'interaction.withdrawn', providerRef }` on the run's sink so the runtime settles
+   the interaction `withdrawn` and clears its routing. Without it the run is parked in
+   `awaiting_interaction` permanently and its own eventual success is recorded as a
+   `provider_contract_violation`.
+7. **Build native answer dictionaries safely.** A native answer map keyed by a question id
+   or a question text is keyed by _arbitrary_ strings. Use `Object.fromEntries`, a
+   null-prototype object or `Object.defineProperty`; `map[key] = value` silently reassigns
+   the prototype for `__proto__` and serialises as `{}` — a reply that answers nothing
+   while your adapter reports the batch settled.
+8. **Keep each bridge independently opt-in.** A question is the model asking the _user_
+   something; an approval is the model asking permission to _act_. Enabling one must never
+   enable the other, and the capability descriptor must describe what is actually bridged.
 
 Questions and answers are **untrusted and potentially sensitive**, and they are durable:
 the request is committed as `interaction.requested`, the answer as `interaction.settled`,
@@ -57,7 +79,16 @@ a host can mask input, but state plainly that it is display guidance and not an 
 control — the runtime stores the answer either way. A host that must not retain a secret
 refuses the interaction rather than answering it. No adapter may copy prompt, option or
 answer text into a diagnostic, an `AgentError` message or a `providerCode`; classify
-refusals with bounded tokens instead.
+refusals with bounded tokens instead. The protocol holds itself to the same rule:
+`checkResponseAgainstRequest` returns a bounded classification, so a rejected answer — which
+the runtime records verbatim-free on a durable command receipt — never carries the value or
+the unknown key that caused it.
+
+`ProviderSession.respondToInteraction` is public SPI. The runtime validates a response
+against its own copy of the request before it ever calls you, but a host holding a session
+can call you directly, so apply `InteractionResponseSchema` **and**
+`checkResponseAgainstRequest` against the request you retained before consuming your one
+settlement. An invalid call must leave the interaction answerable by a later valid one.
 
 ## Cleanup an adapter owns before a session exists
 

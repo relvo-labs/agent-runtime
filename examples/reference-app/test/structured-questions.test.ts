@@ -30,6 +30,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CommandIdSchema,
   InteractionRequestSchema,
+  SequenceSchema,
   createCounterIdFactory,
   createFixedClock,
   type Clock,
@@ -205,12 +206,16 @@ function fakeClaudeQuery() {
     end(): void {
       finish?.();
     },
-    askQuestion(input: Record<string, unknown>): Promise<unknown> {
+    /**
+     * Invoke the installed callback exactly as the pinned SDK does.
+     *
+     * The controller is exposed because withdrawal *is* an abort of that one
+     * request's signal: the SDK gives each permission control request its own
+     * `AbortController`, and aborting it is how it takes a question back.
+     */
+    askQuestion(input: Record<string, unknown>, controller = new AbortController()): Promise<unknown> {
       if (installed === undefined) throw new Error('the adapter installed no host callback');
-      return installed('AskUserQuestion', input, {
-        signal: new AbortController().signal,
-        toolUseID: 'toolu_fixture_1',
-      });
+      return installed('AskUserQuestion', input, { signal: controller.signal, toolUseID: 'toolu_fixture_1' });
     },
     query(params: { prompt: AsyncIterable<{ uuid?: string }>; options: Record<string, unknown> }) {
       installed = params.options.canUseTool as typeof installed;
@@ -250,7 +255,7 @@ const CLAUDE_ASK_INPUT = {
   ],
 };
 
-async function claudeVertical() {
+async function claudeRunning() {
   const fake = fakeClaudeQuery();
   const vertical = await buildRuntime(
     createClaudeProvider({ query: fake.query as never, questions: 'bridge' }),
@@ -271,9 +276,14 @@ async function claudeVertical() {
     user_message_uuid: fake.promptUuid,
   });
   await settle(vertical.runtime);
-  const decision = fake.askQuestion(CLAUDE_ASK_INPUT);
-  await settle(vertical.runtime);
-  return { ...vertical, fake, decision, runId: accepted.result.runId };
+  return { ...vertical, fake, runId: accepted.result.runId };
+}
+
+async function claudeVertical(input: Record<string, unknown> = CLAUDE_ASK_INPUT, controller?: AbortController) {
+  const running = await claudeRunning();
+  const decision = running.fake.askQuestion(input, controller);
+  await settle(running.runtime);
+  return { ...running, decision };
 }
 
 describe('claude structured questions through the runtime', () => {
@@ -691,5 +701,408 @@ describe('codex structured questions through the runtime', () => {
     expect(receipt.disposition).toBe('rejected');
     expect(receipt.error?.code).toBe('unknown_interaction');
     expect(codexReplies(vertical.fake)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Withdrawal, neutral bounds, non-leak and independent opt-in — all through the
+// real Runtime, because each of these failures is only observable there: the
+// adapter reports success while the *session* is left with a pending
+// interaction, a parked run, or a secret in a durable receipt.
+// ---------------------------------------------------------------------------
+
+/** Every event the session recorded, as one string, for a leak scan. */
+async function allEventsText(vertical: Vertical): Promise<string> {
+  const page = await vertical.runtime.readEvents(vertical.sessionId, SequenceSchema.parse(0), 10_000);
+  return JSON.stringify(page);
+}
+
+/** The single interaction the session holds, whatever its status. */
+async function soleInteraction(vertical: Vertical) {
+  const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+  expect(snapshot?.interactions).toHaveLength(1);
+  const interaction = snapshot?.interactions[0];
+  if (interaction === undefined) throw new Error('no interaction');
+  return interaction;
+}
+
+const CLAUDE_SECOND_ASK = {
+  questions: [
+    {
+      question: 'Which cache?',
+      header: 'Cache',
+      options: [
+        { label: 'Redis', description: 'Remote' },
+        { label: 'Memory', description: 'Local' },
+      ],
+      multiSelect: false,
+    },
+  ],
+};
+
+describe('claude question withdrawal through the runtime', () => {
+  it('settles the interaction withdrawn, resumes the run, and lets it succeed', async () => {
+    const controller = new AbortController();
+    const vertical = await claudeVertical(CLAUDE_ASK_INPUT, controller);
+    const { interactionId } = await pendingBatch(vertical);
+
+    // The SDK takes the question back: it aborts that request's signal.
+    controller.abort();
+    await settle(vertical.runtime);
+
+    await expect(vertical.decision).resolves.toMatchObject({ behavior: 'deny' });
+    const withdrawn = await soleInteraction(vertical);
+    expect(withdrawn.status).toBe('settled');
+    expect(withdrawn.settlement?.outcome).toBe('withdrawn');
+    expect(withdrawn.settlement?.response).toBeUndefined();
+
+    // The run left `awaiting_interaction`, so its own success is a success.
+    const resumed = await vertical.runtime.getSession(vertical.sessionId);
+    expect(resumed?.runs.at(-1)?.state).toBe('running');
+    expect(resumed?.runs.at(-1)?.pendingInteractionIds).toStrictEqual([]);
+
+    // A competing answer arriving after the withdrawal fails safely.
+    const late = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1'] }, q2: { type: 'selection', values: ['o1'] } },
+      },
+    });
+    expect(late.disposition).toBe('rejected');
+    expect(late.error?.code).toBe('interaction_already_settled');
+
+    // No resurrection: still one interaction, still settled withdrawn.
+    const unchanged = await soleInteraction(vertical);
+    expect(unchanged.settlement?.outcome).toBe('withdrawn');
+
+    vertical.fake.push({
+      type: 'result',
+      subtype: 'success',
+      is_error: false,
+      user_message_uuid: vertical.fake.promptUuid,
+    });
+    await settle(vertical.runtime);
+
+    const final = await vertical.runtime.getSession(vertical.sessionId);
+    expect(final?.runs.at(-1)?.runId).toBe(vertical.runId);
+    expect(final?.runs.at(-1)?.state).toBe('succeeded');
+    expect(final?.runs.at(-1)?.termination?.outcome).toBe('succeeded');
+    // The defect this test exists for: a withdrawal the Runtime never heard
+    // about turned this success into a contract violation.
+    expect(await allEventsText(vertical)).not.toContain('provider_contract_violation');
+  });
+
+  it('asks and answers a further question after a withdrawal', async () => {
+    const controller = new AbortController();
+    const vertical = await claudeVertical(CLAUDE_ASK_INPUT, controller);
+    await pendingBatch(vertical);
+    controller.abort();
+    await settle(vertical.runtime);
+
+    const second = vertical.fake.askQuestion(CLAUDE_SECOND_ASK);
+    await settle(vertical.runtime);
+    const { interactionId, batch } = await pendingBatch(vertical);
+    expect(batch.questions.map((question) => question.prompt)).toStrictEqual(['Which cache?']);
+
+    const receipt = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: { kind: 'question_set', answers: { q1: { type: 'selection', values: ['o1'] } } },
+    });
+    expect(receipt.disposition).toBe('applied');
+    await expect(second).resolves.toMatchObject({
+      behavior: 'allow',
+      updatedInput: { answers: { 'Which cache?': 'Redis' } },
+    });
+
+    const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+    expect(snapshot?.interactions.map((entry) => entry.settlement?.outcome)).toStrictEqual(['withdrawn', 'responded']);
+    expect(snapshot?.runs.at(-1)?.state).toBe('running');
+  });
+});
+
+describe('neutral bounds refused before any interaction exists', () => {
+  const OVERLONG = 'p'.repeat(8001);
+
+  it('claude refuses an out-of-bounds AskUserQuestion whole and stays usable', async () => {
+    const vertical = await claudeVertical({
+      questions: [
+        {
+          question: OVERLONG,
+          header: 'Database',
+          options: [
+            { label: 'PostgreSQL', description: 'Relational' },
+            { label: 'SQLite', description: 'Embedded' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    });
+
+    // Nothing pending, nothing malformed reached the store, and the run is not
+    // parked on a question no host can be shown.
+    const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+    expect(snapshot?.interactions).toStrictEqual([]);
+    expect(snapshot?.runs.at(-1)?.state).toBe('running');
+    await expect(vertical.decision).resolves.toMatchObject({ behavior: 'deny' });
+
+    const events = await allEventsText(vertical);
+    expect(events).toContain('neutral_bounds');
+    // The refusal is a bounded token; the model-authored text never lands.
+    expect(events).not.toContain('pppp');
+
+    // Still able to ask something it can represent.
+    const second = vertical.fake.askQuestion(CLAUDE_SECOND_ASK);
+    await settle(vertical.runtime);
+    const { interactionId } = await pendingBatch(vertical);
+    const receipt = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: { kind: 'question_set', answers: { q1: { type: 'selection', values: ['o1'] } } },
+    });
+    expect(receipt.disposition).toBe('applied');
+    await expect(second).resolves.toMatchObject({ behavior: 'allow' });
+  });
+
+  it('codex refuses an out-of-bounds requestUserInput on its own native id', async () => {
+    const fake = fakeCodexTransport();
+    const vertical = await buildRuntime(
+      createCodexProvider({ transport: () => fake.transport as never, questions: 'bridge' }),
+      'codex',
+    );
+    const accepted = await vertical.runtime.submitTurn({
+      commandId: vertical.next(),
+      type: 'submit_turn',
+      sessionId: vertical.sessionId,
+      input: { parts: [{ type: 'text', text: 'design the service' }] },
+    });
+    if (accepted.result?.type !== 'turn_accepted') throw new Error('submit_turn failed');
+    await settle(vertical.runtime);
+
+    const frame = codexQuestionFrame() as { params: { questions: Record<string, unknown>[] } };
+    frame.params.questions = [
+      {
+        id: 'native-a',
+        header: 'Database',
+        question: OVERLONG,
+        isOther: false,
+        isSecret: false,
+        options: [{ label: 'PostgreSQL', description: 'Relational' }],
+      },
+    ];
+    fake.push(frame as unknown as Record<string, unknown>);
+    await settle(vertical.runtime);
+
+    const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+    expect(snapshot?.interactions).toStrictEqual([]);
+    expect(snapshot?.runs.at(-1)?.state).toBe('running');
+    // Answered on its own id — a blocking request left unanswered stalls the
+    // turn — with `-32602`, not a half-mapped batch.
+    expect(codexReplies(fake)[0]).toMatchObject({ error: { code: -32602 } });
+
+    const events = await allEventsText(vertical);
+    expect(events).toContain('neutral_bounds');
+    expect(events).not.toContain('pppp');
+  });
+});
+
+describe('rejected answers never reach a durable record', () => {
+  // Split so the repository's own static scan does not read this fixture as an
+  // assigned credential; it is a marker, and its only job is to be absent.
+  const MARKER = ['SYNTHETIC', 'SECRET', 'MARKER'].join('_');
+
+  it('claude: a rejected choice value is absent from the receipt and every event', async () => {
+    const vertical = await claudeVertical();
+    const { interactionId } = await pendingBatch(vertical);
+
+    const receipt = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: {
+          q1: { type: 'selection', values: [MARKER] },
+          q2: { type: 'selection', values: ['o1'] },
+        },
+      },
+    });
+    expect(receipt.disposition).toBe('rejected');
+    expect(receipt.error?.code).toBe('invalid_request');
+    expect(JSON.stringify(receipt)).not.toContain(MARKER);
+    expect(await allEventsText(vertical)).not.toContain(MARKER);
+
+    // Rejecting must not burn the one settlement.
+    const applied = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1'] }, q2: { type: 'selection', values: ['o1'] } },
+      },
+    });
+    expect(applied.disposition).toBe('applied');
+  });
+
+  it('codex: a rejected unknown answer key is counted, never echoed', async () => {
+    const vertical = await codexVertical();
+    const { interactionId } = await pendingBatch(vertical);
+
+    const receipt = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: {
+          q1: { type: 'selection', values: ['o1'] },
+          q2: { type: 'text', text: 'tok' },
+          UNASKED: { type: 'text', text: MARKER },
+        },
+      },
+    });
+    expect(receipt.disposition).toBe('rejected');
+    expect(JSON.stringify(receipt)).not.toContain(MARKER);
+    expect(JSON.stringify(receipt)).not.toContain('UNASKED');
+    const events = await allEventsText(vertical);
+    expect(events).not.toContain(MARKER);
+    expect(events).not.toContain('UNASKED');
+  });
+});
+
+describe('codex server-side resolution through the runtime', () => {
+  const CODEX_RESOLVED = {
+    method: 'serverRequest/resolved',
+    params: { threadId: CODEX_THREAD, requestId: CODEX_REQUEST_ID },
+  };
+
+  it('withdraws an unanswered request, resumes the turn, and completes it', async () => {
+    const vertical = await codexVertical();
+    const { interactionId } = await pendingBatch(vertical);
+
+    vertical.fake.push(CODEX_RESOLVED);
+    await settle(vertical.runtime);
+
+    const withdrawn = await soleInteraction(vertical);
+    expect(withdrawn.settlement?.outcome).toBe('withdrawn');
+    // Nothing was written on the native id: the server resolved it itself.
+    expect(codexReplies(vertical.fake)).toHaveLength(0);
+
+    const resumed = await vertical.runtime.getSession(vertical.sessionId);
+    expect(resumed?.runs.at(-1)?.state).toBe('running');
+
+    const late = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1'] }, q2: { type: 'text', text: 'tok' } },
+      },
+    });
+    expect(late.disposition).toBe('rejected');
+    expect(late.error?.code).toBe('interaction_already_settled');
+    expect(codexReplies(vertical.fake)).toHaveLength(0);
+
+    vertical.fake.push({
+      method: 'turn/completed',
+      params: {
+        threadId: CODEX_THREAD,
+        turn: {
+          id: CODEX_TURN,
+          items: [],
+          itemsView: 'complete',
+          status: 'completed',
+          error: null,
+          startedAt: 1,
+          completedAt: 2,
+          durationMs: 1,
+        },
+      },
+    });
+    await settle(vertical.runtime);
+
+    const final = await vertical.runtime.getSession(vertical.sessionId);
+    expect(final?.runs.at(-1)?.state).toBe('succeeded');
+    expect(await allEventsText(vertical)).not.toContain('provider_contract_violation');
+  });
+
+  it('is idempotent across duplicate resolutions', async () => {
+    const vertical = await codexVertical();
+    await pendingBatch(vertical);
+    vertical.fake.push(CODEX_RESOLVED);
+    vertical.fake.push(CODEX_RESOLVED);
+    await settle(vertical.runtime);
+
+    const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+    expect(snapshot?.interactions).toHaveLength(1);
+    expect(snapshot?.interactions[0]?.settlement?.outcome).toBe('withdrawn');
+    expect(snapshot?.runs.at(-1)?.state).toBe('running');
+  });
+
+  it('treats a resolution after a host answer as a harmless confirmation', async () => {
+    const vertical = await codexVertical();
+    const { interactionId } = await pendingBatch(vertical);
+    const receipt = await vertical.runtime.respondToInteraction({
+      commandId: vertical.next(),
+      type: 'respond_to_interaction',
+      sessionId: vertical.sessionId,
+      interactionId,
+      response: {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1'] }, q2: { type: 'text', text: 'tok' } },
+      },
+    });
+    expect(receipt.disposition).toBe('applied');
+
+    vertical.fake.push(CODEX_RESOLVED);
+    await settle(vertical.runtime);
+
+    const settledInteraction = await soleInteraction(vertical);
+    expect(settledInteraction.settlement?.outcome).toBe('responded');
+    expect(codexReplies(vertical.fake)).toHaveLength(1);
+  });
+});
+
+describe('codex approval bridging stays independently opt-in through the runtime', () => {
+  it('declines a command approval in questions-only mode and raises nothing', async () => {
+    const vertical = await codexVertical();
+    const approvalId = 802;
+    vertical.fake.push({
+      id: approvalId,
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        kind: 'command',
+        threadId: CODEX_THREAD,
+        turnId: CODEX_TURN,
+        itemId: 'item-approval-1',
+        startedAtMs: 1_700_000_000_000,
+        environmentId: null,
+        command: 'rm -rf ./build',
+        cwd: '/workspace',
+        reason: 'clear the build directory',
+      },
+    });
+    await settle(vertical.runtime);
+
+    const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+    // Exactly the one question batch; no approval interaction was created.
+    expect(snapshot?.interactions.map((entry) => entry.request.kind)).toStrictEqual(['question_set']);
+    const reply = vertical.fake.sent.find((message) => message.id === approvalId && message.method === undefined);
+    expect(reply).toMatchObject({ error: { code: -32601 } });
+    expect(JSON.stringify(vertical.fake.sent)).not.toContain('"decision"');
   });
 });

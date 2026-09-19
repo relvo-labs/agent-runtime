@@ -102,7 +102,7 @@ tell "asks one question" from "asks up to four, one of which may be a secret" be
 starts. Defaults stay conservative (`false` / `null`), so an adapter that forgets a field
 under-promises (ADR-0015).
 
-### 5. Fail closed, whole-request
+### 5. Fail closed, whole-request, against the neutral schema
 
 A native request this adapter cannot represent faithfully is refused **in full**, on its own
 native request id / callback, and raises no interaction. Refusal is always preferable to a
@@ -110,12 +110,58 @@ partial rendering, because a user cannot meaningfully answer a question they wer
 incomplete version of. The per-adapter matrices live in each adapter's README and are
 reproduced in `docs/provider-development.md`.
 
-### 6. `WIRE_VERSION` 0.4 → 0.5
+"Faithfully" includes "within the neutral bounds". Neither native surface declares text
+lengths — `AskUserQuestionInput` bounds counts only, and `ToolRequestUserInputParams`
+bounds nothing — so an 8001-character prompt is a well-formed native request and an invalid
+`QuestionSetRequest`. Each adapter therefore parses its **complete translated request**
+through `QuestionSetRequestSchema` before retaining any entry or emitting any event, and
+refuses the whole native request with a bounded token when it fails.
+
+This ordering is load-bearing rather than tidy. The Runtime discards a malformed
+`ProviderEventInput` as a diagnostic; if the adapter had already retained the native
+callback, the result would be a blocking native request waiting forever on an answer to an
+interaction that was never raised — a hang, not a refusal.
+
+### 6. Withdrawal is a first-class provider event
+
+`ProviderEventPayload` gains `{ type: 'interaction.withdrawn', providerRef }`. The Runtime
+records it as an `interaction.settled` event with a `withdrawn` outcome on the interaction
+that reference raised, clears its routing, and lets the run leave
+`awaiting_interaction`. Identity and time stay the Runtime's, exactly as for
+`interaction.requested`: a provider states which of _its own_ references it is withdrawing
+and nothing else, so it cannot settle an interaction it did not raise or stamp a time.
+
+It exists because both pinned surfaces can withdraw a question while the run continues:
+
+- **Claude** aborts that request's `AbortSignal`, and then keeps waiting on the callback.
+- **Codex** sends `serverRequest/resolved` (`{ threadId, requestId }`), which both confirms
+  an answer already sent and retires a request the server resolved itself. It carries no
+  `turnId`, so it is correlated by the native request id the adapter retained — which is
+  why the adapter's own interaction registry holds that id.
+
+Without this payload an adapter can only retire its own callback. The interaction stays
+pending, the run stays parked in `awaiting_interaction` for the rest of its life, and the
+provider's own eventual success is recorded as a `provider_contract_violation` — the run
+completed while an interaction it owns was unsettled. A withdrawal that arrives after a
+response has already reached the provider is ignored by the Runtime: a retained settlement
+is logically ahead of it.
+
+`PROVIDER_EMITTABLE_EVENT_TYPES` is consequently typed as `ProviderEventPayload['type'][]`
+rather than `EventType[]`, because `interaction.withdrawn` is a provider payload that has
+no `EventPayload` member of its own.
+
+### 7. `WIRE_VERSION` 0.4 → 0.5
 
 Required by the table in `runtime-contract-evolution`: adding a member to a closed
 discriminated union, and adding fields to the strict `QuestionCapability` object, are both
 breaking. `SCHEMA_ID_BASE` moves with it, so every generated `$id` changes from
 `…/agent-runtime/0.4/…` to `…/agent-runtime/0.5/…`.
+
+The `interaction.withdrawn` provider payload in §6 is a member added to a closed union and
+is therefore breaking by the same table. It does **not** move the line again: `0.5` has
+never been published, and `runtime-contract-evolution` permits a release-blocker correction
+to refine a candidate line before its first publication. `0.5` is the line that carries the
+whole of ADR-0018, withdrawal included; nothing outside this repository encodes it.
 
 `docs/architecture/foundation-v0.4.md` keeps its filename: it documents the foundation
 milestone, not the wire minor, and renaming it would churn the skill ownership map for no
@@ -178,6 +224,15 @@ Multi-select answers are joined with `', '` because the pinned `AskUserQuestionI
 value type is `string`. The batch is answered in one callback return, so aggregation is
 atomic by construction.
 
+The native answer map is keyed by the **question text**, which is model-authored and
+unconstrained, so it is built with `Object.fromEntries`. Assigning `answers[text] = value`
+would reassign the object's prototype for a question called `__proto__` and serialise as
+`{}` — answering nothing while reporting success. Codex has the same hazard on its native
+question `id`, and the same fix.
+
+Withdrawal is `CanUseTool`'s `AbortSignal`: the SDK aborts that one request's signal and
+keeps waiting on the promise. See §6.
+
 ### Codex — app-server / CLI `0.153.4`
 
 `item/tool/requestUserInput` is answered on its own native JSON-RPC request id with
@@ -186,6 +241,19 @@ atomic by construction.
 `thread`/`turn`/`item` correlation is enforced before any interaction is raised: a request
 whose `(threadId, turnId)` is not the active run's pair is refused with `-32600` and raises
 nothing, exactly as command approvals already are.
+
+`serverRequest/resolved` (`{ threadId, requestId }`) is the app-server's resolution
+notification for its own outstanding requests. It carries no `turnId`, so it is correlated
+by the native request id the adapter retained alongside the entry — the one place a native
+`RequestId` is held outside the client layer, compared and never published. A resolution of
+an already-answered request is a confirmation and does nothing; a resolution of an
+unanswered one is a withdrawal, and is handled as §6 describes.
+
+The two bridges are independently opted into. `questions: 'bridge'` must not enable command
+approvals: it changes nothing about `approvalPolicy`, and
+`item/commandExecution/requestApproval` is still declined with `-32601` unless
+`approvals: 'bridge'` was also asked for. `extensions.bridgedServerRequests` lists exactly
+the enabled methods.
 
 **No experimental capability is enabled.** The earlier refusal note in this repository stated
 that `ToolRequestUserInput*` is "gated behind `InitializeCapabilities.experimentalApi`". The
@@ -217,6 +285,12 @@ documented for hosts in `docs/provider-development.md` and both adapter READMEs:
 - No adapter copies question or answer text into a diagnostic, an `AgentError` message, or a
   `providerCode`. Refusals are classified by bounded tokens (`provider-adapter-development`,
   step 9).
+- Neither does the protocol. `checkResponseAgainstRequest` returns a bounded classification,
+  and the Runtime wraps that reason in an `AgentError` on a durable command receipt. It may
+  name a `key` the request already published — an adapter-assigned token — and it may state
+  _how many_ values or unknown keys were wrong, but it never repeats a rejected answer value
+  or a caller-supplied answer key. A rejected answer to a `sensitive: true` question would
+  otherwise be written into the event log by the very act of refusing it.
 - Option `preview` content is not carried. Claude only generates previews when
   `toolConfig.askUserQuestion.previewFormat` is set, which this adapter never sets; a request
   that carries one anyway is refused whole, because silently dropping a preview changes what

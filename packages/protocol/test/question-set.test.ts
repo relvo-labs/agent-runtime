@@ -123,27 +123,36 @@ describe('question_set response', () => {
     expect(checkResponseAgainstRequest(batch, response)).toContain('unanswered');
   });
 
-  it('refuses an answer for a question that was not asked', () => {
+  it('refuses an answer for a question that was not asked, counting it rather than naming it', () => {
     const response = QuestionSetResponseSchema.parse(
       answer({
         q1: { type: 'selection', values: ['pg'] },
         q2: { type: 'selection', values: ['eu'] },
         q3: { type: 'text', text: 'x' },
-        q4: { type: 'text', text: 'smuggled' },
+        UNASKED_KEY_MARKER: { type: 'text', text: 'smuggled' },
       }),
     );
-    expect(checkResponseAgainstRequest(batch, response)).toContain('was not asked');
+    const reason = checkResponseAgainstRequest(batch, response);
+    expect(reason).toContain('was not asked');
+    expect(reason).toContain('1 answer(s)');
+    // The key is caller-controlled and the reason reaches a durable receipt.
+    expect(reason).not.toContain('UNASKED_KEY_MARKER');
   });
 
-  it('refuses an unknown choice value', () => {
+  it('refuses an unknown choice value without echoing it', () => {
     const response = QuestionSetResponseSchema.parse(
       answer({
-        q1: { type: 'selection', values: ['mysql'] },
+        q1: { type: 'selection', values: ['SYNTHETIC_SECRET_MARKER'] },
         q2: { type: 'selection', values: ['eu'] },
         q3: { type: 'text', text: 'x' },
       }),
     );
-    expect(checkResponseAgainstRequest(batch, response)).toContain('unknown choice');
+    const reason = checkResponseAgainstRequest(batch, response);
+    // Bounded classification: the offending question's own key (which the
+    // request already published) and a count, never the rejected value.
+    expect(reason).toContain('question `q1`');
+    expect(reason).toContain('1 choice value(s)');
+    expect(reason).not.toContain('SYNTHETIC_SECRET_MARKER');
   });
 
   it('refuses more than one selection on a single-select question', () => {

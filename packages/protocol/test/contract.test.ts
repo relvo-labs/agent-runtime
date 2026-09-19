@@ -172,7 +172,14 @@ describe('wire contract', () => {
       multiSelect: false,
     };
     expect(checkResponseAgainstRequest(request, { kind: 'question', answer: 'a' })).toBeUndefined();
-    expect(checkResponseAgainstRequest(request, { kind: 'question', answer: 'b' })).toContain('unknown choice');
+    const rejected = checkResponseAgainstRequest(request, {
+      kind: 'question',
+      answer: 'SYNTHETIC_SECRET_MARKER',
+    });
+    expect(rejected).toContain('does not offer');
+    // The reason is wrapped in an `AgentError` and recorded on a durable
+    // command receipt, so it states a count and never the rejected value.
+    expect(rejected).not.toContain('SYNTHETIC_SECRET_MARKER');
     expect(
       AgentInteractionSchema.safeParse({
         interactionId: 'int_0000000000000001',

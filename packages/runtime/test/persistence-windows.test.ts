@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   CommandIdSchema,
+  SequenceSchema,
   createCounterIdFactory,
   createFixedClock,
   type CommandId,
@@ -69,6 +70,7 @@ async function fixture(
   const completion = deferred<ProviderRunTermination>();
   const interruptGate = deferred<undefined>();
   let sink: ProviderEventSink | undefined;
+  let sessionSink: ProviderEventSink | undefined;
   let starts = 0;
   let responses = 0;
   let interrupts = 0;
@@ -84,8 +86,9 @@ async function fixture(
   });
   const provider: AgentProvider = {
     describe: () => descriptor,
-    createSession: () =>
-      Promise.resolve({
+    createSession: (init) => {
+      sessionSink = init.sink;
+      return Promise.resolve({
         startRun: (request) => {
           starts += 1;
           sink = request.sink;
@@ -108,7 +111,8 @@ async function fixture(
           disposes += 1;
           return Promise.resolve();
         },
-      }),
+      });
+    },
   };
   const runtime = createAgentRuntime({
     workspaces: createLocalWorkspaceProvider({ baseDirectory: join(root, 'managed'), clock, idFactory }),
@@ -145,6 +149,12 @@ async function fixture(
           request: { kind: 'question', prompt: 'Continue?', multiSelect: false },
         },
       }),
+    /** A provider withdrawing a request it raised, on the run's own sink. */
+    emitWithdrawal: (providerRef = 'question') =>
+      sink?.emit({ payload: { type: 'interaction.withdrawn', providerRef } }),
+    /** The same payload on the *session* sink, which owns no run. */
+    emitSessionWithdrawal: (providerRef = 'question') =>
+      sessionSink?.emit({ payload: { type: 'interaction.withdrawn', providerRef } }),
   };
 }
 
@@ -453,5 +463,108 @@ describe('invalid command identity', () => {
       disposition: 'rejected',
       error: { code: 'invalid_request' },
     });
+  });
+});
+
+/**
+ * Provider-originated withdrawal.
+ *
+ * The runtime owns the settlement's identity and time; the provider only names
+ * a reference it was given. These are the adversarial edges: a reference it was
+ * never given, a reference whose answer is already a retained logical
+ * settlement, and a run-scoped payload emitted where no run owns it.
+ */
+describe('provider interaction withdrawal', () => {
+  it('settles the interaction withdrawn, clears routing and resumes the run', async () => {
+    const value = await fixture();
+    await start(value);
+    const interactionId = await interaction(value);
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('awaiting_interaction');
+
+    value.emitWithdrawal();
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+    const snapshot = await value.runtime.getSession(value.sessionId);
+    expect(snapshot?.interactions[0]).toMatchObject({
+      status: 'settled',
+      settlement: { outcome: 'withdrawn' },
+    });
+    expect(snapshot?.interactions[0]?.settlement?.response).toBeUndefined();
+    expect(snapshot?.runs[0]?.state).toBe('running');
+    expect(snapshot?.runs[0]?.pendingInteractionIds).toStrictEqual([]);
+
+    // Routing is gone with it, and the provider was never asked to apply an
+    // answer to a question that is no longer being asked.
+    const late = await value.runtime.respondToInteraction({
+      commandId: value.next(),
+      type: 'respond_to_interaction',
+      sessionId: value.sessionId,
+      interactionId,
+      response: { kind: 'question', answer: 'too late' },
+    });
+    expect(late).toMatchObject({ disposition: 'rejected', error: { code: 'interaction_already_settled' } });
+    expect(value.counts().responses).toBe(0);
+  });
+
+  it('ignores a withdrawal naming a reference this provider never raised', async () => {
+    const value = await fixture();
+    await start(value);
+    await interaction(value);
+
+    value.emitWithdrawal('some-other-reference');
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+    const snapshot = await value.runtime.getSession(value.sessionId);
+    // Untouched: a provider must not be able to settle by guessing a token.
+    expect(snapshot?.interactions[0]?.status).toBe('pending');
+    expect(snapshot?.runs[0]?.state).toBe('awaiting_interaction');
+  });
+
+  it('keeps a retained settlement ahead of a later withdrawal', async () => {
+    const value = await fixture();
+    await start(value);
+    const interactionId = await interaction(value);
+    const command = {
+      commandId: value.next(),
+      type: 'respond_to_interaction' as const,
+      sessionId: value.sessionId,
+      interactionId,
+      response: { kind: 'question' as const, answer: 'yes' },
+    };
+
+    // The answer reached the provider; only its persistence failed.
+    value.failNextCommit();
+    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    expect(value.counts().responses).toBe(1);
+
+    value.emitWithdrawal();
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    const duringRetention = await value.runtime.getSession(value.sessionId);
+    expect(duringRetention?.interactions[0]?.status).toBe('pending');
+
+    // The exact retry still records the answer that was actually delivered.
+    const retried = await value.runtime.respondToInteraction(command);
+    expect(retried.disposition).toBe('applied');
+    const settled = await value.runtime.getSession(value.sessionId);
+    expect(settled?.interactions[0]?.settlement).toMatchObject({
+      outcome: 'responded',
+      response: { kind: 'question', answer: 'yes' },
+    });
+    expect(value.counts().responses).toBe(1);
+  });
+
+  it('records a diagnostic for a withdrawal emitted on the session sink', async () => {
+    const value = await fixture();
+    await start(value);
+    await interaction(value);
+
+    value.emitSessionWithdrawal();
+    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+
+    const snapshot = await value.runtime.getSession(value.sessionId);
+    expect(snapshot?.interactions[0]?.status).toBe('pending');
+    const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0), 1000);
+    const diagnostics = page.events.filter((event) => event.payload.type === 'diagnostic');
+    expect(JSON.stringify(diagnostics)).toContain('interaction.withdrawn');
   });
 });

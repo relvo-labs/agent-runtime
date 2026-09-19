@@ -519,3 +519,355 @@ describe('codex question lifecycle', () => {
     expect(error.code).toBe('unknown_interaction');
   });
 });
+
+// ---------------------------------------------------------------------------
+// `serverRequest/resolved`, independent opt-in, neutral bounds and hostile keys
+// ---------------------------------------------------------------------------
+
+const RESOLVED_NOTIFICATION = 'serverRequest/resolved';
+const APPROVAL_METHOD = 'item/commandExecution/requestApproval';
+const APPROVAL_ID: CodexRequestId = 801;
+
+function resolvedFrame(requestId: CodexRequestId = QUESTION_ID, threadId: string = FAKE_THREAD_ID): unknown {
+  // The pinned notification: a thread and a native request id, and no `turnId`
+  // at all — so it cannot be correlated the way every other notification is.
+  return { method: RESOLVED_NOTIFICATION, params: { threadId, requestId } };
+}
+
+function approvalFrame(id: CodexRequestId = APPROVAL_ID): unknown {
+  return {
+    id,
+    method: APPROVAL_METHOD,
+    params: {
+      kind: 'command',
+      threadId: FAKE_THREAD_ID,
+      turnId: FAKE_TURN_ID,
+      itemId: 'item-approval-1',
+      startedAtMs: 1_700_000_000_000,
+      environmentId: null,
+      command: 'rm -rf ./build',
+      cwd: '/workspace/project',
+      reason: 'the build directory must be cleared first',
+    },
+  };
+}
+
+describe('codex server-side request resolution', () => {
+  it('withdraws an unanswered request and fences every later reply', async () => {
+    const opened = await running();
+    const { providerRef } = await raise(opened);
+
+    opened.fake.push(resolvedFrame());
+    await flush();
+
+    // Nothing is written on the native id: the server resolved it itself, and
+    // a reply now would be a second reply on a retired request.
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+    // The Runtime is told, on the same reference the request carried, so the
+    // interaction settles `withdrawn` instead of staying pending forever.
+    const withdrawn = opened.runSink.ofType('interaction.withdrawn');
+    expect(withdrawn).toHaveLength(1);
+    expect(withdrawn[0]?.payload).toStrictEqual({ type: 'interaction.withdrawn', providerRef });
+
+    const error = await rejectionOf(opened.session.respondToInteraction(providerRef, COMPLETE));
+    expect(error.code).toBe('unknown_interaction');
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+  });
+
+  it('treats a duplicate resolution as a no-op', async () => {
+    const opened = await running();
+    await raise(opened);
+
+    opened.fake.push(resolvedFrame());
+    opened.fake.push(resolvedFrame());
+    await flush();
+
+    expect(opened.runSink.ofType('interaction.withdrawn')).toHaveLength(1);
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+  });
+
+  it('treats a resolution confirming an answer this adapter already sent as harmless', async () => {
+    const opened = await running();
+    const { providerRef } = await raise(opened);
+    await opened.session.respondToInteraction(providerRef, COMPLETE);
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
+
+    opened.fake.push(resolvedFrame());
+    await flush();
+
+    // A confirmation, not a withdrawal: the interaction is already settled and
+    // nothing more is written or announced.
+    expect(opened.runSink.ofType('interaction.withdrawn')).toHaveLength(0);
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
+    // Identical redelivery stays a no-op rather than becoming unknown.
+    await expect(opened.session.respondToInteraction(providerRef, COMPLETE)).resolves.toBeUndefined();
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
+  });
+
+  it('ignores a resolution for another thread or an untracked id', async () => {
+    const opened = await running();
+    await raise(opened);
+
+    opened.fake.push(resolvedFrame(QUESTION_ID, 'thread-somebody-else'));
+    opened.fake.push(resolvedFrame(9999));
+    opened.fake.push({ method: RESOLVED_NOTIFICATION, params: { threadId: FAKE_THREAD_ID } });
+    await flush();
+
+    expect(opened.runSink.ofType('interaction.withdrawn')).toHaveLength(0);
+    // Still answerable: nothing was retired.
+    await expect(
+      opened.session.respondToInteraction(soleInteraction(opened.runSink).providerRef, COMPLETE),
+    ).resolves.toBeUndefined();
+  });
+
+  it('lets the turn ask again, and complete, after a withdrawal', async () => {
+    const opened = await running();
+    await raise(opened);
+    opened.fake.push(resolvedFrame());
+    await flush();
+
+    const second = createSink();
+    opened.fake.push(questionFrame({}, 702));
+    await flush();
+    const raised = opened.runSink.ofType('interaction.requested');
+    expect(raised).toHaveLength(2);
+    const next = raised[1]?.payload as { providerRef: string };
+    await opened.session.respondToInteraction(next.providerRef, COMPLETE);
+    expect(repliesTo(opened.fake, 702)).toHaveLength(1);
+    expect(second.events).toHaveLength(0);
+
+    opened.fake.push(turnCompleted('completed'));
+    await expect(opened.run.completion).resolves.toStrictEqual({ outcome: 'succeeded' });
+  });
+});
+
+describe('codex approval bridging stays independently opt-in', () => {
+  it('declines a command approval in questions-only mode without raising an interaction', async () => {
+    const opened = await running();
+    expect(createCodexProvider({ questions: 'bridge' }).describe().interaction.approval.supported).toBe(false);
+
+    opened.fake.push(approvalFrame());
+    await flush();
+
+    // `-32601` is the same fail-closed decline a provider with no interaction
+    // registry at all sends, which is what `approval: {}` promises.
+    expect(repliesTo(opened.fake, APPROVAL_ID)[0]).toMatchObject({ error: { code: -32601 } });
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(0);
+    // And no `decision` was ever sent on that id.
+    expect(JSON.stringify(opened.fake.sent)).not.toContain('acceptForSession');
+    expect(JSON.stringify(opened.fake.sent)).not.toContain('"decision"');
+  });
+
+  it('bridges both when both are opted into, and names both in the descriptor', async () => {
+    const descriptor = createCodexProvider({ approvals: 'bridge', questions: 'bridge' }).describe();
+    expect(descriptor.extensions).toMatchObject({
+      bridgedServerRequests: [APPROVAL_METHOD, CODEX_BRIDGED_QUESTION],
+    });
+    expect(createCodexProvider({ questions: 'bridge' }).describe().extensions).toMatchObject({
+      bridgedServerRequests: [CODEX_BRIDGED_QUESTION],
+    });
+    expect(createCodexProvider({ approvals: 'bridge' }).describe().extensions).toMatchObject({
+      bridgedServerRequests: [APPROVAL_METHOD],
+    });
+
+    const opened = await running({ approvals: 'bridge' });
+    opened.fake.push(approvalFrame());
+    await flush();
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(1);
+  });
+});
+
+describe('codex neutral-bound refusals', () => {
+  const question = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+    id: 'native-q-a',
+    header: 'Database',
+    question: 'Which database should I use?',
+    isOther: false,
+    isSecret: false,
+    options: [
+      { label: 'PostgreSQL', description: 'Relational' },
+      { label: 'SQLite', description: 'Embedded' },
+    ],
+    ...overrides,
+  });
+
+  const cases: readonly [string, Record<string, unknown>][] = [
+    ['a prompt past the neutral bound', question({ question: 'p'.repeat(8001) })],
+    ['a header past the neutral bound', question({ header: 'h'.repeat(201) })],
+    ['an option label past the neutral bound', question({ options: [{ label: 'L'.repeat(401), description: 'a' }] })],
+    [
+      'an option description past the neutral bound',
+      question({ options: [{ label: 'A', description: 'd'.repeat(2001) }] }),
+    ],
+    [
+      'more options than a neutral choice list carries',
+      question({
+        options: Array.from({ length: 65 }, (_unused, index) => ({
+          label: `option-${String(index)}`,
+          description: '',
+        })),
+      }),
+    ],
+  ];
+
+  for (const [name, hostile] of cases) {
+    it(`refuses ${name} whole, on its own native id`, async () => {
+      const opened = await running();
+      opened.fake.push(questionFrame({ questions: [hostile] }));
+      await flush();
+
+      // The aggregate 16000-character check cannot see an individual field or
+      // an option count, so only the neutral schema can refuse these.
+      expect(repliesTo(opened.fake, QUESTION_ID)[0]).toMatchObject({ error: { code: -32602 } });
+      expect(opened.runSink.ofType('interaction.requested')).toHaveLength(0);
+      const diagnostics = opened.runSink.ofType('diagnostic');
+      expect(diagnostics).toHaveLength(1);
+      const message = (diagnostics[0]?.payload as { message: string }).message;
+      expect(message).toContain('neutral_bounds');
+      expect(message).not.toContain('pppp');
+
+      // The turn is still able to ask a question it *can* represent.
+      opened.fake.push(questionFrame({}, 702));
+      await flush();
+      expect(opened.runSink.ofType('interaction.requested')).toHaveLength(1);
+    });
+  }
+});
+
+describe('codex prototype-sensitive native question ids', () => {
+  it('replies with own properties for `__proto__`, `constructor` and ordinary ids', async () => {
+    const opened = await running();
+    const hostile = (id: string): Record<string, unknown> => ({
+      id,
+      header: 'H',
+      question: `Question ${id}?`,
+      isOther: false,
+      isSecret: false,
+      options: null,
+    });
+    const { providerRef } = await raise(
+      opened,
+      questionFrame({ questions: [hostile('__proto__'), hostile('constructor'), hostile('native-ordinary')] }),
+    );
+
+    await opened.session.respondToInteraction(providerRef, {
+      kind: 'question_set',
+      answers: {
+        q1: { type: 'text', text: 'first' },
+        q2: { type: 'text', text: 'second' },
+        q3: { type: 'text', text: 'third' },
+      },
+    });
+
+    const [reply] = repliesTo(opened.fake, QUESTION_ID);
+    if (reply === undefined || !('result' in reply)) throw new Error('the adapter wrote no result');
+    const answers = (reply.result as { answers: Record<string, unknown> }).answers;
+    expect(Object.hasOwn(answers, '__proto__')).toBe(true);
+    expect(Object.getPrototypeOf(answers)).toBe(Object.prototype);
+    // Serialized through JSON, because an object literal `{ __proto__: … }` is
+    // itself a prototype assignment — the trap this test exists for.
+    const serialized = JSON.parse(JSON.stringify(answers)) as Record<string, { answers: string[] }>;
+    // A `Map` so the lookup itself cannot be confused with a prototype read.
+    const byKey = new Map(Object.entries(serialized));
+    expect([...byKey.keys()].sort()).toStrictEqual(['__proto__', 'constructor', 'native-ordinary']);
+    expect(byKey.get('__proto__')?.answers).toStrictEqual(['first']);
+    expect(byKey.get('constructor')?.answers).toStrictEqual(['second']);
+    expect(byKey.get('native-ordinary')?.answers).toStrictEqual(['third']);
+  });
+});
+
+describe('codex request-aware settlement at the public SPI', () => {
+  const invalid: readonly [string, InteractionResponse][] = [
+    [
+      'an answer for a question that was not asked',
+      {
+        kind: 'question_set',
+        answers: { ...COMPLETE_ANSWERS, EXTRA_KEY: { type: 'text', text: 'smuggled' } },
+      },
+    ],
+    [
+      'two selections on a question that permits one',
+      {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1', 'o2'] }, q2: { type: 'text', text: 'tok' } },
+      },
+    ],
+    [
+      'a repeated selection',
+      {
+        kind: 'question_set',
+        answers: { q1: { type: 'selection', values: ['o1', 'o1'] }, q2: { type: 'text', text: 'tok' } },
+      },
+    ],
+    [
+      'a choice value this question does not offer',
+      {
+        kind: 'question_set',
+        answers: {
+          q1: { type: 'selection', values: ['SYNTHETIC_SECRET_MARKER'] },
+          q2: { type: 'text', text: 'tok' },
+        },
+      },
+    ],
+  ];
+
+  for (const [name, response] of invalid) {
+    it(`rejects ${name} and leaves the batch answerable`, async () => {
+      const opened = await running();
+      const { providerRef } = await raise(opened);
+
+      const error = await rejectionOf(opened.session.respondToInteraction(providerRef, response));
+      expect(error.code).toBe('invalid_request');
+      expect(error.message).not.toContain('SYNTHETIC_SECRET_MARKER');
+      expect(error.message).not.toContain('EXTRA_KEY');
+      expect(error.message).not.toContain('smuggled');
+      // The one settlement was not consumed: nothing reached the server.
+      expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+
+      await opened.session.respondToInteraction(providerRef, COMPLETE);
+      expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
+    });
+  }
+
+  it('rejects free text for a question whose `isOther` is false', async () => {
+    const opened = await running();
+    const { providerRef, batch } = await raise(
+      opened,
+      questionFrame({
+        questions: [
+          {
+            id: 'native-only-choices',
+            header: 'Database',
+            question: 'Which database should I use?',
+            // No "Other" affordance, and options are present: typed text is
+            // not an answer the server offered.
+            isOther: false,
+            isSecret: false,
+            options: [
+              { label: 'PostgreSQL', description: 'Relational' },
+              { label: 'SQLite', description: 'Embedded' },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(batch.questions[0]?.allowFreeText).toBe(false);
+
+    const error = await rejectionOf(
+      opened.session.respondToInteraction(providerRef, {
+        kind: 'question_set',
+        answers: { q1: { type: 'text', text: 'SYNTHETIC_SECRET_MARKER' } },
+      }),
+    );
+    expect(error.code).toBe('invalid_request');
+    expect(error.message).toContain('does not accept free text');
+    expect(error.message).not.toContain('SYNTHETIC_SECRET_MARKER');
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+
+    await opened.session.respondToInteraction(providerRef, {
+      kind: 'question_set',
+      answers: { q1: { type: 'selection', values: ['o1'] } },
+    });
+    expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
+  });
+});

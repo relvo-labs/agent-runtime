@@ -41,6 +41,26 @@ checks each answer's type, choice membership, duplicate selections and cardinali
 runs before any provider is touched, so no adapter can be handed a partially answered
 batch.
 
+BREAKING: `ProviderEventPayload` gains a `{ type: 'interaction.withdrawn', providerRef }`
+member, so a provider can withdraw a request it raised while its run continues. The runtime
+records it as an `interaction.settled` event with a `withdrawn` outcome, clears the
+interaction's routing and lets the run leave `awaiting_interaction`; identity and time stay
+the runtime's. Without it an adapter whose native surface takes a question back (Claude
+aborts the request's `AbortSignal`; Codex sends `serverRequest/resolved`) could only retire
+its own callback, leaving the interaction pending forever and turning the provider's own
+later success into a `provider_contract_violation`. A withdrawal naming a reference the
+provider did not raise, or one whose response is already a retained logical settlement, is
+ignored. `PROVIDER_EMITTABLE_EVENT_TYPES` is consequently typed
+`readonly ProviderEventPayload['type'][]` rather than `readonly EventType[]`, and lists the
+new member; code that assigned it to an `EventType[]` must widen.
+
+`checkResponseAgainstRequest` no longer echoes rejected values. A message may name a `key`
+the request published and state how many values or unknown keys were wrong; it never
+repeats a rejected choice value or a caller-supplied answer key. The runtime wraps that
+reason in an `AgentError` on a durable command receipt, so echoing would have written a
+rejected answer to a `sensitive` question into the event log by the act of refusing it.
+Assertions on the old message text (`unknown choice value(s): …`) must be updated.
+
 BREAKING: `QuestionCapability` gains `batch`, `maxQuestions`, `freeText` and `sensitive`
 (conservative defaults: `false` / `null`). Reading `descriptor.interaction.question` with
 an exact-shape assertion needs updating; reading individual fields does not.

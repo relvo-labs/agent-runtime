@@ -164,15 +164,6 @@ export const EventPayloadSchema = z.discriminatedUnion('type', [
 export type EventPayload = z.infer<typeof EventPayloadSchema>;
 export type EventType = EventPayload['type'];
 
-/** Payload types a provider is permitted to originate. */
-export const PROVIDER_EMITTABLE_EVENT_TYPES: readonly EventType[] = [
-  'run.message_delta',
-  'run.tool_activity',
-  'run.usage',
-  'interaction.requested',
-  'diagnostic',
-];
-
 export const ProviderEventPayloadSchema = z.discriminatedUnion('type', [
   runMessageDelta,
   runToolActivity,
@@ -184,10 +175,49 @@ export const ProviderEventPayloadSchema = z.discriminatedUnion('type', [
     /** Provider's own correlation token, mapped to an InteractionId by the runtime. */
     providerRef: z.string().min(1).max(200),
   }),
+  /**
+   * The provider no longer wants the answer to an interaction it raised.
+   *
+   * A native surface can withdraw a pending question while its run continues:
+   * the Claude SDK aborts the `AskUserQuestion` request's `AbortSignal`, and
+   * the Codex app-server sends `serverRequest/resolved` for a request it has
+   * resolved itself. Without this payload the adapter can only retire its own
+   * callback, leaving the Runtime interaction pending and the run stuck in
+   * `awaiting_interaction` forever — which then turns the provider's own later
+   * success into a `provider_contract_violation`.
+   *
+   * Correlation is the same `providerRef` the request carried, so a provider
+   * still cannot name an interaction it did not raise. The provider supplies no
+   * timestamp and no settlement: the runtime records an `interaction.settled`
+   * event with a `withdrawn` outcome, stamps it, and clears its own routing —
+   * identity and time stay the runtime's, exactly as for a request.
+   */
+  z.strictObject({
+    type: z.literal('interaction.withdrawn'),
+    /** The token this provider supplied on the matching `interaction.requested`. */
+    providerRef: z.string().min(1).max(200),
+  }),
   diagnostic,
 ]);
 
 export type ProviderEventPayload = z.infer<typeof ProviderEventPayloadSchema>;
+
+/**
+ * Payload types a provider is permitted to originate.
+ *
+ * Not every member is an `EventType`. `interaction.withdrawn` is a
+ * provider-only payload: the runtime records it as an `interaction.settled`
+ * event with a `withdrawn` outcome, because only the runtime may stamp a
+ * settlement's time and identity.
+ */
+export const PROVIDER_EMITTABLE_EVENT_TYPES: readonly ProviderEventPayload['type'][] = [
+  'run.message_delta',
+  'run.tool_activity',
+  'run.usage',
+  'interaction.requested',
+  'interaction.withdrawn',
+  'diagnostic',
+];
 
 // ---------------------------------------------------------------------------
 // Envelope

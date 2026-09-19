@@ -246,7 +246,36 @@ export const CODEX_NOTIFICATION = {
   itemCompleted: 'item/completed',
   tokenUsage: 'thread/tokenUsage/updated',
   error: 'error',
+  /**
+   * The server has resolved one of its own outstanding requests.
+   *
+   * It confirms an answer this client already sent *and* retires a request the
+   * server settled by itself, which is the app-server's withdrawal signal for
+   * `item/tool/requestUserInput`. Its payload is `{ threadId, requestId }` —
+   * no `turnId` — so it is correlated by the native request id the client
+   * layer holds, never by turn.
+   */
+  serverRequestResolved: 'serverRequest/resolved',
 } as const;
+
+/**
+ * Correlation carried by `serverRequest/resolved`.
+ *
+ * Read positively and permissively: an unrecognised extra member must not turn
+ * withdrawal back off, because the failure mode of ignoring this notification
+ * is a permanently pending question. Only the two fields this adapter acts on
+ * are extracted, and `requestId` is validated as an echo-safe `RequestId`.
+ */
+export function asServerRequestResolved(
+  value: unknown,
+): { readonly threadId: string; readonly requestId: CodexRequestId } | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const threadId = asId(record.threadId);
+  const requestId = asRequestId(record.requestId);
+  if (threadId === undefined || requestId === undefined) return undefined;
+  return { threadId, requestId };
+}
 
 /**
  * Every server-initiated request in the pinned stable surface

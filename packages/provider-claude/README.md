@@ -142,7 +142,9 @@ allow-on-timeout and no allow-on-error path:
 - when the SDK withdraws a prompt — it aborts that request's own signal, and then keeps
   waiting on the answer — the prompt is denied once, its cancellation listener is detached
   and its reference is retired, so a host cannot answer into a request nothing is listening
-  for. A prompt that is already withdrawn when it arrives raises no interaction at all;
+  for. A prompt that is already withdrawn when it arrives raises no interaction at all. For
+  a _question_, withdrawal is additionally propagated to the Runtime so the interaction
+  settles `withdrawn` rather than staying pending;
 - a prompt that arrives once disposal has begun, including the retry window after a
   rejected teardown, raises no interaction and is denied.
 
@@ -203,25 +205,35 @@ answers map that `AskUserQuestionInput.answers` declares ("User answers collecte
 permission component"). A bare `{ behavior: 'allow' }` would run the tool with no answers;
 a denial would hand the model prose. Neither is ever used to settle a question here.
 
-| Native form                          | Bridged            | Notes                                                                                                    |
-| ------------------------------------ | ------------------ | -------------------------------------------------------------------------------------------------------- |
-| single-select question               | **yes**            | `multiSelect: false`. The answer is the option's `label`.                                                |
-| multi-select question                | **yes**            | `multiSelect: true`. Labels are joined with `', '`, the pinned encoding for the `string`-valued map.     |
-| free text / "Other"                  | **yes**            | Every question carries `allowFreeText: true`; the typed text is sent verbatim, never the word "Other".   |
-| 1–4 questions in one call            | **yes**            | Raised as one ordered batch, answered as one unit. Partial answers are refused before the SDK is called. |
-| cancellation / withdrawal            | **yes**            | Aborting the request's signal denies once, detaches and retires the reference.                           |
-| option `preview`                     | no — refused whole | `toolConfig.askUserQuestion.previewFormat` is never set, so none is generated; one arriving is refused.  |
-| secret answers                       | n/a                | `AskUserQuestion` has no secret-answer concept, so `sensitive` is always `false`.                        |
-| `autoResolution` / `afkTimeoutMs`    | no                 | Output-only in the SDK, and this adapter never auto-answers. No settlement deadline is imposed.          |
-| pre-filled `answers` / `annotations` | no — refused whole | Answers arriving inbound are not a host answer; treating them as one would fabricate consent.            |
-| duplicate question text              | no — refused whole | The native answer map is keyed by question text, so duplicates cannot both be answered.                  |
-| duplicate option label               | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                 |
-| counts outside 1–4 / 2–4             | no — refused whole | The pinned tool bounds, enforced rather than assumed.                                                    |
-| `onUserDialog`, MCP elicitation      | no                 | Different native mechanisms; neither is bridged, and neither is claimed.                                 |
+| Native form                          | Bridged            | Notes                                                                                                                                                                                         |
+| ------------------------------------ | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| single-select question               | **yes**            | `multiSelect: false`. The answer is the option's `label`.                                                                                                                                     |
+| multi-select question                | **yes**            | `multiSelect: true`. Labels are joined with `', '`, the pinned encoding for the `string`-valued map.                                                                                          |
+| free text / "Other"                  | **yes**            | Every question carries `allowFreeText: true`; the typed text is sent verbatim, never the word "Other".                                                                                        |
+| 1–4 questions in one call            | **yes**            | Raised as one ordered batch, answered as one unit. Partial answers are refused before the SDK is called.                                                                                      |
+| cancellation / withdrawal            | **yes**            | Aborting the request's signal denies once, detaches and retires the reference, **and** withdraws the interaction on the Runtime so the run resumes.                                           |
+| option `preview`                     | no — refused whole | `toolConfig.askUserQuestion.previewFormat` is never set, so none is generated; one arriving is refused.                                                                                       |
+| secret answers                       | n/a                | `AskUserQuestion` has no secret-answer concept, so `sensitive` is always `false`.                                                                                                             |
+| `autoResolution` / `afkTimeoutMs`    | no                 | Output-only in the SDK, and this adapter never auto-answers. No settlement deadline is imposed.                                                                                               |
+| pre-filled `answers` / `annotations` | no — refused whole | Answers arriving inbound are not a host answer; treating them as one would fabricate consent.                                                                                                 |
+| duplicate question text              | no — refused whole | The native answer map is keyed by question text, so duplicates cannot both be answered.                                                                                                       |
+| duplicate option label               | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                                                                                                      |
+| counts outside 1–4 / 2–4             | no — refused whole | The pinned tool bounds, enforced rather than assumed.                                                                                                                                         |
+| text past a neutral bound            | no — refused whole | `AskUserQuestionInput` declares counts but no lengths. A prompt, header, label or description longer than `question_set` permits is refused (`neutral_bounds`) before any interaction exists. |
+| `onUserDialog`, MCP elicitation      | no                 | Different native mechanisms; neither is bridged, and neither is claimed.                                                                                                                      |
 
 A refused call is denied whole, on its own callback, and **raises no interaction** — a
-question a host cannot display faithfully must never be shown half-rendered. The refusal
+question a host cannot display faithfully must never be shown half-rendered. The whole
+translated batch is validated against the neutral `question_set` schema before any entry is
+retained, because a batch the Runtime would discard as a malformed provider event would
+otherwise leave the SDK blocked forever on a question no host was ever shown. The refusal
 diagnostic carries a bounded reason token and no prompt, option or answer text.
+
+**Withdrawal reaches the Runtime, not just this adapter.** When the SDK aborts the
+request's signal while the run continues, the call is denied _and_ `interaction.withdrawn`
+is emitted on that run's sink, so the interaction settles `withdrawn`, its routing clears,
+a later answer is `interaction_already_settled`, the next question can be raised, and the
+run's own success stays a success instead of becoming a `provider_contract_violation`.
 
 Two limitations worth stating: `canUseTool` is not called for a tool an allow rule or a
 permission mode already decided, so an `AskUserQuestion` pre-approved that way is never
