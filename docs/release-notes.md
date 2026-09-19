@@ -9,16 +9,210 @@ Notes are written when a version is **prepared**. A version appearing here has n
 itself, been published: publication is a separate manual dispatch described in the
 [release runbook](release.md).
 
-## 0.2.0 — prepared, not published
+## 0.3.0 — prepared, not published
 
-The first line of Foundation v0.4 prepared for publication. All eight public packages move
-together from `0.1.0`; `linked` in the Changesets config keeps them in step, and every
-internal dependency in the packed tarballs resolves to `^0.2.0`. `@relvo-labs/reference-app`
-is private and is not part of this or any release.
+All eight public packages move together from `0.2.0`; `linked` keeps them in step.
+`@relvo-labs/reference-app` is private, stays at `0.0.0`, and is not part of this or any
+release. At the registry observation taken for this preparation, every one of the eight
+served only `0.2.0` with `latest = 0.2.0`; `0.3.0` was absent. Preparation is not merge,
+dispatch or publication authority, and this branch is **not dispatchable** — see the
+[release runbook](release.md).
 
-Prepared is not published, and not yet approved for publication. Whether this line may be
-published is decided against the [first-release evidence policy](release.md#first-release-evidence-policy)
-by a person, after the canonical gate has been run against the merged commit.
+Prepared by consuming seven changesets: `structured-question-sets`,
+`claude-approval-bridge`, `claude-structured-questions`, `codex-approval-bridge`,
+`codex-structured-questions`, `question-validation-retirement` and
+`retained-withdrawal-validation`. Because these packages are pre-1.0, a breaking change is
+still a **minor** bump; the `BREAKING:` notes below are the migration record.
+
+### Structured question sets — protocol, executor, provider, runtime (minor)
+
+**BREAKING:** `WIRE_VERSION` moves `0.4` → `0.5`. Rebuild every package against the new
+protocol and add a `case 'question_set':` to any `switch` on an interaction `kind` before
+upgrading. An adapter still declaring `wireVersion: '0.4'` is refused at registration with
+`provider_contract_violation` naming both versions. Generated JSON Schema `$id`s move to
+`https://schemas.relvo.dev/agent-runtime/0.5/…`. See
+[ADR-0018](adr/ADR-0018-structured-question-sets.md) for the decision, migration and
+rollback.
+
+`InteractionRequest` and `InteractionResponse` gain a `kind: 'question_set'` member: an
+ordered list of adapter-keyed questions, answered by a record keyed by those keys rather
+than by array position. The existing `kind: 'question'` form is untouched, so
+single-question providers and their hosts need nothing beyond the rebuild. Each question
+carries its own `header`, `choices`, `multiSelect`, `allowFreeText` and `sensitive` facts;
+`key` is adapter-assigned and never a provider-native identifier. Settlement is
+all-or-nothing: `checkResponseAgainstRequest` requires the answered key set to equal the
+asked key set exactly, then checks type, choice membership, duplicate selections and
+cardinality, before any provider is touched.
+
+**BREAKING:** `ProviderEventPayload` gains `{ type: 'interaction.withdrawn', providerRef }`,
+so a provider can withdraw a request it raised while its run continues. The runtime records
+it as an `interaction.settled` event with a `withdrawn` outcome, clears routing and lets the
+run leave `awaiting_interaction`; identity and time stay the runtime's. A withdrawal naming
+a reference the provider did not raise, or one already retained as a logical settlement, is
+ignored. `PROVIDER_EMITTABLE_EVENT_TYPES` is consequently typed
+`readonly ProviderEventPayload['type'][]`; code that assigned it to an `EventType[]` must
+widen.
+
+**BREAKING:** `QuestionCapability` gains `batch`, `maxQuestions`, `freeText` and `sensitive`
+(conservative defaults `false` / `null`); an exact-shape assertion on
+`descriptor.interaction.question` needs updating. `checkResponseAgainstRequest` also no
+longer echoes rejected values — it may name a `key` the request published and state how many
+values or unknown keys were wrong, but never repeats a rejected choice value or a
+caller-supplied answer key, because the runtime wraps that reason in a durable receipt.
+Assertions on the old message text must be updated.
+
+New protocol exports: `QuestionKeySchema`, `QuestionItemSchema`, `QuestionSetRequestSchema`,
+`QuestionAnswerSchema`, `QuestionSetResponseSchema` and their types. New from
+`@relvo-labs/agent-provider`: `canAskQuestionSet(descriptor, count)`. Runtime behaviour is
+otherwise unchanged: interaction identity, settlement-once, receipt idempotency, retained
+settlement after a failed store commit and terminal-run rejection all apply to a batch as
+they do to a single question.
+
+### `@relvo-labs/agent-provider-claude` — approval and question bridges (minor)
+
+Both bridges are **opt-in and independent**, and both keep their documented fail-closed
+boundaries.
+
+`createClaudeProvider({ approvals: 'bridge' })` sets the SDK's `permissionPrompts: 'host'`
+and installs `canUseTool`, raising an undecided tool call as `interaction.requested`
+(`kind: 'approval'`); the call proceeds only after `{ decision: 'approved', mode: 'once' }`.
+The provider then declares `interaction.approval = { supported: true, modes: ['once'],
+blocking: true }`. The default is unchanged: with `approvals` unset the adapter still sends
+`permissionPrompts: 'none'`, declares no approval capability, and a prompt fails closed
+inside the SDK rather than parking a run — this adapter imposes no settlement deadline, so
+bridging is for hosts that actually settle interactions. Everything but that one grant fails
+closed and never executes the SDK callback twice; run end, interrupt, EOF, stream failure or
+disposal denies outstanding prompts and retires their references. References are namespaced
+per session with an adapter-generated nonce. Settlement is in-process, not crash-safe
+exactly-once. The approval subject carries a sanitized tool name only, never tool input.
+
+`createClaudeProvider({ questions: 'bridge' })` bridges the SDK's `AskUserQuestion` tool to
+the neutral `question_set` interaction, so **the same run resumes at the native wait point**
+once answered — not a follow-up turn and not an approval. The host answers by allowing the
+call with an `updatedInput` carrying the answers map. Supported: single-select, multi-select
+(labels joined with `', '`), free text as the "Other" answer sent verbatim, 1–4 questions
+answered as one unit, and withdrawal via the request's `AbortSignal` — which denies the call
+**and** emits `interaction.withdrawn`, so the run's own success stays a success instead of
+becoming a `provider_contract_violation`. Refused whole, raising no interaction: option
+`preview`, pre-filled `answers`/`annotations`, duplicate question text or option label,
+counts outside the pinned 1–4 / 2–4 bounds, unknown members, and anything past the neutral
+`question_set` bounds — the complete translated batch is parsed through
+`QuestionSetRequestSchema` before any entry is retained. `onUserDialog` and MCP elicitation
+remain unbridged and unclaimed. Do not add `AskUserQuestion` to `allowedTools`: auto-approved
+calls bypass `canUseTool` and defeat the bridge.
+
+Public surface: `ClaudeProviderOptions.questions`, `CLAUDE_QUESTION_TOOL`, and the types
+`ClaudeCanUseTool`, `ClaudePermissionResult`, `ClaudeToolPermissionRequest`,
+`ClaudeAskUserQuestionInput`, `ClaudeQuestion`, `ClaudeQuestionOption`. `ClaudeQueryOptions`
+now declares `permissionPrompts: 'host' | 'none'` and an optional `canUseTool`; a host
+binding annotated with the narrow literal must widen. `ClaudePermissionResult`'s `allow`
+branch gains an optional `updatedInput`.
+
+### `@relvo-labs/agent-provider-codex` — approval and question bridges (minor)
+
+Both bridges are **opt-in and independent**; `extensions.bridgedServerRequests` lists only
+the methods each enabled opt-in actually enables.
+
+`createCodexProvider({ approvals: 'bridge' })` sends `thread/start` with
+`approvalPolicy: 'on-request'`, raising `item/commandExecution/requestApproval` as
+`interaction.requested` (`kind: 'approval'`); the command proceeds only after
+`{ decision: 'approved', mode: 'once' | 'session' }`. Declared modes are `['once',
+'session']`. The default is unchanged: with both bridges unset the adapter sends
+`approvalPolicy: 'never'`, declares no approval capability and declines every
+server-initiated request. Other pinned stable `ServerRequest` methods are declined on their
+own native request id with no interaction raised. A bridged approval is refused when it
+cannot be represented faithfully, does not name the active `(threadId, turnId)`, arrives
+before binding or after conclusion or interruption, or exceeds the per-session bound. A
+denial `reason` is not transmissible on this protocol, stated as
+`extensions.approvalDenialReasonDelivered === false`.
+
+`createCodexProvider({ questions: 'bridge' })` bridges `item/tool/requestUserInput` to the
+neutral `question_set` interaction, so **the same turn resumes at the native wait point**.
+Native thread, turn, item and question identifiers stay inside the adapter. Supported:
+choice questions, free-text (`options: null`), `isOther` as `allowFreeText`, `isSecret` as
+`sensitive`, and several questions answered as one unit. Multi-select is **not** offered:
+the native question type has no field permitting several answers, and offering an unstated
+capability would be a guess. Refused whole with `-32602`, raising no interaction:
+`isBlocking: false`, any `autoResolutionMs`, duplicate question `id` or option `label`, an
+empty or oversized batch, unknown members, and anything the neutral schema refuses; the
+batch is parsed through `QuestionSetRequestSchema` before any entry is retained. Withdrawal
+is bridged: a `serverRequest/resolved` for an unanswered request is the app-server
+withdrawing it, so the adapter writes nothing on that native id, fences it, and emits
+`interaction.withdrawn`. `initialize.params.capabilities` stays `null` — no experimental
+capability is enabled. When a run ends with a batch outstanding the native request is
+answered with an **empty** answer map, the only honest reply this protocol has: it answers
+no question, invents nothing, and releases the server's wait.
+
+Public surface: `CodexProviderOptions.questions`, `CODEX_BRIDGED_APPROVAL`,
+`CODEX_BRIDGED_QUESTION`.
+
+### Validation and retention fixes (patch)
+
+`@relvo-labs/agent-protocol`, `@relvo-labs/agent-runtime` and
+`@relvo-labs/agent-provider-codex` reject invalid own question-answer keys before record
+parsing, including JSON-parsed `__proto__`, without changing the key grammar or valid
+`constructor` / `toString` answers; missing-answer errors stay bounded for maximum-size
+batches so Runtime returns a replayable `invalid_request` receipt and leaves the interaction
+answerable. Correlated server-resolved Codex requests are retired in the client reply ledger
+without writing a reply, with duplicate protection and the tracking bound preserved.
+
+`@relvo-labs/agent-protocol` and `@relvo-labs/agent-runtime` retain provider question
+withdrawals across transient store failures, fence competing answers, and persist the
+withdrawn outcome during redelivery, completion or cleanup; retention is bounded by routed
+interactions in one Runtime process and is **not crash durable**. Command schema rejections
+use a stable `invalid_request` classification without copying caller-controlled keys, paths
+or values into receipt errors. These are compatible implementation fixes: schemas, public
+signatures and wire 0.5 are unchanged by them.
+
+### Evidence for this line, stated as it is
+
+Version preparation moves versions. It produces no new provider evidence and upgrades none
+that the adapters already had. The
+[first-release evidence policy](release.md#first-release-evidence-policy) governs whether
+this line may be published at all.
+
+| Claim                                                   | Evidence                                                                                                                                                                                          |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Deterministic gate, all eight packages                  | **Required, and established only against the exact commit under review.** Authoring versions does not produce it; a run against any other tree says nothing about this one.                       |
+| Wire 0.5 and `question_set` contract                    | Deterministic Zod/JSON Schema parity evidence, including the Ajv parity corpus for the Zod-only question-key uniqueness invariant.                                                                |
+| Same-run resumption of a bridged question               | Deterministic tests and protocol evidence against pinned frame shapes and scripted doubles.                                                                                                       |
+| Bridged approvals and questions against a live provider | **None.** There is no verified live-provider same-run acceptance for either bridge. The canonical gate is credential-free and no gate test executes a real Codex or Claude turn.                  |
+| Codex wire compatibility with 0.153.4 stable            | Deterministic tests against pinned frame shapes, plus an end-to-end suite over real pipes to a local stand-in server. Issue #15 carries authentic recorded Codex app-server interaction evidence. |
+| Claude SDK integration                                  | Deterministic doubles only — the `query()` seam is exercised against scripted implementations.                                                                                                    |
+
+Both bridges are implemented against their documented protocol surfaces; neither has been
+verified against a live credentialed provider. "Implements the surface" and "verified
+against the provider" are different claims, and only the first is made for the bridges this
+line adds. Do not describe the bridges, or the same-run resumption behaviour, as
+live-verified. This table states the evidence for the new behaviour in 0.3.0; it does not
+restate or revise the evidence recorded for earlier lines. Settlement in both
+adapters is process-local exactly-once, not crash-safe exactly-once. Questions, answers and
+approval subjects are untrusted and durable; hosts own display, retention, access and
+logging, and approval is not a Runtime sandbox guarantee.
+
+## 0.2.0 — published, and immutable
+
+**All eight public packages are published at 0.2.0.** A registry observation taken at
+`2026-09-19T18:03:17Z` against `https://registry.npmjs.org` asked for each of the eight
+package names below: every one answered HTTP 200, listed exactly one version — `0.2.0` —
+and reported `latest = 0.2.0`. npm versions cannot be overwritten and unpublishing is not a
+recovery plan, so each of these is public and immutable: never republish one, and never name
+one in a dispatch again.
+
+That observation establishes existence, the version list and the dist-tag, and nothing more.
+It recorded a hash of each packument response body only; it did not parse per-version
+integrity, shasum or tarball metadata. **Nothing here asserts that the artifacts the
+registry serves match the reviewed ones** — that is a separate check this preparation did
+not perform.
+
+The first line of Foundation v0.4. All eight public packages moved together from `0.1.0`;
+`linked` in the Changesets config kept them in step, and every internal dependency in the
+packed tarballs resolves to `^0.2.0`. `@relvo-labs/reference-app` is private and is not part
+of this or any release.
+
+The preparation record for this line is kept below as history: it was written when 0.2.0 was
+prepared and not yet published, and it is what a reader asking what 0.2.0 contains should
+read.
 
 - `@relvo-labs/agent-protocol`
 - `@relvo-labs/agent-executor`
