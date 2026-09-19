@@ -23,9 +23,11 @@ import {
   ClaudePermissionModeSchema,
   ClaudeSessionOptionsSchema,
   createClaudeProvider,
+  type ClaudeCanUseTool,
   type ClaudeInterruptReceipt,
   type ClaudeMessageUuid,
   type ClaudePermissionMode,
+  type ClaudePermissionResult,
   type ClaudeProviderFactory,
   type ClaudeProviderOptions,
   type ClaudePromptMessage,
@@ -34,6 +36,7 @@ import {
   type ClaudeQueryMessage,
   type ClaudeQueryParams,
   type ClaudeSessionOptions,
+  type ClaudeToolPermissionRequest,
 } from '@relvo-labs/agent-provider-claude';
 import {
   CODEX_ADAPTER_STATUS,
@@ -123,6 +126,28 @@ const claudeOptions: ClaudeProviderOptions = {
   model: 'claude-sonnet-4-6',
   permissionMode: 'acceptEdits',
   query: scriptedClaudeQuery,
+  // Opt in to the host approval bridge: tool prompts the SDK cannot decide on
+  // its own become neutral `approval` interactions this host settles through
+  // `respondToInteraction`. Omit it and the adapter declares no approval
+  // capability, exactly as before.
+  approvals: 'bridge',
+};
+
+/**
+ * A host may also drive the SDK's permission callback itself — the seam is a
+ * named public type, so an answer of the wrong shape fails to compile here.
+ */
+const hostPermissionCallback: ClaudeCanUseTool = (
+  toolName: string,
+  _input: Record<string, unknown>,
+  request: ClaudeToolPermissionRequest,
+): Promise<ClaudePermissionResult> => {
+  const decision: ClaudePermissionResult = request.signal.aborted
+    ? { behavior: 'deny', message: 'the session is shutting down' }
+    : toolName === 'Read'
+      ? { behavior: 'allow' }
+      : { behavior: 'deny', message: 'not authorised by this host' };
+  return Promise.resolve(decision);
 };
 const claudeFactory: ClaudeProviderFactory = createClaudeProvider;
 const claude: AgentProvider = claudeFactory(claudeOptions);
@@ -231,6 +256,7 @@ void CLAUDE_ADAPTER_VERSION;
 void CLAUDE_AGENT_SDK_PACKAGE;
 void CLAUDE_AGENT_SDK_VERSION;
 void claudePermissionMode;
+void hostPermissionCallback;
 void runClaudeTurn;
 void claudeRuntime;
 void claudeSessionOptions;

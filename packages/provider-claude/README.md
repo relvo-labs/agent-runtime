@@ -57,10 +57,11 @@ complete list of what it does, not as a starting point.
 means this package implements and executes the SDK `query()` surface, not that the result
 has been observed against a real Claude model.
 
-| Claim                                       | Evidence                                                                                                                                                       |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Implements the SDK `query()` surface        | Deterministic tests over the `ClaudeQuery` seam — correlation, interrupt settlement, disposal and error classification are exercised against scripted doubles. |
-| Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.            |
+| Claim                                       | Evidence                                                                                                                                                                                                         |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implements the SDK `query()` surface        | Deterministic tests over the `ClaudeQuery` seam — correlation, interrupt settlement, disposal and error classification are exercised against scripted doubles.                                                   |
+| Bridges host permission prompts             | Deterministic tests invoke the installed `canUseTool` exactly as the SDK does — approve, deny, unsupported mode/kind, unknown, cross-session, redelivered, conflicting, unattributable, and every teardown path. |
+| Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                              |
 
 The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.259**
 (`CLAUDE_AGENT_SDK_VERSION`), which is the pinned peer range. There is no captured
@@ -76,6 +77,7 @@ only the first is made here.
 
 | SDK message                  | Provider event / outcome                            |
 | ---------------------------- | --------------------------------------------------- |
+| `canUseTool` prompt          | `interaction.requested` (`approval`) — bridge only  |
 | assistant `text` block       | `run.message_delta` (split at 100 000 chars)        |
 | assistant `tool_use` block   | `run.tool_activity` `invoked`                       |
 | user `tool_result` block     | `run.tool_activity` `succeeded` / `failed`          |
@@ -109,6 +111,51 @@ pre-`user_message_uuid` CLI, declares it with `createClaudeProvider({ correlatio
 that cannot arrive would hang every run. That declaration lapses the moment a stamp does
 appear: the producer has then proven it correlates.
 
+### Tool approvals
+
+Off by default. `createClaudeProvider({ approvals: 'bridge' })` sets the SDK's
+`permissionPrompts: 'host'` and installs its `canUseTool` callback; anything the permission
+mode, rules and hooks did not already decide becomes a neutral `approval` interaction on
+the run that asked, and the tool call proceeds **only** after a response of
+`{ kind: 'approval', decision: 'approved', mode: 'once' }`.
+
+| Neutral capability          | Bridged           | Why                                                                                                 |
+| --------------------------- | ----------------- | --------------------------------------------------------------------------------------------------- |
+| `approval.modes: ['once']`  | yes               | The callback decides the one call in front of it.                                                   |
+| `approval.blocking: true`   | yes               | The SDK waits for the answer; the prompt has no deadline of its own.                                |
+| `approval.modes: 'session'` | no — rejected     | A durable grant is a permission rule this adapter does not write.                                   |
+| `question`                  | no — never raised | `AskUserQuestion`, `onUserDialog` and MCP elicitation carry forms one neutral question cannot hold. |
+| `expired` / `withdrawn`     | no                | No settlement deadline is imposed here, so neither outcome is manufactured.                         |
+
+Everything that is not that one grant fails closed. There is no auto-allow, no
+allow-on-timeout and no allow-on-error path:
+
+- a response for an unknown, already-retired or other session's reference is
+  `unknown_interaction`, and the reference is never echoed back on the error;
+- an unsupported mode or a non-approval response is `capability_unsupported` and does
+  **not** consume the settlement, so a correct answer can still arrive;
+- an identical redelivery is a no-op — the SDK callback is never executed twice — while a
+  different answer to a settled reference is `interaction_already_settled`;
+- when the run ends for any reason (its own result, interrupt, stream EOF, stream failure,
+  session disposal) every outstanding prompt it raised is denied and its references are
+  forgotten, so nothing dangles and a late answer cannot resurrect it.
+
+This is in-process settlement, not crash-safe exactly-once.
+
+The approval subject carries a **sanitized tool name and nothing else**. Tool input holds
+paths, argv, URLs and workspace contents, and an event is durable, so none of it is
+published; the category (`command`, `file_write`, `network`, `tool`) is an advisory label
+derived from the tool name, not an enforced classification. A host that needs the arguments
+to decide wraps `query` in its own binding, where it sees the full `canUseTool` context.
+
+One limitation, stated rather than papered over: a permission callback in 0.3.259 carries
+no `user_message_uuid`, so it cannot be correlated the way a message frame is. Attribution
+rests on this adapter running one turn per session at a time plus the stream binding — a
+prompt is raised for the active run only while nothing contradicts it, and is denied
+outright when another turn owns the wire, when the active run has already produced its
+terminal frame, or when there is no active run. Approval is a host decision surface, not a
+runtime sandbox: see `docs/adr/ADR-0009-provider-trust-boundary.md`.
+
 ### Interrupt semantics
 
 Interrupt is idempotent and coalescing: concurrent calls share one control request.
@@ -134,9 +181,11 @@ callers, and stays retryable to success if teardown rejects.
 
 ## What it does not do
 
-- **Interaction bridging.** No approval or question is raised, so none is declared.
-  `permissionPrompts: 'none'` is set unconditionally: a prompt nobody can answer fails
-  closed instead of hanging a run. Choose a `permissionMode` to pre-authorise tool use.
+- **Questions.** No question is ever raised, so none is declared — see the approval table
+  above for why. Approvals are raised only when the host opts in with
+  `approvals: 'bridge'`; without it `permissionPrompts: 'none'` is set and a prompt nobody
+  can answer fails closed instead of parking a run, since this adapter imposes no
+  settlement deadline. Choose a `permissionMode` to pre-authorise tool use instead.
 - **Non-text turn input.** A `file_ref` part is rejected with `capability_unsupported`
   rather than being invented into prose.
 - **Recovery.** No recovery record is exported, so none is claimed.

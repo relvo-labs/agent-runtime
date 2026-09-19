@@ -58,6 +58,25 @@ export type ClaudeProviderOptions = {
    * misattribution above until the first stamp is observed.
    */
   readonly correlation?: 'required' | 'legacy-unstamped';
+  /**
+   * Whether tool-permission prompts are bridged to neutral approvals.
+   *
+   * `'none'` (the default) tells the SDK nobody answers prompts: anything the
+   * permission mode, rules and hooks did not already decide is denied at once.
+   * The adapter declares no approval capability, which is the honest reading of
+   * a host that has no approval surface — a bridged prompt nobody answers would
+   * park the run instead, and this adapter imposes no settlement deadline.
+   *
+   * `'bridge'` installs the SDK's host permission callback and raises a neutral
+   * `approval` interaction for each prompt, granted only by an explicit
+   * `approved` / `once` response. Declare it only when the host actually
+   * settles interactions.
+   *
+   * This is deliberately not a per-session override: the capability descriptor
+   * is provider-level, and a session that behaved differently would make that
+   * descriptor untrue.
+   */
+  readonly approvals?: 'none' | 'bridge';
   readonly model?: string;
   readonly maxTurns?: number;
   readonly permissionMode?: ClaudePermissionMode;

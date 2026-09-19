@@ -36,11 +36,14 @@ import {
   type ProviderSessionInit,
 } from '@relvo-labs/agent-provider';
 
+import { createApprovalRegistry, type ApprovalRegistry } from './approvals.ts';
 import { loadClaudeQuery, CLAUDE_AGENT_SDK_PACKAGE } from './binding.ts';
 import { ClaudeSessionOptionsSchema, type ClaudeProviderOptions, type ClaudeSessionOptions } from './options.ts';
 import { classifyThrown, correlationStampsOf, createRunTranslator } from './translate.ts';
 import type {
+  ClaudeCanUseTool,
   ClaudeMessageUuid,
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
@@ -138,6 +141,7 @@ function queryOptionsFor(
   defaults: ClaudeProviderOptions,
   overrides: ClaudeSessionOptions,
   abortController: AbortController,
+  canUseTool: ClaudeCanUseTool | undefined,
 ): ClaudeQueryOptions {
   const model = overrides.model ?? defaults.model;
   const maxTurns = overrides.maxTurns ?? defaults.maxTurns;
@@ -148,9 +152,14 @@ function queryOptionsFor(
   return {
     cwd: root,
     abortController,
-    // This adapter declares no interaction capability. Anything that would ask
-    // a human must fail closed instead of hanging a run nobody can answer.
-    permissionPrompts: 'none',
+    // Who answers a prompt the mode, rules and hooks did not settle. Without a
+    // bridge the answer is nobody: anything that would ask a human fails closed
+    // instead of hanging a run no one can answer. With one, the host answers
+    // through a neutral approval interaction. The two fields move together so
+    // `'host'` can never be set without a callback behind it.
+    ...(canUseTool === undefined
+      ? { permissionPrompts: 'none' as const }
+      : { permissionPrompts: 'host' as const, canUseTool }),
     ...(model === undefined ? {} : { model }),
     ...(maxTurns === undefined ? {} : { maxTurns }),
     ...(permissionMode === undefined ? {} : { permissionMode }),
@@ -224,12 +233,20 @@ function createSessionFor(
 ): ProviderSession {
   const abortController = new AbortController();
   const prompts = createPromptStream();
+  const approvals: ApprovalRegistry | undefined =
+    defaults.approvals === 'bridge' ? createApprovalRegistry() : undefined;
 
   let handle: ClaudeQueryHandle;
   try {
     handle = query({
       prompt: prompts.messages,
-      options: queryOptionsFor(init.workspace.root, defaults, overrides, abortController),
+      options: queryOptionsFor(
+        init.workspace.root,
+        defaults,
+        overrides,
+        abortController,
+        approvals === undefined ? undefined : askForApproval,
+      ),
     });
   } catch (error) {
     throw new ProviderRejection(
@@ -245,11 +262,15 @@ function createSessionFor(
   let teardown: Promise<void> | undefined;
 
   /**
-   * The run that owns the turn currently on the wire, once a stamped frame has
-   * identified it. `undefined` means the turn is not this session's active run:
-   * a background or scheduled turn, or a turn whose run has already settled.
+   * What the wire says about the turn currently producing output.
+   *
+   * `unbound` — nothing has identified the turn yet. `run` — a stamped frame
+   * bound it to that run. `foreign` — a stamped frame named a turn this session
+   * did not submit, or one whose run has already settled: a background or
+   * scheduled turn owns the stream.
    */
-  let boundRun: ActiveRun | undefined;
+  type StreamBinding = { kind: 'unbound' } | { kind: 'run'; run: ActiveRun } | { kind: 'foreign' };
+  let binding: StreamBinding = { kind: 'unbound' };
   /**
    * Whether this producer has ever stamped a client uuid. It only ever retires
    * the host's `legacy-unstamped` declaration: once a stamp has been seen, the
@@ -270,7 +291,11 @@ function createSessionFor(
     run.terminated = true;
     run.concluded = true;
     if (active === run) active = undefined;
-    if (boundRun === run) boundRun = undefined;
+    if (binding.kind === 'run' && binding.run === run) binding = { kind: 'unbound' };
+    // The run that asked is gone, so nobody can answer for it any more. Denying
+    // here releases the SDK call that is still waiting and retires the run's
+    // references, so a late response settles nothing and resurrects nothing.
+    approvals?.cancel(run);
     run.settle(termination);
   }
 
@@ -348,13 +373,13 @@ function createSessionFor(
     if (stamps.length > 0) {
       sawCorrelationStamp = true;
       const owner = active !== undefined && stamps.includes(active.uuid) ? active : undefined;
-      boundRun = owner;
+      binding = owner === undefined ? { kind: 'foreign' } : { kind: 'run', run: owner };
       if (owner === undefined) noteUnattributedTurn();
       return owner;
     }
     // Later frames of a turn carry no stamp, so they follow whatever the last
     // stamped frame bound — including a binding to no run at all.
-    if (boundRun !== undefined) return boundRun;
+    if (binding.kind === 'run') return binding.run;
     // Nothing is bound and nothing has been correlated yet. An absent stamp is
     // not evidence of a legacy producer: a background, scheduled or synthetic
     // turn is unstamped for the same reason, and the two are indistinguishable
@@ -364,6 +389,61 @@ function createSessionFor(
     if (legacyUnstamped && !sawCorrelationStamp) return active;
     if (active !== undefined) noteUnattributedTurn();
     return undefined;
+  }
+
+  /**
+   * Which run, if any, a tool-permission prompt may be raised for.
+   *
+   * The pinned SDK's permission callback carries no client uuid — there is no
+   * `user_message_uuid` on a control request — so the stamp that correlates a
+   * *frame* is not available here. Attribution rests on two facts instead: this
+   * adapter runs one turn per session at a time, and the message stream says
+   * which turn is currently producing output.
+   *
+   * A prompt is therefore attributed to the active run only while nothing
+   * contradicts it. If another turn owns the wire, or the active run has
+   * already produced its terminal frame, or there is no active run at all, the
+   * prompt belongs to work this session cannot account for and is denied.
+   * Attributing it anyway would ask a host to authorise one run's action and
+   * then apply the answer to another's.
+   */
+  function approvalOwner(): ActiveRun | undefined {
+    const run = active;
+    if (run === undefined || run.terminated || run.concluded) return undefined;
+    // A run being stopped may not raise a new interaction: the runtime records
+    // that as a contract violation rather than routing it, so the prompt would
+    // wait for an answer that can never be delivered. Intent is provisional —
+    // a refused stop withdraws it — and attribution resumes with it.
+    if (run.interruptRequested) return undefined;
+    if (binding.kind === 'foreign') return undefined;
+    if (binding.kind === 'run' && binding.run !== run) return undefined;
+    return run;
+  }
+
+  /**
+   * The SDK's host permission callback.
+   *
+   * Installed only when the host asked for the bridge. It never rejects and
+   * never resolves `null`: the SDK reads `null` as "already answered out of
+   * band" and would leave the tool blocked with no answer coming.
+   */
+  function askForApproval(toolName: string, _input: Record<string, unknown>): Promise<ClaudePermissionResult> {
+    const registry = approvals;
+    const run = registry === undefined ? undefined : approvalOwner();
+    if (registry === undefined || run === undefined) {
+      init.sink.emit({
+        payload: {
+          type: 'diagnostic',
+          level: 'debug',
+          message: 'claude asked for tool permission outside an attributable run; it was denied',
+        },
+      });
+      return Promise.resolve({
+        behavior: 'deny',
+        message: 'this session has no run that can be asked to approve tool use',
+      });
+    }
+    return registry.request(run, run.request.sink, toolName);
   }
 
   function pump(): void {
@@ -550,14 +630,21 @@ function createSessionFor(
       }
     },
 
-    respondToInteraction(_providerRef: string, _response: InteractionResponse): Promise<void> {
-      // The adapter never raises an interaction, so any reference is unknown.
-      // Silently accepting one would let a caller believe an approval landed.
-      // The reference itself is not echoed: it is caller-controlled text on a
-      // durable error.
-      return Promise.reject(
-        new ProviderRejection(agentError('unknown_interaction', 'the claude adapter does not raise interactions')),
-      );
+    respondToInteraction(providerRef: string, response: InteractionResponse): Promise<void> {
+      // Silently accepting a reference this session cannot settle would let a
+      // caller believe an approval landed. The reference itself is never
+      // echoed: it is caller-controlled text on a durable error.
+      if (approvals === undefined) {
+        return Promise.reject(
+          new ProviderRejection(agentError('unknown_interaction', 'the claude adapter does not raise interactions')),
+        );
+      }
+      try {
+        approvals.settle(providerRef, response);
+        return Promise.resolve();
+      } catch (error) {
+        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      }
     },
 
     dispose(): Promise<void> {
@@ -567,6 +654,10 @@ function createSessionFor(
       disposing = true;
       prompts.close();
       abortController.abort();
+      // Fenced in the same synchronous step: an outstanding prompt can never be
+      // answered once the query is aborted, and a teardown that then rejects
+      // must not leave the SDK holding a promise nothing will settle.
+      approvals?.cancelAll();
       // One teardown at a time, shared by concurrent callers.
       if (teardown !== undefined) return teardown;
 
@@ -625,9 +716,22 @@ export function createClaudeProvider(options: ClaudeProviderOptions = {}): Agent
       },
       maxConcurrentRunsPerSession: 1,
     },
-    // No approval or question is bridged, so none is claimed. Permission
-    // prompts inside the SDK fail closed instead of waiting for an answer.
-    interaction: { approval: {}, question: {}, settlementTimeoutMs: null },
+    interaction: {
+      // Claimed only when the host asked for the bridge, and only to the degree
+      // the SDK's callback can express: it decides the one call in front of it,
+      // and it blocks until this adapter answers. A `session` or `persistent`
+      // grant would be a permission rule this adapter does not write, so it is
+      // not offered. Without the bridge nothing is claimed and a prompt fails
+      // closed inside the SDK instead of waiting for an answer.
+      approval: options.approvals === 'bridge' ? { supported: true, modes: ['once'], blocking: true } : {},
+      // The SDK's question-shaped surfaces — `AskUserQuestion` tool input,
+      // `onUserDialog`, MCP elicitation — carry forms this adapter cannot
+      // represent as one neutral question without dropping fields, so none is
+      // claimed and none is bridged.
+      question: {},
+      // No settlement deadline is imposed here; a prompt waits for the host.
+      settlementTimeoutMs: null,
+    },
     workspace: { requires: 'directory', acceptsOwnership: ['borrowed', 'managed'], writes: true },
     recovery: {},
     extensions: {

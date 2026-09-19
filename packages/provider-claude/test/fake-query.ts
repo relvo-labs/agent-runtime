@@ -7,6 +7,7 @@
  */
 
 import type {
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
@@ -45,6 +46,14 @@ export type FakeQuery = {
   holdNextInterrupt(): () => void;
   /** Hold `return()` unresolved so a concurrent disposal can be observed. */
   holdNextReturn(): () => void;
+  /**
+   * Ask the host permission callback the adapter installed, the way the SDK
+   * does before running a tool it could not decide on its own.
+   *
+   * Throws when no callback was installed, so a test cannot mistake "the
+   * adapter never offered a permission surface" for "the tool was allowed".
+   */
+  requestPermission(toolName: string, input?: Record<string, unknown>): Promise<ClaudePermissionResult>;
 };
 
 /**
@@ -75,6 +84,7 @@ export function createFakeQuery(): FakeQuery {
   let failure: { reason: unknown } | undefined;
   let interruptCalls = 0;
   let returnCalls = 0;
+  let toolUseCount = 0;
   let nextInterruptFailure: { reason: unknown } | undefined;
   let nextReturnFailure: { reason: unknown } | undefined;
   let interruptReceipt: unknown = undefined;
@@ -211,6 +221,20 @@ export function createFakeQuery(): FakeQuery {
         release.teardown?.();
         release.teardown = undefined;
       };
+    },
+    requestPermission(toolName: string, input: Record<string, unknown> = {}): Promise<ClaudePermissionResult> {
+      const options = calls[0]?.options;
+      const ask = options?.canUseTool;
+      if (options === undefined || ask === undefined) {
+        throw new Error('the adapter installed no host permission callback');
+      }
+      toolUseCount += 1;
+      return ask(toolName, input, {
+        // The real callback is handed the query's own signal, so a test sees
+        // exactly what an aborted query does to an outstanding prompt.
+        signal: options.abortController.signal,
+        toolUseID: `toolu_fake_${String(toolUseCount)}`,
+      });
     },
   };
 }

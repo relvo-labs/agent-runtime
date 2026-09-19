@@ -30,15 +30,18 @@ export {
 } from './options.ts';
 
 export type {
+  ClaudeCanUseTool,
   ClaudeInterruptReceipt,
   ClaudeMessageUuid,
   ClaudePermissionMode,
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
   ClaudeQueryMessage,
   ClaudeQueryOptions,
   ClaudeQueryParams,
+  ClaudeToolPermissionRequest,
 } from './seam.ts';
 
 /**
