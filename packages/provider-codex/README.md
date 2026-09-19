@@ -29,18 +29,19 @@ Do not read "compatible" as "verified against a live model". Those are different
 
 ## Capabilities
 
-| Capability                          | Status                                                                                                                                                                      |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Text turn input                     | Supported. `text` parts only; multiple parts are joined.                                                                                                                    |
-| Streaming assistant text            | Supported, via `item/agentMessage/delta`.                                                                                                                                   |
-| Token usage                         | Supported, streamed from `thread/tokenUsage/updated` (the per-turn `last` breakdown, not the cumulative thread total).                                                      |
-| Cooperative interrupt               | Supported, via `turn/interrupt`. The session survives it.                                                                                                                   |
-| Tool activity events                | **Not supported.** The item payloads are stable in the protocol but carry commands, cwd and executor-native paths that need a redaction contract this slice does not build. |
-| Approvals / questions / elicitation | **Not supported.** Every server-initiated request is declined with a JSON-RPC error, so a blocking request cannot stall a turn.                                             |
-| Recovery / resume / export          | **Not supported.**                                                                                                                                                          |
-| Images, audio, file references      | **Not supported.**                                                                                                                                                          |
-| Workspace                           | Required. One thread is bound to the acquired lease root for the whole session.                                                                                             |
-| Side-effect-free execution          | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                        |
+| Capability                                | Status                                                                                                                                                                                          |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Text turn input                           | Supported. `text` parts only; multiple parts are joined.                                                                                                                                        |
+| Streaming assistant text                  | Supported, via `item/agentMessage/delta`.                                                                                                                                                       |
+| Token usage                               | Supported, streamed from `thread/tokenUsage/updated` (the per-turn `last` breakdown, not the cumulative thread total).                                                                          |
+| Cooperative interrupt                     | Supported, via `turn/interrupt`. The session survives it.                                                                                                                                       |
+| Tool activity events                      | **Not supported.** The item payloads are stable in the protocol but carry commands, cwd and executor-native paths that need a redaction contract this slice does not build.                     |
+| Command approvals                         | **Opt-in**, via `createCodexProvider({ approvals: 'bridge' })`. One `item/commandExecution/requestApproval` becomes one neutral approval, granted only by an explicit response. Off by default. |
+| Questions / elicitation / other approvals | **Not supported.** Declined with a JSON-RPC error on their own request id, so a blocking request cannot stall a turn. See the mapping table below.                                              |
+| Recovery / resume / export                | **Not supported.**                                                                                                                                                                              |
+| Images, audio, file references            | **Not supported.**                                                                                                                                                                              |
+| Workspace                                 | Required. One thread is bound to the acquired lease root for the whole session.                                                                                                                 |
+| Side-effect-free execution                | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                                            |
 
 ## Usage
 
@@ -76,6 +77,40 @@ const codex = createCodexProvider({ transport: ({ cwd }) => myTransportFor(cwd) 
 > For that reason `descriptor.workspace.writes` is **always `true`**, including under `read-only`: a host must treat the lease root as mutable whatever policy was requested. `descriptor.extensions.isolatesConfiguredTooling` is `false`, stated explicitly so nothing is inferred from the policy name.
 
 Choosing `workspace-write` or `danger-full-access` alongside a `cwd` also causes the app-server to mark that project trusted in the user's `config.toml`, which is a host-config mutation outside the acquired workspace. That is why the conservative value is the default.
+
+### Approvals — the pinned mapping table
+
+Off by default. `createCodexProvider({ approvals: 'bridge' })` turns it on, which changes exactly three things: `thread/start` sends `approvalPolicy: 'on-request'` instead of `'never'`, the descriptor declares `interaction.approval = { supported: true, modes: ['once', 'session'], blocking: true }`, and one server-initiated method is answered by a host instead of declined.
+
+```ts
+const codex = createCodexProvider({ approvals: 'bridge', sandboxMode: 'workspace-write' });
+```
+
+The command then runs only after a `{ kind: 'approval', decision: 'approved', mode: 'once' | 'session' }` response reaches `respondToInteraction`. There is no auto-approve, no allow-on-timeout and no allow-on-error path anywhere in this package.
+
+Every `ServerRequest` method in the pinned 0.153.4 stable surface, and what this adapter does with it:
+
+| Method                                  | Bridged | Why                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `item/commandExecution/requestApproval` | **Yes** | Carries its own reviewable subject (`command`, `cwd`, `reason`), and `accept` / `acceptForSession` / `decline` map onto `once` / `session` / denied.                                                                                                                                                  |
+| `item/fileChange/requestApproval`       | No      | `FileChangeRequestApprovalParams` names no files — the change set lives in the `itemId` item, which this adapter does not surface (`streaming.toolActivity: false`). The approval would have no reviewable subject.                                                                                   |
+| `item/tool/requestUserInput`            | No      | Every `ToolRequestUserInput*` type is annotated EXPERIMENTAL and gated behind `InitializeCapabilities.experimentalApi`, which is never opted into. Its payload is also a question _list_ carrying `isSecret`, `isOther` and `autoResolutionMs`, which one neutral `QuestionRequest` cannot represent. |
+| `item/permissions/requestApproval`      | No      | The response requires a `GrantedPermissionProfile` and a `PermissionGrantScope`, and has no decline variant at all.                                                                                                                                                                                   |
+| `mcpServer/elicitation/request`         | No      | An arbitrary multi-field form (`McpElicitationSchema`) with a _nullable_ `turnId`, so neither the one-question mapping nor run correlation holds.                                                                                                                                                     |
+| `item/tool/call`                        | No      | Asks the client to execute a tool. Not an interaction.                                                                                                                                                                                                                                                |
+| `account/chatgptAuthTokens/refresh`     | No      | A credential operation; this adapter holds no credentials.                                                                                                                                                                                                                                            |
+| `attestation/generate`                  | No      | Requires `requestAttestation`, which is never sent.                                                                                                                                                                                                                                                   |
+| `applyPatchApproval` (legacy)           | No      | Carries `conversationId` / `callId` and no `turnId`, so it cannot be bound to the active run.                                                                                                                                                                                                         |
+| `execCommandApproval` (legacy)          | No      | Same: no `turnId`.                                                                                                                                                                                                                                                                                    |
+
+A bridged command approval is **still refused**, on its own request id with `-32602`, when the request cannot be represented faithfully: `kind: 'writeStdin'` or any unknown kind, no reviewable `command`, or a proposed execpolicy / network-policy amendment or managed-network context — because the neutral response cannot carry the amendment the server is actually asking about, and answering it with a plain `accept` would discard the question. A well-formed approval that does not name the active `(threadId, turnId)`, arrives before the turn is bound, arrives after the run concluded or after interruption began, or exceeds the per-session bound, is refused with `-32600`. Nothing in either case raises an interaction.
+
+Two limits worth stating plainly:
+
+- **A denial reason does not reach the model.** `CommandExecutionRequestApprovalResponse` carries `decision` and nothing else, so `response.reason` is not transmissible on this protocol. The descriptor says so: `extensions.approvalDenialReasonDelivered === false`.
+- **An approval is provider-declared intent, not a runtime guarantee.** The subject's `command`, `cwd` and `reason` are untrusted text from another process, and the runtime neither runs the command nor can enforce that Codex runs exactly it (ADR-0009). Displaying, retaining and access-controlling that text is the host's responsibility.
+
+Settlement is **process-local and exactly-once**: one reference settles one native callback one time. An identical redelivery is a no-op, a conflicting answer is `interaction_already_settled`, an unknown or retired reference is `unknown_interaction`, and a mode the protocol cannot encode is `capability_unsupported` _before_ the settlement is consumed, so the approval stays answerable. This is not crash-safe exactly-once. When a run ends for any reason — completion, failure, interrupt, EOF, transport failure or disposal — its outstanding approvals are declined and their references retired, so no callback dangles and a late answer can neither settle nor revive the run.
 
 ### Credentials
 

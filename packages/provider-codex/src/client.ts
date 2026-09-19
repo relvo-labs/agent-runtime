@@ -13,9 +13,17 @@
  *      child-process exit surfaces;
  *   3. a per-request deadline, for a live peer that simply never answers.
  *
- * It also declines every server-initiated request. Silence is not an option:
- * `item/tool/requestUserInput` carries `isBlocking`, so an unanswered request
- * can stall a turn indefinitely (research, "Wire and initialization").
+ * It also guarantees that every *server-initiated* request is answered exactly
+ * once. The session may take ownership of one and answer it later — that is how
+ * an approval reaches a host — but anything it does not take is declined here
+ * and now. Silence is not an option: `item/tool/requestUserInput` carries
+ * `isBlocking`, so an unanswered request can stall a turn indefinitely
+ * (research, "Wire and initialization").
+ *
+ * The two id spaces are deliberately separate. `pending` holds ids this adapter
+ * chose and the server must answer; `serverRequests` holds ids the server chose
+ * and this adapter must answer. Both sides number from 1, so merging them would
+ * let one side settle the other's request.
  */
 
 import { agentError, type JsonValue } from '@relvo-labs/agent-protocol';
@@ -23,6 +31,7 @@ import { ProviderRejection } from '@relvo-labs/agent-provider';
 
 import { METHOD_NOT_SUPPORTED, classifyServerMessage, type JsonlDropReason } from './protocol.ts';
 import { classifyThrown } from './translate.ts';
+import type { CodexServerRequestOffer } from './interaction.ts';
 import type { CodexRequestId, CodexTransport, CodexTransportEnd, CodexWireError } from './seam.ts';
 
 /** Default per-request deadline. Turns are unbounded; RPC round-trips are not. */
@@ -123,10 +132,17 @@ export type CodexClientEnd = {
 export type CodexClientHandlers = {
   /** A turn/thread notification. Already classified; params are unvalidated. */
   onNotification(method: string, params: unknown): void;
-  /** A server-initiated request was declined. Only the method name is passed. */
-  onServerRequest(method: string): void;
+  /**
+   * A server-initiated request arrived.
+   *
+   * Return `true` to take responsibility for answering it — now or later,
+   * through the offer's own `respond`/`reject`. Return `false` and this layer
+   * declines it immediately, so an unhandled request can never hang a turn.
+   * The native id is not passed: the ability to answer it once is.
+   */
+  onServerRequest(request: CodexServerRequestOffer): boolean;
   /** An inbound frame could not be used. Bounded, allowlisted reason token. */
-  onDrop(reason: JsonlDropReason | 'unclassifiable' | 'unknown_reply'): void;
+  onDrop(reason: JsonlDropReason | 'unclassifiable' | 'unknown_reply' | 'duplicate_server_request'): void;
   /** The inbound stream ended. Fires exactly once. */
   onEnd(end: CodexClientEnd): void;
 };
@@ -159,7 +175,16 @@ export function createCodexClient(
   options: CodexClientOptions = {},
 ): CodexClient {
   const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  /** Ids this adapter chose, awaiting the server's reply. */
   const pending = new Map<CodexRequestId, Pending>();
+  /**
+   * Ids the *server* chose, awaiting this adapter's reply.
+   *
+   * Kept strictly apart from `pending`. The two id spaces are independent —
+   * both sides number from 1 — so merging them would let a server request
+   * resolve one of this adapter's own in-flight calls, or the reverse.
+   */
+  const serverRequests = new Set<CodexRequestId>();
   // Monotonic and never reused, so a late reply to a retired request can never
   // be mistaken for the answer to a current one.
   let nextId = 1;
@@ -179,6 +204,9 @@ export function createCodexClient(
     if (announcedEnd) return;
     announcedEnd = true;
     ended = true;
+    // Nothing can be written any more, so no server request is still
+    // answerable. The session retires its own routing state on `onEnd`.
+    serverRequests.clear();
     settleAllPending(
       new ProviderRejection(
         agentError(
@@ -208,16 +236,49 @@ export function createCodexClient(
         return;
 
       case 'request': {
-        // Decline explicitly, once, echoing the server's own id so it is not
-        // left waiting. Nothing about the request payload is read or retained.
-        transport.send({
-          id: message.id,
-          error: {
-            code: METHOD_NOT_SUPPORTED,
-            message: 'method not supported by this client',
-          },
-        });
-        handlers.onServerRequest(message.method);
+        // A second request reusing an id that is still outstanding cannot be
+        // answered: a reply frame naming that id would settle the *first*
+        // request. So it is recorded and ignored rather than answered or
+        // allowed to raise anything.
+        if (serverRequests.has(message.id)) {
+          handlers.onDrop('duplicate_server_request');
+          return;
+        }
+        serverRequests.add(message.id);
+
+        // At most one reply per server request, guaranteed here rather than
+        // trusted to the handler. `serverRequests` is deliberately a separate
+        // map from `pending`: one tracks ids the *server* chose and this
+        // adapter must answer, the other tracks ids this adapter chose and the
+        // server must answer. Sharing them would let one side settle the other.
+        let answered = false;
+        const reply = (
+          body: { id: CodexRequestId; result: JsonValue } | { id: CodexRequestId; error: CodexWireError },
+        ): boolean => {
+          if (answered || ended) return false;
+          answered = true;
+          serverRequests.delete(message.id);
+          transport.send(body);
+          return true;
+        };
+        const offer: CodexServerRequestOffer = {
+          method: message.method,
+          params: message.params,
+          respond: (result: JsonValue) => reply({ id: message.id, result }),
+          reject: (code: number, text: string) => reply({ id: message.id, error: { code, message: text } }),
+        };
+
+        let taken: boolean;
+        try {
+          taken = handlers.onServerRequest(offer);
+        } catch {
+          // A handler that throws must not leave the server waiting, and must
+          // not be able to break the inbound loop.
+          taken = false;
+        }
+        // Decline explicitly, echoing the server's own id so it is not left
+        // waiting. `reject` is a no-op if the handler already answered.
+        if (!taken) offer.reject(METHOD_NOT_SUPPORTED, 'method not supported by this client');
         return;
       }
 

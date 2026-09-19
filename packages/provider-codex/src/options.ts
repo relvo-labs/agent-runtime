@@ -70,6 +70,30 @@ export type CodexProviderOptions = {
   /** Default execution policy, overridable per session. Defaults to `read-only`. */
   readonly sandboxMode?: CodexSandboxMode;
   /**
+   * Whether the app-server's command-approval requests are bridged to neutral
+   * approval interactions.
+   *
+   * Defaults to `'none'`, which keeps the current posture exactly: `thread/start`
+   * sends `approvalPolicy: 'never'`, the descriptor declares no approval
+   * capability, and every server-initiated request is declined. That is the
+   * honest reading of a host with no approval surface — a bridged approval
+   * nobody answers would park a run, because this adapter imposes no settlement
+   * deadline of its own.
+   *
+   * `'bridge'` sends `approvalPolicy: 'on-request'`, declares
+   * `approval = { supported: true, modes: ['once', 'session'], blocking: true }`
+   * and raises one `interaction.requested` per
+   * `item/commandExecution/requestApproval` on the run that owns the turn. The
+   * command only runs after an explicit `approved` response reaches
+   * `respondToInteraction`. Every other server request stays declined — see the
+   * mapping table in `interaction.ts`.
+   *
+   * This is provider-level, not a session override: a descriptor is one object
+   * for the whole provider, and a capability that varied per session would be a
+   * claim the descriptor cannot make truthfully.
+   */
+  readonly approvals?: 'none' | 'bridge';
+  /**
    * Client identity sent in `initialize.params.clientInfo.name`. Upstream uses
    * it for compliance-log attribution, so a host with its own registered client
    * name should set it.

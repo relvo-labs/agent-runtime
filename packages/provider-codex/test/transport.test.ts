@@ -272,7 +272,7 @@ describe('argv and shell safety', () => {
         fixture.onCleanup(() => transport.close());
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: () => undefined,
         });
@@ -501,7 +501,7 @@ describe('process exit and teardown', () => {
         fixture.onCleanup(() => transport.close());
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: () => undefined,
         });
@@ -1075,7 +1075,7 @@ describe('stdout EOF while the process is still alive', () => {
         const ends: CodexClientEnd[] = [];
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: (end) => ends.push(end),
         });

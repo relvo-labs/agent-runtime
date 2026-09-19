@@ -27,7 +27,12 @@ function recorder(): { handlers: Parameters<typeof createCodexClient>[1]; log: R
     log,
     handlers: {
       onNotification: (method, params) => log.notifications.push({ method, params }),
-      onServerRequest: (method) => log.serverRequests.push(method),
+      // Takes no ownership, so the client must decline every one of them —
+      // which is the posture a provider without the approval bridge keeps.
+      onServerRequest: (request) => {
+        log.serverRequests.push(request.method);
+        return false;
+      },
       onDrop: (reason) => log.drops.push(reason),
       onEnd: (end) => log.ends.push(end),
     },
