@@ -195,14 +195,14 @@ callers, and stays retryable to success if teardown rejects.
 ## Structured questions
 
 Off by default. `createClaudeProvider({ questions: 'bridge' })` installs the SDK's host
-callback and turns each `AskUserQuestion` call into one neutral `question_set` interaction
-on the run that asked. The run **pauses at the native wait point** and resumes there once
-the host answers — this is not a follow-up turn and not an approval.
+callback and turns each `AskUserQuestion` call reaching it into one neutral `question_set`
+interaction on the run that asked. The run **pauses at the native wait point** and resumes
+there once the host answers — this is not a follow-up turn and not an approval.
 
-The answer route is the pinned one. `AskUserQuestion` reaches `canUseTool` like any other
-tool, and the host answers by allowing the call with an `updatedInput` carrying the
-answers map that `AskUserQuestionInput.answers` declares ("User answers collected by the
-permission component"). A bare `{ behavior: 'allow' }` would run the tool with no answers;
+The answer route requires `AskUserQuestion` to reach `canUseTool`. The host answers by
+allowing the call with an `updatedInput` carrying the answers map that
+`AskUserQuestionInput.answers` declares ("User answers collected by the permission
+component"). A bare `{ behavior: 'allow' }` would run the tool with no answers;
 a denial would hand the model prose. Neither is ever used to settle a question here.
 
 | Native form                          | Bridged            | Notes                                                                                                                                                                                         |
@@ -235,10 +235,17 @@ is emitted on that run's sink, so the interaction settles `withdrawn`, its routi
 a later answer is `interaction_already_settled`, the next question can be raised, and the
 run's own success stays a success instead of becoming a `provider_contract_violation`.
 
-Two limitations worth stating: `canUseTool` is not called for a tool an allow rule or a
-permission mode already decided, so an `AskUserQuestion` pre-approved that way is never
-seen by this bridge; and if you pass an `allowedTools` list, include `AskUserQuestion` in
-it or the tool is never offered to the model.
+In the pinned SDK 0.3.259, `tools` controls the available tool inventory; `allowedTools`
+auto-approves tool calls. This adapter forwards `allowedTools` but does not expose the
+SDK's `tools` option. Do not add `AskUserQuestion` to `allowedTools` to enable questions:
+auto-approved calls bypass `canUseTool`, preventing this bridge from creating a structured
+interaction and returning `updatedInput.answers`. Allow rules or permission modes that
+already decide the call can also bypass the callback. Tool availability alone does not
+guarantee that the callback runs.
+
+Keep `questions: 'bridge'` and `approvals: 'bridge'` as separate opt-ins. Enabling questions
+does not approve other tools; relaxing permissions is not a substitute for collecting
+answers through `canUseTool`.
 
 Questions and answers are untrusted, possibly sensitive text, and a settled answer is
 committed to the durable event log. See "Untrusted and sensitive content" below.
@@ -250,7 +257,7 @@ committed to the durable event log. See "Untrusted and sensitive content" below.
   reply. Approvals are likewise raised only when the host opts in with
   `approvals: 'bridge'`; without either, `permissionPrompts: 'none'` is set and a prompt
   nobody can answer fails closed instead of parking a run, since this adapter imposes no
-  settlement deadline. Choose a `permissionMode` to pre-authorise tool use instead.
+  settlement deadline. Pre-authorising tool use does not supply question answers.
 - **Non-text turn input.** A `file_ref` part is rejected with `capability_unsupported`
   rather than being invented into prose.
 - **Recovery.** No recovery record is exported, so none is claimed.
