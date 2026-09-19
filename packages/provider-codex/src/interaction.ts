@@ -503,9 +503,11 @@ export type CodexServerRequestOffer = {
   readonly id: CodexRequestId;
   readonly method: string;
   readonly params: unknown;
-  /** Answer with a result. Returns false if it was already answered. */
+  /** Mark server-side resolution without writing a reply. Idempotent. */
+  retire(): void;
+  /** Answer with a result. Returns false if it was already answered or retired. */
   respond(result: JsonValue): boolean;
-  /** Answer with a JSON-RPC error. Returns false if it was already answered. */
+  /** Answer with a JSON-RPC error. Returns false if already answered or retired. */
   reject(code: number, message: string): boolean;
 };
 
@@ -568,6 +570,7 @@ type Entry = {
   /** The adapter's correlation token, echoed on a withdrawal. */
   readonly providerRef: string;
   readonly respond: (result: JsonValue) => boolean;
+  readonly retire: () => void;
   /**
    * The answer already applied, canonicalized. Present means the one native
    * callback has been used: identical redelivery is a no-op, a different answer
@@ -718,6 +721,9 @@ export function createInteractionRegistry(
       request: translation.request,
       plan: translation.plan,
       respond: (result: JsonValue) => request.respond(result),
+      retire: () => {
+        request.retire();
+      },
       applied: undefined,
     });
     byNativeId.set(request.id, providerRef);
@@ -784,6 +790,9 @@ export function createInteractionRegistry(
         // Wrapped rather than passed by reference: the offer owns the native
         // id and the at-most-once guard, and this keeps `this` bound to it.
         respond: (result: JsonValue) => request.respond(result),
+        retire: () => {
+          request.retire();
+        },
         applied: undefined,
       });
       byNativeId.set(request.id, providerRef);
@@ -799,6 +808,10 @@ export function createInteractionRegistry(
       byNativeId.delete(requestId);
       const entry = entries.get(providerRef);
       if (entry === undefined) return;
+      // Correlation is established by the session's thread check and this
+      // registry's native-id lookup. Retire the client ledger too: overflow
+      // cleanup must never write a rejection to a server-resolved request.
+      entry.retire();
       // Already answered: this is the server confirming the reply this adapter
       // already wrote. Harmless, and the entry stays tracked so an identical
       // redelivery of that answer remains a no-op rather than becoming an

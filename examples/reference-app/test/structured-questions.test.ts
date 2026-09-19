@@ -1251,3 +1251,114 @@ describe('native withdrawal commit failures through real adapters and Runtime', 
     }
   }
 });
+
+describe('invalid own answer keys through concrete adapters and Runtime', () => {
+  for (const adapter of ['claude', 'codex'] as const) {
+    it.each([
+      { key: '__proto__', answer: { type: 'invalid', text: 'not asked' } },
+      { key: '__proto__', answer: { type: 'text', text: 'not asked' } },
+      { key: 'bad key', answer: { type: 'text', text: 'not asked' } },
+    ])(
+      `${adapter}: rejects JSON-parsed $key with $answer.type, then continues the same run`,
+      async ({ key, answer }) => {
+        const claude = adapter === 'claude' ? await claudeVertical() : undefined;
+        const codex = adapter === 'codex' ? await codexVertical() : undefined;
+        const vertical = claude ?? codex!;
+        const { interactionId } = await pendingBatch(vertical);
+        let nativeSettlements = 0;
+        if (claude)
+          void claude.decision.then(() => {
+            nativeSettlements += 1;
+          });
+        const response = {
+          kind: 'question_set' as const,
+          answers: {
+            q1: { type: 'selection' as const, values: ['o1'] },
+            q2:
+              adapter === 'claude'
+                ? { type: 'selection' as const, values: ['o1'] }
+                : { type: 'text' as const, text: 'provided' },
+          },
+        };
+        const malformed: unknown = JSON.parse(
+          JSON.stringify({
+            ...response,
+            answers: Object.fromEntries([...Object.entries(response.answers), [key, answer]]),
+          }),
+        );
+        const command = {
+          commandId: vertical.next(),
+          type: 'respond_to_interaction' as const,
+          sessionId: vertical.sessionId,
+          interactionId,
+          response: malformed,
+        };
+        const rejected = await vertical.runtime.respondToInteraction(command as never);
+        expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'invalid_request' } });
+        expect(await vertical.runtime.respondToInteraction(command as never)).toEqual(rejected);
+        await settle(vertical.runtime);
+        expect(nativeSettlements).toBe(0);
+        if (codex) expect(codexReplies(codex.fake)).toHaveLength(0);
+        expect((await soleInteraction(vertical)).status).toBe('pending');
+        expect((await vertical.runtime.getSession(vertical.sessionId))?.runs.at(-1)?.state).toBe(
+          'awaiting_interaction',
+        );
+        const corrected = await vertical.runtime.respondToInteraction({
+          ...command,
+          commandId: vertical.next(),
+          response,
+        });
+        expect(corrected.disposition).toBe('applied');
+        if (claude) {
+          await expect(claude.decision).resolves.toMatchObject({
+            behavior: 'allow',
+            updatedInput: {
+              answers: { 'Which database should I use?': 'PostgreSQL', 'Which regions?': 'EU' },
+            },
+          });
+          expect(nativeSettlements).toBe(1);
+          claude.fake.push({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            user_message_uuid: claude.fake.promptUuid,
+          });
+        }
+        if (codex) {
+          expect(codexReplies(codex.fake)).toHaveLength(1);
+          expect(codexReplies(codex.fake)[0]).toMatchObject({
+            result: {
+              answers: {
+                'native-a': { answers: ['PostgreSQL'] },
+                'native-b': { answers: ['provided'] },
+              },
+            },
+          });
+          codex.fake.push({
+            method: 'turn/completed',
+            params: {
+              threadId: CODEX_THREAD,
+              turn: {
+                id: CODEX_TURN,
+                items: [],
+                itemsView: 'complete',
+                status: 'completed',
+                error: null,
+                startedAt: 1,
+                completedAt: 2,
+                durationMs: 1,
+              },
+            },
+          });
+        }
+        await settle(vertical.runtime);
+        expect((await vertical.runtime.getSession(vertical.sessionId))?.runs.at(-1)).toMatchObject({
+          runId: vertical.runId,
+          state: 'succeeded',
+        });
+        expect((await soleInteraction(vertical)).settlement?.outcome).toBe('responded');
+        await vertical.runtime.shutdown();
+      },
+    );
+  }
+});

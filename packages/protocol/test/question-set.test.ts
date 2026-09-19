@@ -6,16 +6,20 @@
  * completely or not at all, and the legacy single-question form is untouched.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
+import type { z } from 'zod';
 
 import {
+  AgentErrorSchema,
   InteractionRequestSchema,
   InteractionResponseSchema,
   QuestionSetRequestSchema,
   QuestionSetResponseSchema,
   WIRE_VERSION,
   checkResponseAgainstRequest,
+  type QuestionAnswer,
   type QuestionSetRequest,
+  type QuestionSetResponse,
 } from '../src/index.ts';
 
 const batch: QuestionSetRequest = QuestionSetRequestSchema.parse({
@@ -252,8 +256,35 @@ describe('prototype-named neutral question keys', () => {
       expect(checkResponseAgainstRequest(request, present)).toBeUndefined();
       if (keys.length > 1) {
         Reflect.deleteProperty(present.answers, 'toString');
-        expect(checkResponseAgainstRequest(request, present)).toBe('unanswered question(s): toString');
+        expect(checkResponseAgainstRequest(request, present)).toBe('unanswered question(s): 1');
       }
     },
   );
+});
+
+describe('bounded missing-answer classification', () => {
+  it('fits AgentError for 32 missing 64-character keys and accepts a corrected full batch', () => {
+    const keys = Array.from({ length: 32 }, (_, index) => `q${String(index).padStart(2, '0')}`.padEnd(64, 'x'));
+    const request = QuestionSetRequestSchema.parse({
+      kind: 'question_set',
+      questions: keys.map((key) => ({ key, prompt: 'Answer explicitly' })),
+    });
+    const missing = QuestionSetResponseSchema.parse({ kind: 'question_set', answers: {} });
+    const reason = checkResponseAgainstRequest(request, missing);
+    expect(reason).toBeDefined();
+    expect(reason!.length).toBeLessThanOrEqual(2000);
+    expect(AgentErrorSchema.safeParse({ code: 'invalid_request', message: reason }).success).toBe(true);
+    expect(reason).toBe('unanswered question(s): 32');
+    for (const key of keys) expect(reason).not.toContain(key);
+    const complete = QuestionSetResponseSchema.parse({
+      kind: 'question_set',
+      answers: Object.fromEntries(keys.map((key) => [key, { type: 'text', text: 'provided' }])),
+    });
+    expect(checkResponseAgainstRequest(request, complete)).toBeUndefined();
+  });
+});
+
+it('keeps question response schema input and output DTOs identical', () => {
+  expectTypeOf<z.input<typeof QuestionSetResponseSchema>>().toEqualTypeOf<QuestionSetResponse>();
+  expectTypeOf<QuestionSetResponse['answers']>().toEqualTypeOf<Record<string, QuestionAnswer>>();
 });

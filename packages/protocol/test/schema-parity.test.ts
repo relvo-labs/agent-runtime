@@ -510,3 +510,55 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     }
   });
 });
+
+describe('own answer key grammar before record parsing', () => {
+  const cases = [
+    { key: '__proto__', answer: { type: 'invalid', text: 'not asked' }, accepted: false },
+    { key: '__proto__', answer: { type: 'text', text: 'not asked' }, accepted: false },
+    ...['', '_hidden', 'bad key', 'a'.repeat(65)].map((key) => ({
+      key,
+      answer: { type: 'text', text: 'not asked' },
+      accepted: false,
+    })),
+    ...['constructor', 'toString'].map((key) => ({
+      key,
+      answer: { type: 'text', text: 'provided' },
+      accepted: true,
+    })),
+  ];
+  for (const schema of ['interaction-response', 'agent-command'] as const) {
+    it.each(cases)(
+      `${schema} preserves parity for JSON-parsed own key $key with $answer.type`,
+      ({ key, answer, accepted }) => {
+        const answers = JSON.parse(
+          JSON.stringify(
+            Object.fromEntries([
+              ['q1', { type: 'text', text: 'provided' }],
+              [key, answer],
+            ]),
+          ),
+        ) as Record<string, unknown>;
+        expect(Object.hasOwn(answers, key)).toBe(true);
+        const response = { kind: 'question_set', answers };
+        const value =
+          schema === 'interaction-response'
+            ? response
+            : {
+                commandId: 'answer-keys',
+                type: 'respond_to_interaction',
+                sessionId: interactionBase.sessionId,
+                interactionId: interactionBase.interactionId,
+                response,
+              };
+        const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+        addFormats(ajv);
+        ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+        const validate = ajv.compile(JSON_SCHEMAS[schema]);
+        expect(validate(value), JSON.stringify(validate.errors)).toBe(accepted);
+        const parsed = PUBLISHED_SCHEMAS[schema].safeParse(value);
+        expect(parsed.success).toBe(accepted);
+        if (parsed.success) expect(parsed.data).toEqual(value);
+      },
+    );
+  }
+});

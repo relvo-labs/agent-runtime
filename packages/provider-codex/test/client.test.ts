@@ -456,3 +456,32 @@ describe('R1 bounded native request retirement', () => {
     await client.close();
   });
 });
+
+describe('no-write server request retirement', () => {
+  it('closes stale reply closures and retains the duplicate identity without sending a frame', async () => {
+    const fake = createFakeTransport({ responders: {} });
+    const { handlers, log } = recorder();
+    const offers: Parameters<typeof handlers.onServerRequest>[0][] = [];
+    const client = createCodexClient(fake.transport, {
+      ...handlers,
+      onServerRequest: (offer) => {
+        offers.push(offer);
+        return true;
+      },
+    });
+    fake.push({ id: 'resolved-request', method: 'supported', params: {} });
+    await flush();
+    expect(offers).toHaveLength(1);
+    const offer = offers[0]!;
+    offer.retire();
+    offer.retire();
+    expect(offer.respond({ answer: 'stale' })).toBe(false);
+    expect(offer.reject(-32600, 'stale')).toBe(false);
+    fake.push({ id: 'resolved-request', method: 'supported', params: {} });
+    await flush();
+    expect(offers).toHaveLength(1);
+    expect(log.drops).toEqual(['duplicate_server_request']);
+    expect(fake.sent).toHaveLength(0);
+    await client.close();
+  });
+});

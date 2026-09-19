@@ -769,3 +769,49 @@ describe('withdrawal races an answer store read', () => {
     },
   );
 });
+
+describe('maximum-size missing question answers', () => {
+  it('returns a replayable bounded rejection before any provider effect and keeps the same run answerable', async () => {
+    const value = await fixture();
+    const runId = await start(value);
+    const keys = Array.from({ length: 32 }, (_, index) => `q${String(index).padStart(2, '0')}`.padEnd(64, 'x'));
+    value.emitInteraction({
+      kind: 'question_set',
+      questions: keys.map((key) => ({
+        key,
+        prompt: 'Answer explicitly',
+        multiSelect: false,
+        allowFreeText: false,
+        sensitive: false,
+      })),
+    });
+    for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+    const interactionId = (await value.runtime.getSession(value.sessionId))!.interactions[0]!.interactionId;
+    const command = {
+      commandId: value.next(),
+      type: 'respond_to_interaction' as const,
+      sessionId: value.sessionId,
+      interactionId,
+      response: { kind: 'question_set' as const, answers: {} },
+    };
+    const rejected = await value.runtime.respondToInteraction(command);
+    expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'invalid_request' } });
+    expect(rejected.error!.message.length).toBeLessThanOrEqual(2000);
+    expect(await value.runtime.respondToInteraction(command)).toEqual(rejected);
+    expect(value.counts().responses).toBe(0);
+    expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
+    const corrected = await value.runtime.respondToInteraction({
+      ...command,
+      commandId: value.next(),
+      response: {
+        kind: 'question_set',
+        answers: Object.fromEntries(keys.map((key) => [key, { type: 'text' as const, text: 'provided' }])),
+      },
+    });
+    expect(corrected.disposition).toBe('applied');
+    expect(value.counts().responses).toBe(1);
+    value.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]).toMatchObject({ runId, state: 'succeeded' });
+  });
+});

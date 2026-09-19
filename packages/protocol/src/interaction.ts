@@ -180,6 +180,16 @@ export const QuestionAnswerSchema = z.discriminatedUnion('type', [
   }),
 ]);
 
+const QuestionAnswersSchema = z.record(QuestionKeySchema, QuestionAnswerSchema);
+
+function hasInvalidAnswerKeys(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    Reflect.ownKeys(value).some((key) => !QuestionKeySchema.safeParse(key).success)
+  );
+}
+
 /**
  * The answers to a whole batch, filed under the keys the request handed out.
  *
@@ -189,7 +199,17 @@ export const QuestionAnswerSchema = z.discriminatedUnion('type', [
  */
 export const QuestionSetResponseSchema = z.strictObject({
   kind: z.literal('question_set'),
-  answers: z.record(QuestionKeySchema, QuestionAnswerSchema),
+  answers: z.preprocess((value: z.input<typeof QuestionAnswersSchema>, ctx) => {
+    // Zod's record parser skips own `__proto__` properties. Validate keys
+    // before reconstruction so no invalid answer disappears before validation.
+    // This enforces the record's existing JSON Schema propertyNames grammar;
+    // it does not change the accepted wire shape or the inferred input type.
+    if (hasInvalidAnswerKeys(value)) {
+      ctx.addIssue({ code: 'custom', message: 'answer keys must match the question key grammar' });
+      return z.NEVER;
+    }
+    return value;
+  }, QuestionAnswersSchema),
 });
 
 export const ApprovalResponseSchema = z.strictObject({
@@ -381,7 +401,7 @@ function checkQuestionSetAnswers(request: QuestionSetRequest, response: Question
 
   const unanswered = request.questions.filter((question) => !Object.hasOwn(response.answers, question.key));
   if (unanswered.length > 0) {
-    return `unanswered question(s): ${unanswered.map((question) => question.key).join(', ')}`;
+    return `unanswered question(s): ${String(unanswered.length)}`;
   }
   const extra = Object.keys(response.answers).filter((key) => !asked.has(key));
   if (extra.length > 0) {
@@ -393,7 +413,7 @@ function checkQuestionSetAnswers(request: QuestionSetRequest, response: Question
     // The completeness check above already established this, so reaching it is
     // a defect rather than a caller error — but the contract says every
     // question is answered, so it is stated rather than assumed.
-    if (answer === undefined) return `unanswered question(s): ${question.key}`;
+    if (answer === undefined) return 'unanswered question(s): 1';
 
     if (answer.type === 'text') {
       if (question.choices !== undefined && !question.allowFreeText) {

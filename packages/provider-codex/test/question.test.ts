@@ -871,3 +871,34 @@ describe('codex request-aware settlement at the public SPI', () => {
     expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(1);
   });
 });
+
+describe('server resolution retires the client reply ledger', () => {
+  it.each(['correlated', 'foreign'] as const)(
+    '%s resolution followed by request-limit cleanup writes only to still-pending IDs',
+    async (correlation) => {
+      const opened = await running();
+      await raise(opened);
+      opened.fake.push(resolvedFrame(QUESTION_ID, correlation === 'correlated' ? FAKE_THREAD_ID : 'another-thread'));
+      await flush();
+      expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+      // A duplicate cannot re-admit a retired identity. Retired IDs still count
+      // toward the connection's fixed bound; no eviction or reset is allowed.
+      opened.fake.push(questionFrame());
+      for (let index = 0; index < 4096; index += 1) {
+        opened.fake.push({ id: `limit-${String(index)}`, method: 'unsupported', params: {} });
+      }
+      await flush();
+      await expect(opened.run.completion).resolves.toMatchObject({ outcome: 'failed' });
+      if (correlation === 'correlated') {
+        expect(opened.runSink.ofType('interaction.withdrawn')).toHaveLength(1);
+        expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(0);
+      } else {
+        expect(opened.runSink.ofType('interaction.withdrawn')).toHaveLength(0);
+        expect(repliesTo(opened.fake, QUESTION_ID)).toMatchObject([{ error: { code: -32600 } }]);
+      }
+      expect(repliesTo(opened.fake, 'limit-4095')).toMatchObject([{ error: { code: -32600 } }]);
+      await opened.session.dispose();
+      expect(repliesTo(opened.fake, QUESTION_ID)).toHaveLength(correlation === 'correlated' ? 0 : 1);
+    },
+  );
+});
