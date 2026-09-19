@@ -146,6 +146,13 @@ completed while an interaction it owns was unsettled. A withdrawal that arrives 
 response has already reached the provider is ignored by the Runtime: a retained settlement
 is logically ahead of it.
 
+Before attempting persistence, the Runtime retains one logical withdrawal per routed
+interaction and fences competing responses. A failed commit, before or after transaction
+mutation, leaves that record and routing intact. Redelivery reuses the record and timestamp;
+completion and cleanup materialize it as `withdrawn` before deciding the run outcome or
+cancelling other interactions. Routing and retention are cleared only after persistence
+succeeds. This is bounded process-local retry state, not crash-durable recovery.
+
 `PROVIDER_EMITTABLE_EVENT_TYPES` is consequently typed as `ProviderEventPayload['type'][]`
 rather than `EventType[]`, because `interaction.withdrawn` is a provider payload that has
 no `EventPayload` member of its own.
@@ -290,7 +297,9 @@ documented for hosts in `docs/provider-development.md` and both adapter READMEs:
   name a `key` the request already published — an adapter-assigned token — and it may state
   _how many_ values or unknown keys were wrong, but it never repeats a rejected answer value
   or a caller-supplied answer key. A rejected answer to a `sensitive: true` question would
-  otherwise be written into the event log by the very act of refusing it.
+  otherwise be written into the event log by the very act of refusing it. Command schema
+  failures likewise use a stable `invalid_request` classification, without copying raw
+  validator messages or caller-controlled property paths, keys or values.
 - Option `preview` content is not carried. Claude only generates previews when
   `toolConfig.askUserQuestion.previewFormat` is set, which this adapter never sets; a request
   that carries one anyway is refused whole, because silently dropping a preview changes what

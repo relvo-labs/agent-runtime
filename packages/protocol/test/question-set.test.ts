@@ -234,3 +234,26 @@ describe('wire version', () => {
     expect(WIRE_VERSION).not.toBe('0.4');
   });
 });
+
+describe('prototype-named neutral question keys', () => {
+  it.each([['constructor'], ['toString'], ['ordinary', 'constructor', 'toString']])(
+    'requires own answers for %j and accepts a complete batch',
+    (...keys) => {
+      const request = QuestionSetRequestSchema.parse({
+        kind: 'question_set',
+        questions: keys.map((key) => ({ key, prompt: 'Answer explicitly', choices: [{ value: 'yes', label: 'Yes' }] })),
+      });
+      const missing = QuestionSetResponseSchema.parse({ kind: 'question_set', answers: {} });
+      expect(checkResponseAgainstRequest(request, missing)).toContain('unanswered question(s)');
+      const present = QuestionSetResponseSchema.parse({
+        kind: 'question_set',
+        answers: Object.fromEntries(keys.map((key) => [key, { type: 'selection', values: ['yes'] }])),
+      });
+      expect(checkResponseAgainstRequest(request, present)).toBeUndefined();
+      if (keys.length > 1) {
+        Reflect.deleteProperty(present.answers, 'toString');
+        expect(checkResponseAgainstRequest(request, present)).toBe('unanswered question(s): toString');
+      }
+    },
+  );
+});

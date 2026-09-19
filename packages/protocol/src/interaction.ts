@@ -379,7 +379,7 @@ export type AgentInteraction = z.infer<typeof AgentInteractionSchema>;
 function checkQuestionSetAnswers(request: QuestionSetRequest, response: QuestionSetResponse): string | undefined {
   const asked = new Map(request.questions.map((question) => [question.key, question]));
 
-  const unanswered = request.questions.filter((question) => response.answers[question.key] === undefined);
+  const unanswered = request.questions.filter((question) => !Object.hasOwn(response.answers, question.key));
   if (unanswered.length > 0) {
     return `unanswered question(s): ${unanswered.map((question) => question.key).join(', ')}`;
   }

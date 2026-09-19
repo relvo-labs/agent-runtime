@@ -13,19 +13,21 @@ Bridge the Codex app-server command-approval request to the neutral approval int
 `interaction.approval = { supported: true, modes: ['once', 'session'], blocking: true }`;
 `once` is `accept` and `session` is `acceptForSession`.
 
-The default is unchanged: with `approvals` unset the adapter still sends
+The default is unchanged: with both bridges unset the adapter still sends
 `approvalPolicy: 'never'`, declares no approval capability and declines every
 server-initiated request, because this adapter imposes no settlement deadline and a
 bridged approval nobody answers would park a run.
 
-Only that one method is bridged, and the descriptor says so in
-`extensions.bridgedServerRequests`. Everything else in the pinned 0.153.4 stable
-`ServerRequest` surface is declined on its own native request id with no interaction
-raised: `item/fileChange/requestApproval` (its params name no files — the change set lives
-in an item this adapter does not surface), `item/tool/requestUserInput` (EXPERIMENTAL,
-gated behind an `experimentalApi` opt-in that is never sent, and a question _list_ whose
-`isSecret` / `isOther` / multi-question payload one neutral `QuestionRequest` cannot
-carry), `item/permissions/requestApproval`, `mcpServer/elicitation/request`,
+Approval bridging enables only that method; `extensions.bridgedServerRequests` lists
+the methods enabled by each independent opt-in. The stable pinned 0.153.4
+`item/tool/requestUserInput` surface is handled separately by `questions: 'bridge'`
+and needs no `experimentalApi` opt-in. Without that bridge it is declined whole:
+its `isSecret` / `isOther` / multi-question payload needs the neutral `question_set`
+contract rather than the single `QuestionRequest`.
+
+Other methods in the pinned stable `ServerRequest` surface are declined on their own
+native request id with no interaction raised: `item/fileChange/requestApproval` (its params name no files — the change set lives
+in an item this adapter does not surface), `item/permissions/requestApproval`, `mcpServer/elicitation/request`,
 `item/tool/call`, `account/chatgptAuthTokens/refresh`, `attestation/generate`, and the
 legacy `applyPatchApproval` / `execCommandApproval`, which carry no `turnId` at all. A
 multi-question payload is never partially answered and never reduced to one question.

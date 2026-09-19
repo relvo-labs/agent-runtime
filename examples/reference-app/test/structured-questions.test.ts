@@ -68,18 +68,27 @@ async function workspaceRoot(): Promise<string> {
 }
 
 /** A store whose next `commit` can be made to fail exactly once. */
-function faultableStore(clock: Clock, idFactory: IdFactory): { store: RuntimeStore; failNextCommit: () => void } {
+function faultableStore(
+  clock: Clock,
+  idFactory: IdFactory,
+): { store: RuntimeStore; failNextCommit: (phase?: 'before' | 'after') => void } {
   const base = createInMemoryStore({ clock, idFactory });
-  let rejectNext = false;
+  let rejectNext: false | 'before' | 'after' = false;
   return {
-    failNextCommit: () => {
-      rejectNext = true;
+    failNextCommit: (phase = 'before') => {
+      rejectNext = phase;
     },
     store: {
       ...base,
       commit: (mutate) => {
         if (rejectNext) {
+          const phase = rejectNext;
           rejectNext = false;
+          if (phase === 'after')
+            return base.commit((tx) => {
+              mutate(tx);
+              throw new Error('injected transient commit failure');
+            });
           return Promise.reject(new Error('injected transient commit failure'));
         }
         return base.commit(mutate);
@@ -108,7 +117,7 @@ type Vertical = {
   readonly runtime: AgentRuntime;
   readonly sessionId: SessionId;
   readonly next: () => CommandId;
-  readonly failNextCommit: () => void;
+  readonly failNextCommit: (phase?: 'before' | 'after') => void;
 };
 
 async function buildRuntime(provider: AgentProvider, providerId: string): Promise<Vertical> {
@@ -1105,4 +1114,140 @@ describe('codex approval bridging stays independently opt-in through the runtime
     expect(reply).toMatchObject({ error: { code: -32601 } });
     expect(JSON.stringify(vertical.fake.sent)).not.toContain('"decision"');
   });
+});
+
+describe('command schema confidentiality through real adapters and Runtime', () => {
+  for (const adapter of ['claude', 'codex'] as const) {
+    for (const level of ['response', 'answer', 'path'] as const) {
+      it(`${adapter}: ${level} schema failure has stable replayable errors without caller text`, async () => {
+        const vertical = adapter === 'claude' ? await claudeVertical() : await codexVertical();
+        const { interactionId } = await pendingBatch(vertical);
+        const marker = ['SYNTHETIC', 'SCHEMA', 'PRIVATE'].join('_');
+        const response = {
+          kind: 'question_set',
+          answers: {
+            q1: { type: 'selection', values: ['o1'] },
+            q2: adapter === 'claude' ? { type: 'selection', values: ['o1'] } : { type: 'text', text: 'provided' },
+          },
+        };
+        const malformed =
+          level === 'response'
+            ? { ...response, [marker]: marker }
+            : level === 'answer'
+              ? { ...response, answers: { ...response.answers, q1: { ...response.answers.q1, [marker]: marker } } }
+              : { ...response, answers: { ...response.answers, [marker]: { type: marker, text: marker } } };
+        const command = {
+          commandId: vertical.next(),
+          type: 'respond_to_interaction',
+          sessionId: vertical.sessionId,
+          interactionId,
+          response: malformed,
+        };
+        const rejected = await vertical.runtime.respondToInteraction(command as never);
+        expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'invalid_request' } });
+        expect(JSON.stringify(rejected)).not.toContain(marker);
+        expect(await vertical.runtime.respondToInteraction(command as never)).toEqual(rejected);
+        expect(await allEventsText(vertical)).not.toContain(marker);
+        expect((await soleInteraction(vertical)).status).toBe('pending');
+        expect(
+          await vertical.runtime.respondToInteraction({ ...command, commandId: vertical.next(), response } as never),
+        ).toMatchObject({ disposition: 'applied' });
+      });
+    }
+  }
+});
+
+describe('native withdrawal commit failures through real adapters and Runtime', () => {
+  for (const adapter of ['claude', 'codex'] as const) {
+    for (const phase of ['before', 'after'] as const) {
+      for (const finish of ['completion', 'cleanup'] as const) {
+        it(`${adapter}: ${phase}-mutation failure retains withdrawal through ${finish}`, async () => {
+          const controller = new AbortController();
+          const claude = adapter === 'claude' ? await claudeVertical(CLAUDE_ASK_INPUT, controller) : undefined;
+          const codex = adapter === 'codex' ? await codexVertical() : undefined;
+          const vertical = claude ?? codex!;
+          const { interactionId } = await pendingBatch(vertical);
+          const withdraw = () => {
+            if (claude) controller.abort();
+            else
+              codex!.fake.push({
+                method: 'serverRequest/resolved',
+                params: { threadId: CODEX_THREAD, requestId: CODEX_REQUEST_ID },
+              });
+          };
+          const complete = () => {
+            if (claude)
+              claude.fake.push({
+                type: 'result',
+                subtype: 'success',
+                is_error: false,
+                user_message_uuid: claude.fake.promptUuid,
+              });
+            else
+              codex!.fake.push({
+                method: 'turn/completed',
+                params: {
+                  threadId: CODEX_THREAD,
+                  turn: {
+                    id: CODEX_TURN,
+                    items: [],
+                    itemsView: 'complete',
+                    status: 'completed',
+                    error: null,
+                    startedAt: 1,
+                    completedAt: 2,
+                    durationMs: 1,
+                  },
+                },
+              });
+          };
+          vertical.failNextCommit(phase);
+          withdraw();
+          await settle(vertical.runtime);
+          expect((await soleInteraction(vertical)).status).toBe('pending');
+          if (claude) await expect(claude.decision).resolves.toMatchObject({ behavior: 'deny' });
+          if (codex) expect(codexReplies(codex.fake)).toHaveLength(0);
+          const command = {
+            commandId: vertical.next(),
+            type: 'respond_to_interaction' as const,
+            sessionId: vertical.sessionId,
+            interactionId,
+            response: {
+              kind: 'question_set' as const,
+              answers: {
+                q1: { type: 'selection' as const, values: ['o1'] },
+                q2:
+                  adapter === 'claude'
+                    ? { type: 'selection' as const, values: ['o1'] }
+                    : { type: 'text' as const, text: 'provided' },
+              },
+            },
+          };
+          const rejected = await vertical.runtime.respondToInteraction(command);
+          expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'interaction_already_settled' } });
+          expect(await vertical.runtime.respondToInteraction(command)).toEqual(rejected);
+          // Native duplicate notifications are consumed by the concrete adapter;
+          // Runtime must retain its original withdrawal without relying on redelivery.
+          withdraw();
+          await settle(vertical.runtime);
+          if (finish === 'cleanup') await vertical.runtime.shutdown();
+          complete();
+          await settle(vertical.runtime);
+          const snapshot = await vertical.runtime.getSession(vertical.sessionId);
+          expect(snapshot?.interactions).toHaveLength(1);
+          expect(snapshot?.interactions[0]?.settlement).toMatchObject({ outcome: 'withdrawn' });
+          expect(snapshot?.runs.at(-1)).toMatchObject({
+            runId: vertical.runId,
+            state: finish === 'completion' ? 'succeeded' : 'interrupted',
+          });
+          expect(await allEventsText(vertical)).not.toContain('provider_contract_violation');
+          const page = await vertical.runtime.readEvents(vertical.sessionId, SequenceSchema.parse(0), 1000);
+          expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
+          if (codex) expect(codexReplies(codex.fake)).toHaveLength(0);
+          await vertical.runtime.shutdown();
+          expect((await vertical.runtime.getSession(vertical.sessionId))?.session.state).toBe('closed');
+        });
+      }
+    }
+  }
 });

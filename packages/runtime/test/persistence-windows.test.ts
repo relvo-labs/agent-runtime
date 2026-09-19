@@ -10,6 +10,7 @@ import {
   createFixedClock,
   type CommandId,
   type InteractionId,
+  type InteractionRequest,
   type RunId,
 } from '@relvo-labs/agent-protocol';
 import {
@@ -40,7 +41,13 @@ afterEach(async () => {
 });
 
 async function fixture(
-  options: { holdInterrupt?: boolean; rejectStart?: boolean; rejectResponse?: boolean; rejectInterrupt?: boolean } = {},
+  options: {
+    holdReadInteraction?: boolean;
+    holdInterrupt?: boolean;
+    rejectStart?: boolean;
+    rejectResponse?: boolean;
+    rejectInterrupt?: boolean;
+  } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'relvo-persistence-window-'));
   roots.push(root);
@@ -49,21 +56,37 @@ async function fixture(
   const clock = createFixedClock();
   const idFactory = createCounterIdFactory();
   const base = createInMemoryStore({ clock, idFactory });
-  let rejectNext = false;
+  let rejectNext: false | 'before' | 'after' = false;
+  let skipCommits = 0;
+  const interactionRead = deferred<undefined>();
+  const interactionReadGate = deferred<undefined>();
   const store: RuntimeStore = {
     get revision() {
       return base.revision;
     },
     commit: (mutate) => {
-      if (rejectNext) {
+      if (rejectNext && skipCommits-- <= 0) {
+        const phase = rejectNext;
         rejectNext = false;
+        if (phase === 'after')
+          return base.commit((tx) => {
+            mutate(tx);
+            throw new Error('injected transient commit failure');
+          });
         return Promise.reject(new Error('injected transient commit failure'));
       }
       return base.commit(mutate);
     },
     read: (sessionId) => base.read(sessionId),
     readEvents: (sessionId, from, limit) => base.readEvents(sessionId, from, limit),
-    readInteraction: (sessionId, interactionId) => base.readInteraction(sessionId, interactionId),
+    readInteraction: async (sessionId, interactionId) => {
+      const snapshot = await base.readInteraction(sessionId, interactionId);
+      if (options.holdReadInteraction) {
+        interactionRead.resolve(undefined);
+        await interactionReadGate.promise;
+      }
+      return snapshot;
+    },
     findReceipt: (commandId) => base.findReceipt(commandId),
     listSessions: () => base.listSessions(),
   };
@@ -135,18 +158,22 @@ async function fixture(
     runtime,
     sessionId: opened.result.sessionId,
     next,
-    failNextCommit: () => {
-      rejectNext = true;
+    now: () => clock.now(),
+    failNextCommit: (phase: 'before' | 'after' = 'before', skip = 0) => {
+      rejectNext = phase;
+      skipCommits = skip;
     },
     counts: () => ({ starts, responses, interrupts, disposes }),
     completion,
+    interactionRead,
+    interactionReadGate,
     interruptGate,
-    emitInteraction: () =>
+    emitInteraction: (request: InteractionRequest = { kind: 'question', prompt: 'Continue?', multiSelect: false }) =>
       sink?.emit({
         payload: {
           type: 'interaction.requested',
           providerRef: 'question',
-          request: { kind: 'question', prompt: 'Continue?', multiSelect: false },
+          request,
         },
       }),
     /** A provider withdrawing a request it raised, on the run's own sink. */
@@ -567,4 +594,178 @@ describe('provider interaction withdrawal', () => {
     const diagnostics = page.events.filter((event) => event.payload.type === 'diagnostic');
     expect(JSON.stringify(diagnostics)).toContain('interaction.withdrawn');
   });
+});
+
+describe('retained withdrawal persistence', () => {
+  for (const phase of ['before', 'after'] as const) {
+    for (const finish of ['redelivery', 'completion', 'cleanup'] as const) {
+      it(`${phase}-mutation failure: fences answers and materializes on ${finish}`, async () => {
+        const value = await fixture();
+        await start(value);
+        const interactionId = await interaction(value);
+        value.failNextCommit(phase);
+        value.emitWithdrawal();
+        for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+        expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
+        const afterFailure = value.now();
+        const command = {
+          commandId: value.next(),
+          type: 'respond_to_interaction' as const,
+          sessionId: value.sessionId,
+          interactionId,
+          response: { kind: 'question' as const, answer: 'too late' },
+        };
+        const rejected = await value.runtime.respondToInteraction(command);
+        expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'interaction_already_settled' } });
+        expect(await value.runtime.respondToInteraction(command)).toEqual(rejected);
+        expect(value.counts().responses).toBe(0);
+        if (finish === 'redelivery') {
+          value.failNextCommit(phase);
+          value.emitWithdrawal();
+          for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+          expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
+          value.emitWithdrawal();
+          value.emitWithdrawal();
+          for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+          expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('running');
+        }
+        if (finish === 'cleanup') await value.runtime.shutdown();
+        value.completion.resolve({ outcome: 'succeeded' });
+        await value.runtime.quiesce();
+        const snapshot = await value.runtime.getSession(value.sessionId);
+        expect(snapshot?.interactions[0]).toMatchObject({ status: 'settled', settlement: { outcome: 'withdrawn' } });
+        expect(snapshot?.runs[0]?.state).toBe(finish === 'cleanup' ? 'interrupted' : 'succeeded');
+        expect(Date.parse(snapshot!.interactions[0]!.settlement!.settledAt)).toBeLessThan(Date.parse(afterFailure));
+        value.emitWithdrawal();
+        await value.runtime.quiesce();
+        const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0), 1000);
+        expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
+        expect(JSON.stringify(page)).not.toContain('provider_contract_violation');
+        await value.runtime.shutdown();
+        expect((await value.runtime.getSession(value.sessionId))?.session.state).toBe('closed');
+      });
+    }
+  }
+});
+
+describe('prototype-named answers through Runtime', () => {
+  it.each([['constructor'], ['toString'], ['ordinary', 'constructor', 'toString']])(
+    'returns a replayable invalid_request for missing %j and applies present answers',
+    async (...keys) => {
+      const value = await fixture();
+      await start(value);
+      value.emitInteraction({
+        kind: 'question_set',
+        questions: keys.map((key) => ({
+          key,
+          prompt: 'Answer explicitly',
+          choices: [{ value: 'yes', label: 'Yes' }],
+          multiSelect: false,
+          allowFreeText: false,
+          sensitive: false,
+        })),
+      });
+      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+      const interactionId = (await value.runtime.getSession(value.sessionId))!.interactions[0]!.interactionId;
+      const command = {
+        commandId: value.next(),
+        type: 'respond_to_interaction' as const,
+        sessionId: value.sessionId,
+        interactionId,
+        response: { kind: 'question_set' as const, answers: {} },
+      };
+      const rejected = await value.runtime.respondToInteraction(command);
+      expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'invalid_request' } });
+      expect(await value.runtime.respondToInteraction(command)).toEqual(rejected);
+      expect(value.counts().responses).toBe(0);
+      const answers = Object.fromEntries(keys.map((key) => [key, { type: 'selection' as const, values: ['yes'] }]));
+      if (keys.length > 1) {
+        const partial = { ...answers };
+        Reflect.deleteProperty(partial, 'toString');
+        expect(
+          await value.runtime.respondToInteraction({
+            ...command,
+            commandId: value.next(),
+            response: { kind: 'question_set', answers: partial },
+          }),
+        ).toMatchObject({ disposition: 'rejected', error: { code: 'invalid_request' } });
+      }
+      expect(
+        await value.runtime.respondToInteraction({
+          ...command,
+          commandId: value.next(),
+          response: { kind: 'question_set', answers },
+        }),
+      ).toMatchObject({ disposition: 'applied' });
+      expect(value.counts().responses).toBe(1);
+    },
+  );
+});
+
+describe('retained withdrawals survive cleanup rollback', () => {
+  it.each(['before', 'after'] as const)(
+    '%s-mutation cleanup failure retries the exact close truthfully',
+    async (phase) => {
+      const value = await fixture();
+      await start(value);
+      await interaction(value);
+      value.failNextCommit(phase);
+      value.emitWithdrawal();
+      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+      const close = {
+        commandId: value.next(),
+        type: 'close_session' as const,
+        sessionId: value.sessionId,
+        ifRunActive: 'interrupt' as const,
+      };
+      // Closing-state commit succeeds; terminal fallback rolls back.
+      value.failNextCommit(phase, 1);
+      await expect(value.runtime.closeSession(close)).rejects.toThrow('injected transient');
+      expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
+      expect(await value.runtime.closeSession(close)).toMatchObject({ disposition: 'applied' });
+      value.completion.resolve({ outcome: 'succeeded' });
+      value.emitWithdrawal();
+      await value.runtime.quiesce();
+      const snapshot = await value.runtime.getSession(value.sessionId);
+      expect(snapshot?.session.state).toBe('closed');
+      expect(snapshot?.interactions[0]?.settlement?.outcome).toBe('withdrawn');
+      expect(snapshot?.runs[0]?.state).toBe('interrupted');
+      const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0), 1000);
+      expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
+      expect(JSON.stringify(page)).not.toContain('provider_contract_violation');
+    },
+  );
+});
+
+describe('withdrawal races an answer store read', () => {
+  it.each(['before', 'after'] as const)(
+    '%s-mutation failure fences an answer that already passed its first guard',
+    async (phase) => {
+      const value = await fixture({ holdReadInteraction: true });
+      await start(value);
+      const interactionId = await interaction(value);
+      const answering = value.runtime.respondToInteraction({
+        commandId: value.next(),
+        type: 'respond_to_interaction',
+        sessionId: value.sessionId,
+        interactionId,
+        response: { kind: 'question', answer: 'late' },
+      });
+      await value.interactionRead.promise;
+      value.failNextCommit(phase);
+      value.emitWithdrawal();
+      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+      value.interactionReadGate.resolve(undefined);
+      expect(await answering).toMatchObject({
+        disposition: 'rejected',
+        error: { code: 'interaction_already_settled' },
+      });
+      expect(value.counts().responses).toBe(0);
+      value.completion.resolve({ outcome: 'succeeded' });
+      await value.runtime.quiesce();
+      const snapshot = await value.runtime.getSession(value.sessionId);
+      expect(snapshot?.interactions[0]?.settlement?.outcome).toBe('withdrawn');
+      expect(snapshot?.runs[0]?.state).toBe('succeeded');
+    },
+  );
 });
