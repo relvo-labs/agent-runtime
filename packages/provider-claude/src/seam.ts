@@ -55,16 +55,66 @@ export type ClaudePromptMessage = {
 };
 
 /**
+ * What the host answers a permission prompt with.
+ *
+ * Narrower than the SDK's `PermissionResult` on purpose. The adapter never
+ * rewrites the tool's input and never writes a permission rule, so neither
+ * `updatedInput` nor `updatedPermissions` is expressible here: a grant is for
+ * the one call that asked, which is the only mode this adapter declares.
+ *
+ * `message` on a denial is the text the model is shown so it can adapt. It is
+ * the host's own words, and it is never copied into an event or an error.
+ */
+export type ClaudePermissionResult =
+  { readonly behavior: 'allow' } | { readonly behavior: 'deny'; readonly message: string };
+
+/**
+ * The per-call context the SDK hands the permission callback.
+ *
+ * Only the two fields this adapter reads are declared. Everything else the SDK
+ * passes — `requestId`, `suggestions`, `blockedPath`, `title`, rule provenance —
+ * is deliberately absent: it is either provider-native identity that must not
+ * escape, or prompt prose that would end up in a durable event log.
+ *
+ * `toolUseID` is read for adapter-internal bookkeeping only and never emitted.
+ */
+export type ClaudeToolPermissionRequest = {
+  /** Aborted when the query is torn down while a prompt is outstanding. */
+  readonly signal: AbortSignal;
+  /** Native id of the tool call being asked about. Never emitted. */
+  readonly toolUseID: string;
+};
+
+/**
+ * The host permission callback, mirroring the SDK's `CanUseTool`.
+ *
+ * The SDK calls it before running a tool that its mode, rules and hooks did not
+ * already decide, and waits for the answer: the prompt has no deadline of its
+ * own, so whatever this returns is what happens. This adapter therefore returns
+ * a decision or a denial, never `null` — the SDK reads `null` as "the consumer
+ * already answered out of band", which would leave the tool blocked forever.
+ */
+export type ClaudeCanUseTool = (
+  toolName: string,
+  input: Record<string, unknown>,
+  request: ClaudeToolPermissionRequest,
+) => Promise<ClaudePermissionResult>;
+
+/**
  * The subset of SDK query options this adapter sets.
  *
- * `permissionPrompts: 'none'` is not configurable: this adapter declares no
- * interaction capability, so a prompt that nobody can answer must fail closed
- * rather than hang a run forever.
+ * `permissionPrompts` says who answers a prompt the mode, rules and hooks did
+ * not settle. `'none'` — the default posture — means nobody: anything that
+ * would prompt is denied immediately, which is what an adapter that bridges no
+ * interaction must do rather than hang a run nobody can answer. `'host'` is set
+ * only alongside a `canUseTool` that raises a neutral approval interaction, so
+ * the two are always consistent.
  */
 export type ClaudeQueryOptions = {
   readonly cwd: string;
   readonly abortController: AbortController;
-  readonly permissionPrompts: 'none';
+  readonly permissionPrompts: 'host' | 'none';
+  readonly canUseTool?: ClaudeCanUseTool;
   readonly model?: string;
   readonly maxTurns?: number;
   readonly permissionMode?: ClaudePermissionMode;

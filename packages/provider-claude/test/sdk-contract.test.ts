@@ -31,13 +31,16 @@ import { describe, expect, it } from 'vitest';
 
 import { CLAUDE_AGENT_SDK_VERSION } from '../src/index.ts';
 import type {
+  ClaudeCanUseTool,
   ClaudeInterruptReceipt,
   ClaudeMessageUuid,
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
   ClaudeQueryMessage,
   ClaudeQueryOptions,
+  ClaudeToolPermissionRequest,
 } from '../src/seam.ts';
 
 /** The SDK release this recording was derived from. */
@@ -60,6 +63,57 @@ type RecordedUserMessage = {
   session_id?: string;
 };
 
+/** `PermissionDecisionClassification` — how a decision was arrived at. */
+type RecordedDecisionClassification = 'user_temporary' | 'user_permanent' | 'user_reject';
+
+/**
+ * `PermissionResult` — what the host callback may answer with.
+ *
+ * `decisionClassification` is recorded on both branches because 0.3.259
+ * declares it on both. This adapter does not return it: the classification it
+ * could honestly report is already implied by a `once` grant or a denial, and
+ * emitting one would state a durability this bridge does not implement.
+ */
+type RecordedPermissionResult =
+  | {
+      behavior: 'allow';
+      updatedInput?: Record<string, unknown>;
+      updatedPermissions?: unknown[];
+      toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
+    }
+  | {
+      behavior: 'deny';
+      message: string;
+      interrupt?: boolean;
+      toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
+    };
+
+/**
+ * `CanUseTool` — the host permission callback, with the per-call context the
+ * SDK supplies. The adapter reads only `signal` and `toolUseID`; the rest is
+ * recorded so the contravariant direction is proven against the real shape
+ * rather than against the subset this adapter happens to want.
+ */
+type RecordedCanUseTool = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: {
+    signal: AbortSignal;
+    toolUseID: string;
+    requestId: string;
+    suggestions?: unknown[];
+    blockedPath?: string;
+    decisionReason?: string;
+    title?: string;
+    displayName?: string;
+    description?: string;
+    agentID?: string;
+    matchedAskRule?: { source: string; toolName: string; ruleContent?: string };
+  },
+) => Promise<RecordedPermissionResult | null>;
+
 /** `Options` — the fields this adapter sets, with their declared types. */
 type RecordedOptions = {
   abortController?: AbortController;
@@ -71,6 +125,7 @@ type RecordedOptions = {
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto';
   allowDangerouslySkipPermissions?: boolean;
   permissionPrompts?: 'host' | 'none';
+  canUseTool?: RecordedCanUseTool;
   includePartialMessages?: boolean;
   resume?: string;
 };
@@ -154,6 +209,14 @@ export type SdkAcceptsStampedPrompt = Assert<Assignable<ClaudePromptMessage, Rec
 export type SdkAcceptsClientUuid = Assert<Assignable<ClaudeMessageUuid, RecordedUuid>>;
 /** The options the adapter builds must be acceptable to the SDK's `Options`. */
 export type SdkAcceptsAdapterOptions = Assert<Assignable<ClaudeQueryOptions, RecordedOptions>>;
+/** The bridge's callback must be installable as the SDK's `canUseTool`. */
+export type SdkAcceptsPermissionCallback = Assert<Assignable<ClaudeCanUseTool, RecordedCanUseTool>>;
+/** Every decision the bridge returns must be a `PermissionResult` the SDK reads. */
+export type SdkAcceptsPermissionResult = Assert<Assignable<ClaudePermissionResult, RecordedPermissionResult>>;
+/** The SDK's per-call context must satisfy the narrower one the bridge declares. */
+export type SeamAcceptsPermissionRequest = Assert<
+  Assignable<Parameters<RecordedCanUseTool>[2], ClaudeToolPermissionRequest>
+>;
 
 describe('pinned SDK contract', () => {
   it('records the SDK version the seam was derived from', () => {

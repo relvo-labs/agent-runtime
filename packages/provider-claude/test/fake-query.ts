@@ -7,6 +7,7 @@
  */
 
 import type {
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
@@ -45,6 +46,25 @@ export type FakeQuery = {
   holdNextInterrupt(): () => void;
   /** Hold `return()` unresolved so a concurrent disposal can be observed. */
   holdNextReturn(): () => void;
+  /**
+   * Ask the host permission callback the adapter installed, the way the SDK
+   * does before running a tool it could not decide on its own.
+   *
+   * Each call carries its own `AbortSignal`, as the SDK's control request does.
+   * Pass `{ aborted: true }` for a request the CLI withdrew before the callback
+   * ran. Throws when no callback was installed, so a test cannot mistake "the
+   * adapter never offered a permission surface" for "the tool was allowed".
+   */
+  requestPermission(
+    toolName: string,
+    input?: Record<string, unknown>,
+    options?: { aborted?: boolean },
+  ): Promise<ClaudePermissionResult>;
+  /**
+   * Withdraw an outstanding permission request the way the CLI does — by
+   * aborting that request's signal. Defaults to the most recent one.
+   */
+  cancelPermission(index?: number): void;
 };
 
 /**
@@ -75,6 +95,8 @@ export function createFakeQuery(): FakeQuery {
   let failure: { reason: unknown } | undefined;
   let interruptCalls = 0;
   let returnCalls = 0;
+  let toolUseCount = 0;
+  const permissionControllers: AbortController[] = [];
   let nextInterruptFailure: { reason: unknown } | undefined;
   let nextReturnFailure: { reason: unknown } | undefined;
   let interruptReceipt: unknown = undefined;
@@ -211,6 +233,32 @@ export function createFakeQuery(): FakeQuery {
         release.teardown?.();
         release.teardown = undefined;
       };
+    },
+    requestPermission(
+      toolName: string,
+      input: Record<string, unknown> = {},
+      options: { aborted?: boolean } = {},
+    ): Promise<ClaudePermissionResult> {
+      const params = calls[0]?.options;
+      const ask = params?.canUseTool;
+      if (params === undefined || ask === undefined) {
+        throw new Error('the adapter installed no host permission callback');
+      }
+      toolUseCount += 1;
+      // One controller per request, as the SDK gives each permission control
+      // request its own: cancelling one prompt must not touch another.
+      const controller = new AbortController();
+      if (options.aborted === true) controller.abort();
+      permissionControllers.push(controller);
+      return ask(toolName, input, {
+        signal: controller.signal,
+        toolUseID: `toolu_fake_${String(toolUseCount)}`,
+      });
+    },
+    cancelPermission(index?: number): void {
+      const controller = permissionControllers[index ?? permissionControllers.length - 1];
+      if (controller === undefined) throw new Error('no permission request to cancel');
+      controller.abort();
     },
   };
 }
