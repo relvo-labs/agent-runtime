@@ -31,6 +31,7 @@ import { describe, expect, it } from 'vitest';
 
 import { CLAUDE_AGENT_SDK_VERSION } from '../src/index.ts';
 import type {
+  ClaudeAskUserQuestionInput,
   ClaudeCanUseTool,
   ClaudeInterruptReceipt,
   ClaudeMessageUuid,
@@ -89,6 +90,29 @@ type RecordedPermissionResult =
       toolUseID?: string;
       decisionClassification?: RecordedDecisionClassification;
     };
+
+/**
+ * `AskUserQuestionInput` — the generated tool-input schema for the SDK's
+ * clarifying-question tool, as `canUseTool` receives it.
+ *
+ * Recorded because it is the *answer route*: `answers` is declared on the
+ * **input**, described as "User answers collected by the permission component",
+ * and a host supplies it by allowing the call with an `updatedInput`. The tuple
+ * bounds (1–4 questions, 2–4 options) are recorded as bounds rather than as
+ * tuples — the adapter enforces them at runtime, because a declared tuple says
+ * nothing about a value arriving from another process.
+ */
+type RecordedAskUserQuestionInput = {
+  questions: {
+    question: string;
+    header: string;
+    options: { label: string; description: string; preview?: string }[];
+    multiSelect: boolean;
+  }[];
+  answers?: Record<string, string>;
+  annotations?: Record<string, { preview?: string; notes?: string }>;
+  metadata?: { source?: string };
+};
 
 /**
  * `CanUseTool` — the host permission callback, with the per-call context the
@@ -213,6 +237,17 @@ export type SdkAcceptsAdapterOptions = Assert<Assignable<ClaudeQueryOptions, Rec
 export type SdkAcceptsPermissionCallback = Assert<Assignable<ClaudeCanUseTool, RecordedCanUseTool>>;
 /** Every decision the bridge returns must be a `PermissionResult` the SDK reads. */
 export type SdkAcceptsPermissionResult = Assert<Assignable<ClaudePermissionResult, RecordedPermissionResult>>;
+/** The recorded tool input must be readable through the seam's question shape. */
+export type SeamReadsAskUserQuestionInput = Assert<
+  Assignable<RecordedAskUserQuestionInput, ClaudeAskUserQuestionInput>
+>;
+/**
+ * The answer the bridge returns must be a `PermissionResult` the SDK reads —
+ * including its `updatedInput`, which is what carries the answers.
+ */
+export type SdkAcceptsAnsweredQuestion = Assert<
+  Assignable<{ behavior: 'allow'; updatedInput: Record<string, unknown> }, RecordedPermissionResult>
+>;
 /** The SDK's per-call context must satisfy the narrower one the bridge declares. */
 export type SeamAcceptsPermissionRequest = Assert<
   Assignable<Parameters<RecordedCanUseTool>[2], ClaudeToolPermissionRequest>

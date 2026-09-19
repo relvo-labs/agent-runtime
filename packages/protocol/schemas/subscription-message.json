@@ -562,6 +562,9 @@
           "$ref": "#/$defs/question-request"
         },
         {
+          "$ref": "#/$defs/question-set-request"
+        },
+        {
           "$ref": "#/$defs/approval-request"
         }
       ]
@@ -570,6 +573,9 @@
       "oneOf": [
         {
           "$ref": "#/$defs/question-response"
+        },
+        {
+          "$ref": "#/$defs/question-set-response"
         },
         {
           "$ref": "#/$defs/approval-response"
@@ -647,6 +653,53 @@
         }
       ]
     },
+    "question-answer": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "maxLength": 16000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "selection",
+              "type": "string"
+            },
+            "values": {
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "values"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "question-choice": {
       "additionalProperties": false,
       "properties": {
@@ -668,6 +721,52 @@
       "required": [
         "value",
         "label"
+      ],
+      "type": "object"
+    },
+    "question-item": {
+      "additionalProperties": false,
+      "properties": {
+        "allowFreeText": {
+          "default": false,
+          "type": "boolean"
+        },
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/question-choice"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "header": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "prompt": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "sensitive": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "prompt"
       ],
       "type": "object"
     },
@@ -735,6 +834,54 @@
       "required": [
         "kind",
         "answer"
+      ],
+      "type": "object"
+    },
+    "question-set-request": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "question_set",
+          "type": "string"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/question-item"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "questions"
+      ],
+      "type": "object"
+    },
+    "question-set-response": {
+      "additionalProperties": false,
+      "properties": {
+        "answers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/question-answer"
+          },
+          "propertyNames": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "kind": {
+          "const": "question_set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answers"
       ],
       "type": "object"
     },
@@ -992,7 +1139,7 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/subscription-message.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/subscription-message.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "oneOf": [
     {
@@ -1023,7 +1170,7 @@
               "$ref": "#/$defs/session-id"
             },
             "wireVersion": {
-              "const": "0.4",
+              "const": "0.5",
               "type": "string"
             }
           },
@@ -1139,5 +1286,5 @@
     }
   ],
   "title": "subscription-message",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

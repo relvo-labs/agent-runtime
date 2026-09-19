@@ -89,6 +89,28 @@ export const QuestionCapabilitySchema = z.strictObject({
   choices: z.boolean().default(false),
   /** Provider accepts more than one selected choice. */
   multiSelect: z.boolean().default(false),
+  /**
+   * Provider can raise `kind: 'question_set'` — several correlated questions
+   * answered as one unit. A host that cannot render a batch must check this
+   * before a run starts rather than discovering it from a parked interaction.
+   */
+  batch: z.boolean().default(false),
+  /**
+   * Largest batch the provider will raise, when it states a bound. `null` means
+   * unstated, not unbounded.
+   */
+  maxQuestions: z.int().positive().nullable().default(null),
+  /**
+   * Provider accepts typed text alongside a choice list — the "Other"
+   * affordance — on questions that opt into it.
+   */
+  freeText: z.boolean().default(false),
+  /**
+   * Provider may mark a question's answer as a secret. Display guidance only;
+   * settled answers are still committed to the durable event log, so a host
+   * that must not retain secrets should refuse such a request.
+   */
+  sensitive: z.boolean().default(false),
 });
 
 export const InteractionCapabilitySchema = z.strictObject({

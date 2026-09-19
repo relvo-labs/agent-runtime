@@ -77,6 +77,30 @@ export type ClaudeProviderOptions = {
    * descriptor untrue.
    */
   readonly approvals?: 'none' | 'bridge';
+  /**
+   * Whether the SDK's `AskUserQuestion` tool is bridged to neutral
+   * `question_set` interactions.
+   *
+   * `'none'` (the default) leaves today's behaviour exactly: no question is
+   * claimed, and an `AskUserQuestion` call that reaches this adapter's callback
+   * is denied with a message telling the model to ask in its reply instead.
+   *
+   * `'bridge'` installs the SDK's host callback and raises one neutral
+   * `question_set` per `AskUserQuestion` call, answered by returning the
+   * pinned `updatedInput.answers` map — so the same run resumes where it
+   * paused. Declare it only when the host actually displays questions and
+   * settles interactions: this adapter imposes no settlement deadline, so an
+   * unanswered question parks the run.
+   *
+   * Setting this also installs the callback when `approvals` is `'none'`. That
+   * does not widen what the agent may do: every non-question tool prompt
+   * reaching the callback is denied, which is the same outcome as the
+   * `permissionPrompts: 'none'` posture it replaces.
+   *
+   * Provider-level, not a session override, for the same reason `approvals` is:
+   * the capability descriptor is one object for the whole provider.
+   */
+  readonly questions?: 'none' | 'bridge';
   readonly model?: string;
   readonly maxTurns?: number;
   readonly permissionMode?: ClaudePermissionMode;

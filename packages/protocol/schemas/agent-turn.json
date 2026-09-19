@@ -187,7 +187,7 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-turn.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/agent-turn.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -229,5 +229,5 @@
   ],
   "title": "agent-turn",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

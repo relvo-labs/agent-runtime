@@ -1,3 +1,4 @@
+import { WIRE_VERSION } from '@relvo-labs/agent-protocol';
 import { describe, expect, it } from 'vitest';
 import type { SessionId, SessionSnapshot } from '@relvo-labs/agent-protocol';
 
@@ -12,7 +13,7 @@ function snapshotWithState(sessionId: SessionId, state: 'ready' | 'closed' | 'fa
       sessionId,
       state,
       providerId: 'scripted-demo',
-      wireVersion: '0.4',
+      wireVersion: WIRE_VERSION,
       workspace: {
         leaseId: 'wsl_00000000000000A0' as never,
         ownership: 'managed',

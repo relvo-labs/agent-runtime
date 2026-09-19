@@ -139,11 +139,36 @@
     "question-capability": {
       "additionalProperties": false,
       "properties": {
+        "batch": {
+          "default": false,
+          "type": "boolean"
+        },
         "choices": {
           "default": false,
           "type": "boolean"
         },
+        "freeText": {
+          "default": false,
+          "type": "boolean"
+        },
+        "maxQuestions": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "sensitive": {
           "default": false,
           "type": "boolean"
         },
@@ -266,7 +291,7 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/provider-descriptor.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/provider-descriptor.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -325,5 +350,5 @@
   ],
   "title": "provider-descriptor",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

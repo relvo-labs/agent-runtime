@@ -49,6 +49,7 @@ import {
   type InteractionResponse,
   type JsonObject,
   type JsonValue,
+  type QuestionItem,
 } from '@relvo-labs/agent-protocol';
 import { ProviderRejection, type ProviderEventSink } from '@relvo-labs/agent-provider';
 
@@ -57,6 +58,9 @@ import { sameTurn, type TurnCorrelation } from './translate.ts';
 
 /** The one server-initiated method this adapter answers with a host decision. */
 export const CODEX_BRIDGED_APPROVAL = 'item/commandExecution/requestApproval';
+
+/** The one server-initiated method this adapter answers with host answers. */
+export const CODEX_BRIDGED_QUESTION = 'item/tool/requestUserInput';
 
 /**
  * Approval modes this adapter can actually encode.
@@ -232,6 +236,199 @@ export function translateCommandApproval(params: unknown): ApprovalTranslation {
   return { kind: 'request', correlation: { threadId, turnId }, subject: { category: 'command', summary, detail } };
 }
 
+// ---------------------------------------------------------------------------
+// Question translation
+// ---------------------------------------------------------------------------
+
+/**
+ * Why a recognised `item/tool/requestUserInput` could not be bridged.
+ *
+ * Bounded tokens, never upstream prose.
+ */
+export type QuestionRefusal =
+  | 'malformed'
+  | 'not_blocking'
+  | 'auto_resolution_requested'
+  | 'question_count'
+  | 'duplicate_question_id'
+  | 'duplicate_option_label'
+  | 'detail_too_large';
+
+/**
+ * Private native schema derived from the 0.153.4 generated
+ * `ToolRequestUserInputParams.json`. The JSON Schema gives `isOther`,
+ * `isSecret` and `autoResolutionMs` defaults, so they are optional on the wire
+ * even though the generated TypeScript declares them required. Closed
+ * deliberately: an unknown member is a fact this adapter has not been taught to
+ * carry, and carrying on would drop it.
+ */
+const ToolRequestUserInputOptionSchema = z.strictObject({
+  label: z.string().min(1),
+  description: z.string(),
+});
+
+const ToolRequestUserInputQuestionSchema = z.strictObject({
+  id: z.string().min(1),
+  header: z.string(),
+  question: z.string().min(1),
+  isOther: z.boolean().default(false),
+  isSecret: z.boolean().default(false),
+  options: z.array(ToolRequestUserInputOptionSchema).nullish(),
+});
+
+const ToolRequestUserInputParamsSchema = z.strictObject({
+  threadId: z.string().min(1),
+  turnId: z.string().min(1),
+  itemId: z.string().min(1),
+  questions: z.array(ToolRequestUserInputQuestionSchema),
+  isBlocking: z.boolean(),
+  autoResolutionMs: z.int().nonnegative().nullish(),
+});
+
+/**
+ * Largest neutral batch the protocol carries. A native request above it is
+ * refused rather than truncated.
+ */
+const MAX_QUESTIONS = 32;
+
+/** Bound on the published question payload, as canonical JSON. */
+export const MAX_QUESTION_DETAIL_CHARS = 16_000;
+
+/**
+ * The adapter-private mapping from neutral keys back to the native identifiers
+ * the answer map must be built from. It never leaves this module.
+ */
+export type QuestionPlanEntry = {
+  readonly key: string;
+  /** Native question id. Adapter-private; the answer map is keyed by it. */
+  readonly questionId: string;
+  /** Neutral choice value → native option label. Empty for a free-text question. */
+  readonly labels: ReadonlyMap<string, string>;
+};
+
+export type QuestionTranslation =
+  | {
+      readonly kind: 'request';
+      readonly correlation: TurnCorrelation;
+      readonly questions: readonly QuestionItem[];
+      readonly plan: readonly QuestionPlanEntry[];
+    }
+  | { readonly kind: 'refused'; readonly reason: QuestionRefusal };
+
+function refusedQuestion(reason: QuestionRefusal): QuestionTranslation {
+  return { kind: 'refused', reason };
+}
+
+/** Validate the complete native request before admitting any routing state. */
+export function translateUserInputRequest(params: unknown): QuestionTranslation {
+  const parsed = ToolRequestUserInputParamsSchema.safeParse(params);
+  if (!parsed.success) return refusedQuestion('malformed');
+  const record = parsed.data;
+
+  // A non-blocking request is one the turn does not wait for. Raising it would
+  // ask a host to answer something the server may already have moved past, and
+  // this adapter promises that a settled answer reaches the native wait point.
+  if (!record.isBlocking) return refusedQuestion('not_blocking');
+
+  // `autoResolutionMs` asks the client to answer *for* the user after an
+  // interval. This adapter never fabricates an answer and imposes no
+  // settlement deadline, so a request that wants one is refused rather than
+  // silently answered late or never.
+  if (record.autoResolutionMs != null) return refusedQuestion('auto_resolution_requested');
+
+  if (record.questions.length === 0 || record.questions.length > MAX_QUESTIONS) {
+    return refusedQuestion('question_count');
+  }
+
+  const seenIds = new Set<string>();
+  const questions: QuestionItem[] = [];
+  const plan: QuestionPlanEntry[] = [];
+
+  for (const [index, question] of record.questions.entries()) {
+    // The native answer map is keyed by question id, so two questions sharing
+    // one id cannot both be answered.
+    if (seenIds.has(question.id)) return refusedQuestion('duplicate_question_id');
+    seenIds.add(question.id);
+
+    const labels = new Map<string, string>();
+    const choices: { value: string; label: string; description?: string }[] = [];
+    const seenLabels = new Set<string>();
+    for (const [optionIndex, option] of (question.options ?? []).entries()) {
+      // The native answer is the option label, so duplicates are ambiguous.
+      if (seenLabels.has(option.label)) return refusedQuestion('duplicate_option_label');
+      seenLabels.add(option.label);
+      const value = `o${String(optionIndex + 1)}`;
+      labels.set(value, option.label);
+      choices.push({
+        value,
+        label: option.label,
+        ...(option.description === '' ? {} : { description: option.description }),
+      });
+    }
+
+    // The adapter's own ordinal. The native `id` is provider identity and must
+    // not become a token a caller can address the app-server's internals with.
+    const key = `q${String(index + 1)}`;
+    questions.push({
+      key,
+      prompt: question.question,
+      ...(question.header === '' ? {} : { header: question.header }),
+      ...(choices.length === 0 ? {} : { choices }),
+      // `ToolRequestUserInputQuestion` has no multi-select field in 0.153.4.
+      // The answer is an array, so several answers are *representable*, but
+      // nothing in the request says several are *permitted* — so none is
+      // offered rather than guessed at.
+      multiSelect: false,
+      // With no options at all the only possible answer is text. With options,
+      // `isOther` is exactly the native "let them type something else" flag.
+      allowFreeText: choices.length === 0 || question.isOther,
+      sensitive: question.isSecret,
+    });
+    plan.push({ key, questionId: question.id, labels });
+  }
+
+  // Nothing here is truncated: either the whole batch is publishable, or the
+  // request is refused and the server is told so.
+  if (JSON.stringify(questions).length > MAX_QUESTION_DETAIL_CHARS) return refusedQuestion('detail_too_large');
+
+  return {
+    kind: 'request',
+    correlation: { threadId: record.threadId, turnId: record.turnId },
+    questions,
+    plan,
+  };
+}
+
+/**
+ * Build the native answer map from one validated neutral response.
+ *
+ * The runtime has already proven the response answers every question exactly
+ * once, so this cannot produce a partial map — and it throws rather than
+ * omitting a key if that guarantee is ever violated by a direct SPI caller.
+ */
+export function nativeUserInputAnswers(
+  plan: readonly QuestionPlanEntry[],
+  response: Extract<InteractionResponse, { kind: 'question_set' }>,
+): JsonObject {
+  const answers: Record<string, JsonValue> = {};
+  for (const entry of plan) {
+    const answer = response.answers[entry.key];
+    if (answer === undefined) {
+      throw rejection('invalid_request', 'every question in this codex batch must be answered');
+    }
+    if (answer.type === 'text') {
+      answers[entry.questionId] = { answers: [answer.text] };
+      continue;
+    }
+    const labels = answer.values.map((value) => entry.labels.get(value));
+    if (labels.some((label) => label === undefined)) {
+      throw rejection('invalid_request', 'a selection named a choice this codex question does not offer');
+    }
+    answers[entry.questionId] = { answers: labels as string[] };
+  }
+  return { answers };
+}
+
 /** Neutral response → the pinned `CommandExecutionApprovalDecision`. */
 function nativeDecision(response: Extract<InteractionResponse, { kind: 'approval' }>): string {
   if (response.decision !== 'approved') {
@@ -302,7 +499,10 @@ type Entry = {
    * is a conflict, and neither reaches the server twice.
    */
   applied: string | undefined;
-};
+} & (
+  | { readonly kind: 'approval'; readonly plan?: undefined }
+  | { readonly kind: 'question'; readonly plan: readonly QuestionPlanEntry[] }
+);
 
 function rejection(code: Parameters<typeof agentError>[0], message: string, details?: JsonObject): ProviderRejection {
   return new ProviderRejection(agentError(code, message, details === undefined ? {} : { details }));
@@ -313,7 +513,33 @@ function appliedKey(response: Extract<InteractionResponse, { kind: 'approval' }>
   return JSON.stringify([response.decision, response.mode ?? null, response.reason ?? null]);
 }
 
-export function createInteractionRegistry(sessionSink: ProviderEventSink): CodexInteractionRegistry {
+/**
+ * The same, for a batch. Key order is not semantic, so it is normalized: the
+ * same answers collected in a different order are the same answer.
+ */
+function appliedQuestionKey(response: Extract<InteractionResponse, { kind: 'question_set' }>): string {
+  return JSON.stringify(
+    Object.keys(response.answers)
+      .sort()
+      .map((key) => [key, response.answers[key]]),
+  );
+}
+
+export type InteractionRegistryOptions = {
+  /**
+   * Whether `item/tool/requestUserInput` is bridged. When false the method is
+   * reported `unhandled`, so the caller declines it with `-32601` exactly as
+   * before — an unbridged blocking request must still be answered, never
+   * ignored.
+   */
+  readonly questions: boolean;
+};
+
+export function createInteractionRegistry(
+  sessionSink: ProviderEventSink,
+  options: InteractionRegistryOptions = { questions: false },
+): CodexInteractionRegistry {
+  const bridgesQuestions = options.questions;
   const entries = new Map<string, Entry>();
   /**
    * This registry's own reference namespace.
@@ -337,7 +563,12 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
     entry.applied = RETIRED;
     // Best effort: once the stream has ended nothing can be written, but the
     // entry still goes, so a late response cannot settle anything.
-    entry.respond({ decision: TEARDOWN_DECISION });
+    //
+    // A question has no "decline" variant — `ToolRequestUserInputResponse` is
+    // an answer map and nothing else — so an unanswered batch is retired with
+    // an *empty* map. That answers no question, invents nothing, and releases
+    // the server's wait, which is the only honest thing left to send.
+    entry.respond(entry.kind === 'question' ? { answers: {} } : { decision: TEARDOWN_DECISION });
   }
 
   function clear(key: object | undefined): void {
@@ -347,8 +578,63 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
     }
   }
 
+  /**
+   * Consider one `item/tool/requestUserInput`.
+   *
+   * Mirrors the approval path exactly: validate the whole native request,
+   * refuse it on its own request id if anything cannot be carried, admit it
+   * only against the active turn, and only then raise one neutral batch.
+   */
+  function offerQuestion(request: CodexServerRequestOffer, owner: ApprovalOwner | undefined): OfferVerdict {
+    const sink = owner?.sink ?? sessionSink;
+    const translation = translateUserInputRequest(request.params);
+    if (translation.kind === 'refused') {
+      request.reject(INVALID_PARAMS, 'this user-input request cannot be represented faithfully');
+      note(
+        sink,
+        'warning',
+        `codex requested user input this adapter cannot map (${translation.reason}); it was declined`,
+      );
+      return 'taken';
+    }
+
+    if (owner === undefined || !sameTurn(owner.correlation, translation.correlation)) {
+      request.reject(INVALID_REQUEST, 'no active turn owns this user-input request');
+      note(sink, 'warning', 'codex requested user input that does not belong to the active turn; it was declined');
+      return 'taken';
+    }
+
+    if (entries.size >= MAX_TRACKED_APPROVALS) {
+      request.reject(INVALID_REQUEST, 'too many interactions are outstanding on this session');
+      note(sink, 'warning', 'codex requested more interactions than this adapter tracks at once; it was declined');
+      return 'taken';
+    }
+
+    issued += 1;
+    const providerRef = `question-${namespace}-${String(issued)}`;
+    entries.set(providerRef, {
+      kind: 'question',
+      ownerKey: owner.key,
+      plan: translation.plan,
+      respond: (result: JsonValue) => request.respond(result),
+      applied: undefined,
+    });
+    sink.emit({
+      payload: {
+        type: 'interaction.requested',
+        providerRef,
+        request: { kind: 'question_set', questions: [...translation.questions] },
+      },
+    });
+    return 'taken';
+  }
+
   return {
     offer(request: CodexServerRequestOffer, owner: ApprovalOwner | undefined): OfferVerdict {
+      if (request.method === CODEX_BRIDGED_QUESTION) {
+        if (!bridgesQuestions) return 'unhandled';
+        return offerQuestion(request, owner);
+      }
       if (request.method !== CODEX_BRIDGED_APPROVAL) return 'unhandled';
 
       const sink = owner?.sink ?? sessionSink;
@@ -381,6 +667,7 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
       issued += 1;
       const providerRef = `approval-${namespace}-${String(issued)}`;
       entries.set(providerRef, {
+        kind: 'approval',
         ownerKey: owner.key,
         // Wrapped rather than passed by reference: the offer owns the native
         // id and the at-most-once guard, and this keeps `this` bound to it.
@@ -410,13 +697,34 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
       if (entry === undefined) {
         // The reference is caller-controlled text on a durable error, so it is
         // classified, never echoed.
-        throw rejection('unknown_interaction', 'the codex adapter has no approval outstanding for that reference');
+        throw rejection('unknown_interaction', 'the codex adapter has no interaction outstanding for that reference');
       }
       const parsed = InteractionResponseSchema.safeParse(response);
       if (!parsed.success) {
-        throw rejection('invalid_request', 'the codex approval response is malformed');
+        throw rejection('invalid_request', 'the codex interaction response is malformed');
       }
       response = parsed.data;
+
+      if (entry.kind === 'question') {
+        if (response.kind !== 'question_set') {
+          throw rejection('capability_unsupported', 'this codex interaction is answered with a question batch', {
+            capability: 'interaction.kind',
+            supported: ['question_set'],
+          });
+        }
+        // Validation completes before settlement is consumed, so a response
+        // this adapter cannot apply leaves the batch answerable.
+        const native = nativeUserInputAnswers(entry.plan, response);
+        const questionKey = appliedQuestionKey(response);
+        if (entry.applied !== undefined) {
+          if (entry.applied === questionKey) return;
+          throw rejection('interaction_already_settled', 'this codex question is already settled');
+        }
+        entry.applied = questionKey;
+        entry.respond(native);
+        return;
+      }
+
       if (response.kind !== 'approval') {
         throw rejection(
           'capability_unsupported',

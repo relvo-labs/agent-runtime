@@ -37,7 +37,7 @@ const receiptBase = {
 const providerDescriptorBase = {
   providerId: 'fixture',
   providerVersion: '0.1.0',
-  wireVersion: '0.4',
+  wireVersion: '0.5',
   displayName: 'Fixture',
   run: {
     interrupt: { mode: 'immediate', deliversPartialOutput: true, sessionRemainsUsable: true },
@@ -100,11 +100,11 @@ const settlementEnvelope = (settlement: unknown): unknown => ({
   runId: 'run_0000000000000001',
   sequence: 7,
   occurredAt: timestamp,
-  wireVersion: '0.4',
+  wireVersion: '0.5',
   payload: interactionSettledPayload(settlement),
 });
 const settlementSnapshot = (settlement: unknown): unknown => ({
-  session: { ...agentSessionBase, wireVersion: '0.4' },
+  session: { ...agentSessionBase, wireVersion: '0.5' },
   turns: [],
   runs: [],
   interactions: [settledInteractionWith(settlement)],
@@ -204,7 +204,7 @@ const corpus: readonly ParityCase[] = [
       sessionId: 'ses_0000000000000001',
       state: 'ready',
       providerId: 'fixture',
-      wireVersion: '0.4',
+      wireVersion: '0.5',
       workspace: { leaseId: 'wsl_0000000000000001', ownership: 'borrowed', root: '/workspace', acquiredAt: timestamp },
       createdAt: timestamp,
       sequence: 0,
@@ -215,7 +215,7 @@ const corpus: readonly ParityCase[] = [
     value: {
       providerId: 'minimal',
       providerVersion: '0.1.0',
-      wireVersion: '0.4',
+      wireVersion: '0.5',
       displayName: 'Minimal',
       run: { interrupt: { mode: 'unsupported' }, streaming: {} },
       interaction: { approval: {}, question: {} },
@@ -234,17 +234,17 @@ const corpus: readonly ParityCase[] = [
       },
     },
   },
-  { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.4' } },
   { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
-  { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.4' } },
+  { schema: 'event-envelope', value: { ...eventEnvelopeBase, wireVersion: '0.6' } },
   { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.5' } },
-  {
-    schema: 'provider-recovery-record',
-    value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.4', opaque: {} },
-  },
+  { schema: 'agent-session', value: { ...agentSessionBase, wireVersion: '0.6' } },
   {
     schema: 'provider-recovery-record',
     value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.5', opaque: {} },
+  },
+  {
+    schema: 'provider-recovery-record',
+    value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.6', opaque: {} },
   },
   { schema: 'turn-input', value: { parts: [{ type: 'file_ref', path: 'src/index.ts' }] } },
   { schema: 'turn-input', value: { parts: [{ type: 'file_ref', path: '/etc/passwd' }] } },
@@ -344,11 +344,11 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
   });
 
   it.each([
-    { schema: 'event-envelope' as const, value: { ...eventEnvelopeBase, wireVersion: '0.5' } },
-    { schema: 'agent-session' as const, value: { ...agentSessionBase, wireVersion: '0.5' } },
+    { schema: 'event-envelope' as const, value: { ...eventEnvelopeBase, wireVersion: '0.6' } },
+    { schema: 'agent-session' as const, value: { ...agentSessionBase, wireVersion: '0.6' } },
     {
       schema: 'provider-recovery-record' as const,
-      value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.5', opaque: {} },
+      value: { providerId: 'fixture', providerVersion: '0.1.0', wireVersion: '0.6', opaque: {} },
     },
   ])('rejects a version-only mismatch in both $schema validators', ({ schema, value }) => {
     const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
@@ -374,7 +374,7 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     {
       schema: 'session-snapshot' as const,
       value: {
-        session: { ...agentSessionBase, wireVersion: '0.4' },
+        session: { ...agentSessionBase, wireVersion: '0.5' },
         turns: [],
         runs: [
           {
@@ -429,6 +429,59 @@ describe('Zod and Draft 2020-12 JSON Schema parity', () => {
     const validate = ajv.compile(JSON_SCHEMAS[schema]);
     expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(false);
     expect(validate(value), JSON.stringify(validate.errors)).toBe(false);
+  });
+
+  it.each([
+    { schema: 'interaction-request' as const, wrap: (request: unknown) => request },
+    {
+      schema: 'agent-interaction' as const,
+      wrap: (request: unknown) => ({ ...interactionBase, request, status: 'pending' }),
+    },
+    {
+      schema: 'provider-event-input' as const,
+      wrap: (request: unknown) => ({
+        payload: { type: 'interaction.requested', providerRef: 'question-1', request },
+      }),
+    },
+  ])('$schema publishes the batch question form and admits it in both validators', ({ schema, wrap }) => {
+    const value = wrap({
+      kind: 'question_set',
+      questions: [{ key: 'q1', prompt: 'Which database?', multiSelect: false, allowFreeText: false, sensitive: false }],
+    });
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS[schema]);
+    expect(PUBLISHED_SCHEMAS[schema].safeParse(value).success).toBe(true);
+    expect(validate(value), JSON.stringify(validate.errors)).toBe(true);
+  });
+
+  /**
+   * The one invariant in the batch form that Draft 2020-12 cannot express.
+   *
+   * `uniqueItems` compares whole array items, so two questions that differ in
+   * `prompt` but share a `key` are distinct items and pass it. There is no
+   * keyword for "unique by a named property across items". Rather than leave
+   * the gap implicit, it is asserted here in both directions and documented in
+   * ADR-0018: Zod refuses, Ajv accepts, and the guard therefore has to run at
+   * every in-process ingress — which it does, because the runtime parses each
+   * `ProviderEventInput` through the Zod schema before staging it.
+   */
+  it('enforces unique question keys in Zod only, a documented JSON Schema representability boundary', () => {
+    const value = {
+      kind: 'question_set',
+      questions: [
+        { key: 'q1', prompt: 'Which database?', multiSelect: false, allowFreeText: false, sensitive: false },
+        { key: 'q1', prompt: 'Which region?', multiSelect: false, allowFreeText: false, sensitive: false },
+      ],
+    };
+    const ajv = new Ajv2020({ allErrors: true, strict: true, strictRequired: false, allowUnionTypes: true });
+    addFormats(ajv);
+    ajv.addKeyword({ keyword: 'x-wire-version', schemaType: 'string', valid: true });
+    const validate = ajv.compile(JSON_SCHEMAS['interaction-request']);
+
+    expect(PUBLISHED_SCHEMAS['interaction-request'].safeParse(value).success).toBe(false);
+    expect(validate(value)).toBe(true);
   });
 
   it('publishes the settlement conditional on the shared $defs entry, not only on roots', () => {

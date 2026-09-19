@@ -65,9 +65,9 @@
       ]
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/workspace-spec.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/workspace-spec.json",
   "$ref": "#/$defs/workspace-spec",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "workspace-spec",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

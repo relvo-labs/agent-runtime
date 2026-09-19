@@ -166,8 +166,17 @@ describe('capability truth', () => {
       modes: ['once', 'session'],
       blocking: true,
     });
-    // No question shape in the pinned stable surface is bridged.
-    expect(descriptor.interaction.question).toEqual({ supported: false, choices: false, multiSelect: false });
+    // Bridging approvals claims nothing about questions: the two bridges are
+    // separate options, and `questions: 'bridge'` is what declares this block.
+    expect(descriptor.interaction.question).toEqual({
+      supported: false,
+      choices: false,
+      multiSelect: false,
+      batch: false,
+      maxQuestions: null,
+      freeText: false,
+      sensitive: false,
+    });
     expect(descriptor.interaction.settlementTimeoutMs).toBeNull();
 
     const { fake } = await openSession();

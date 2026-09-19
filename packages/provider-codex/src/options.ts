@@ -94,6 +94,31 @@ export type CodexProviderOptions = {
    */
   readonly approvals?: 'none' | 'bridge';
   /**
+   * Whether the app-server's `item/tool/requestUserInput` requests are bridged
+   * to neutral `question_set` interactions.
+   *
+   * Defaults to `'none'`, which keeps the current posture: the method is
+   * declined with `-32601` on its own request id, so a blocking request cannot
+   * stall a turn while nobody answers it.
+   *
+   * `'bridge'` raises one `interaction.requested` per request, on the run that
+   * owns `(threadId, turnId)`, and answers the native request with the whole
+   * `{ answers: { [questionId]: { answers } } }` map once the host settles it —
+   * so the same turn resumes where it paused.
+   *
+   * **No capability opt-in accompanies this.** `initialize.params.capabilities`
+   * stays `null`: `item/tool/requestUserInput` and its parameter types are in
+   * the pinned *stable* generated surface for 0.153.4, byte-identical to their
+   * `--experimental` counterparts, while genuinely experimental methods such as
+   * `thread/queue/*` are absent from that surface. Setting `experimentalApi`
+   * would additionally widen `CommandExecutionRequestApprovalParams`, which the
+   * approval bridge parses strictly — so opting in would break a shipped
+   * feature to gain nothing. See ADR-0018.
+   *
+   * Provider-level, not a session override, for the same reason `approvals` is.
+   */
+  readonly questions?: 'none' | 'bridge';
+  /**
    * Client identity sent in `initialize.params.clientInfo.name`. Upstream uses
    * it for compliance-log attribution, so a host with its own registered client
    * name should set it.

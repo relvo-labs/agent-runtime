@@ -83,6 +83,9 @@
           "$ref": "#/$defs/question-request"
         },
         {
+          "$ref": "#/$defs/question-set-request"
+        },
+        {
           "$ref": "#/$defs/approval-request"
         }
       ]
@@ -138,6 +141,52 @@
       ],
       "type": "object"
     },
+    "question-item": {
+      "additionalProperties": false,
+      "properties": {
+        "allowFreeText": {
+          "default": false,
+          "type": "boolean"
+        },
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/question-choice"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array"
+        },
+        "header": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "multiSelect": {
+          "default": false,
+          "type": "boolean"
+        },
+        "prompt": {
+          "maxLength": 8000,
+          "minLength": 1,
+          "type": "string"
+        },
+        "sensitive": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "prompt"
+      ],
+      "type": "object"
+    },
     "question-request": {
       "additionalProperties": false,
       "properties": {
@@ -173,6 +222,28 @@
       ],
       "type": "object"
     },
+    "question-set-request": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "question_set",
+          "type": "string"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/question-item"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "questions"
+      ],
+      "type": "object"
+    },
     "usage": {
       "additionalProperties": false,
       "properties": {
@@ -195,7 +266,7 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/provider-event-input.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/provider-event-input.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -342,5 +413,5 @@
   ],
   "title": "provider-event-input",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

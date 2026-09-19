@@ -46,9 +46,9 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/workspace-lease-descriptor.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/workspace-lease-descriptor.json",
   "$ref": "#/$defs/workspace-lease-descriptor",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "workspace-lease-descriptor",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

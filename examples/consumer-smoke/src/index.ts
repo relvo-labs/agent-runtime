@@ -3,16 +3,27 @@ import {
   WIRE_VERSION,
   createCounterIdFactory,
   createFixedClock,
+  checkResponseAgainstRequest,
   CommandIdSchema,
+  InteractionIdSchema,
+  QuestionSetRequestSchema,
+  QuestionSetResponseSchema,
   type CommandReceipt,
+  type InteractionResponse,
+  type QuestionAnswer,
+  type QuestionItem,
+  type QuestionSetRequest,
+  type QuestionSetResponse,
   type SessionId,
   type WorkspaceLeaseDescriptor,
   type WorkspaceSpec,
 } from '@relvo-labs/agent-protocol';
 import {
   ProviderRunTerminationSchema,
+  canAskQuestionSet,
   defineProviderDescriptor,
   type AgentProvider,
+  type CapabilityCheck,
   type ProviderRunTermination,
 } from '@relvo-labs/agent-provider';
 import {
@@ -20,9 +31,11 @@ import {
   CLAUDE_ADAPTER_VERSION,
   CLAUDE_AGENT_SDK_PACKAGE,
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_QUESTION_TOOL,
   ClaudePermissionModeSchema,
   ClaudeSessionOptionsSchema,
   createClaudeProvider,
+  type ClaudeAskUserQuestionInput,
   type ClaudeCanUseTool,
   type ClaudeInterruptReceipt,
   type ClaudeMessageUuid,
@@ -40,6 +53,7 @@ import {
 } from '@relvo-labs/agent-provider-claude';
 import {
   CODEX_ADAPTER_STATUS,
+  CODEX_BRIDGED_QUESTION,
   CODEX_ADAPTER_VERSION,
   CODEX_APP_SERVER_ARGV,
   CODEX_APP_SERVER_VERSION,
@@ -131,6 +145,9 @@ const claudeOptions: ClaudeProviderOptions = {
   // `respondToInteraction`. Omit it and the adapter declares no approval
   // capability, exactly as before.
   approvals: 'bridge',
+  // Opt in to the host question bridge: `AskUserQuestion` becomes a neutral
+  // `question_set` interaction this host answers, and the same run resumes.
+  questions: 'bridge',
 };
 
 /**
@@ -228,6 +245,81 @@ async function runCodexTurn(sessionId: SessionId): Promise<CommandReceipt> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Structured questions (ADR-0018)
+// ---------------------------------------------------------------------------
+
+/**
+ * A host renders a batch and answers it as one unit.
+ *
+ * The answer is keyed by the request's own `key`, never by array position, and
+ * the whole batch is answered or none of it is. `checkResponseAgainstRequest`
+ * is the same check the runtime applies before any provider is touched, so a
+ * host can validate its own form before submitting a command.
+ */
+const questionBatch: QuestionSetRequest = QuestionSetRequestSchema.parse({
+  kind: 'question_set',
+  questions: [
+    {
+      key: 'q1',
+      prompt: 'Which database should the service use?',
+      header: 'Database',
+      choices: [
+        { value: 'o1', label: 'PostgreSQL', description: 'Relational' },
+        { value: 'o2', label: 'SQLite', description: 'Embedded' },
+      ],
+      allowFreeText: true,
+    },
+    { key: 'q2', prompt: 'Paste the deploy token', sensitive: true },
+  ],
+});
+
+/** Collecting one answer per question, in the shape the contract requires. */
+function answerFor(question: QuestionItem): QuestionAnswer {
+  const first = question.choices?.[0];
+  return first === undefined
+    ? { type: 'text', text: 'typed by the user' }
+    : { type: 'selection', values: [first.value] };
+}
+
+const questionAnswers: QuestionSetResponse = QuestionSetResponseSchema.parse({
+  kind: 'question_set',
+  answers: Object.fromEntries(questionBatch.questions.map((question) => [question.key, answerFor(question)])),
+});
+
+/** `undefined` means the batch is answered completely and validly. */
+const questionMismatch: string | undefined = checkResponseAgainstRequest(questionBatch, questionAnswers);
+
+/** A host submits it as an ordinary command, narrowed by the response union. */
+async function answerQuestions(sessionId: SessionId): Promise<CommandReceipt> {
+  const response: InteractionResponse = questionAnswers;
+  return claudeRuntime.respondToInteraction({
+    type: 'respond_to_interaction',
+    commandId: CommandIdSchema.parse('claude-consumer-answer-1'),
+    sessionId,
+    interactionId: InteractionIdSchema.parse('int_0000000000000001'),
+    response,
+  });
+}
+
+/** Capability gating before a host offers a batch surface at all. */
+const batchSupported: CapabilityCheck = canAskQuestionSet(claude.describe(), questionBatch.questions.length);
+
+/**
+ * The Claude question seam is a named public type, so a host that drives
+ * `canUseTool` itself answers `AskUserQuestion` with the pinned route and gets
+ * a compile error if the shape is wrong.
+ */
+const askUserQuestionHandler: ClaudeCanUseTool = (toolName, input, request) => {
+  if (toolName !== CLAUDE_QUESTION_TOOL || request.signal.aborted) {
+    return Promise.resolve({ behavior: 'deny', message: 'not answerable by this host' });
+  }
+  const questions = (input as unknown as ClaudeAskUserQuestionInput).questions;
+  const answers: Record<string, string> = {};
+  for (const question of questions) answers[question.question] = question.options[0]?.label ?? '';
+  return Promise.resolve({ behavior: 'allow', updatedInput: { questions, answers } });
+};
+
 assertReadOnly(['status', '--short']);
 void runtime;
 void descriptor;
@@ -260,3 +352,8 @@ void hostPermissionCallback;
 void runClaudeTurn;
 void claudeRuntime;
 void claudeSessionOptions;
+void questionMismatch;
+void answerQuestions;
+void batchSupported;
+void askUserQuestionHandler;
+void CODEX_BRIDGED_QUESTION;

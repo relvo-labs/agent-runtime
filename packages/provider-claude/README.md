@@ -119,13 +119,13 @@ mode, rules and hooks did not already decide becomes a neutral `approval` intera
 the run that asked, and the tool call proceeds **only** after a response of
 `{ kind: 'approval', decision: 'approved', mode: 'once' }`.
 
-| Neutral capability          | Bridged           | Why                                                                                                 |
-| --------------------------- | ----------------- | --------------------------------------------------------------------------------------------------- |
-| `approval.modes: ['once']`  | yes               | The callback decides the one call in front of it.                                                   |
-| `approval.blocking: true`   | yes               | The SDK waits for the answer; the prompt has no deadline of its own.                                |
-| `approval.modes: 'session'` | no — rejected     | A durable grant is a permission rule this adapter does not write.                                   |
-| `question`                  | no — never raised | `AskUserQuestion`, `onUserDialog` and MCP elicitation carry forms one neutral question cannot hold. |
-| `expired` / `withdrawn`     | no                | No settlement deadline is imposed here, so neither outcome is manufactured.                         |
+| Neutral capability          | Bridged         | Why                                                                                     |
+| --------------------------- | --------------- | --------------------------------------------------------------------------------------- |
+| `approval.modes: ['once']`  | yes             | The callback decides the one call in front of it.                                       |
+| `approval.blocking: true`   | yes             | The SDK waits for the answer; the prompt has no deadline of its own.                    |
+| `approval.modes: 'session'` | no — rejected   | A durable grant is a permission rule this adapter does not write.                       |
+| `question_set`              | separate opt-in | See "Structured questions" below. `approvals: 'bridge'` claims nothing about questions. |
+| `expired` / `withdrawn`     | no              | No settlement deadline is imposed here, so neither outcome is manufactured.             |
 
 Everything that is not that one grant fails closed. There is no auto-allow, no
 allow-on-timeout and no allow-on-error path:
@@ -190,12 +190,54 @@ interrupt once the turn has started stops it normally.
 Disposal fences new runs the instant it begins, shares one teardown between concurrent
 callers, and stays retryable to success if teardown rejects.
 
+## Structured questions
+
+Off by default. `createClaudeProvider({ questions: 'bridge' })` installs the SDK's host
+callback and turns each `AskUserQuestion` call into one neutral `question_set` interaction
+on the run that asked. The run **pauses at the native wait point** and resumes there once
+the host answers — this is not a follow-up turn and not an approval.
+
+The answer route is the pinned one. `AskUserQuestion` reaches `canUseTool` like any other
+tool, and the host answers by allowing the call with an `updatedInput` carrying the
+answers map that `AskUserQuestionInput.answers` declares ("User answers collected by the
+permission component"). A bare `{ behavior: 'allow' }` would run the tool with no answers;
+a denial would hand the model prose. Neither is ever used to settle a question here.
+
+| Native form                          | Bridged            | Notes                                                                                                    |
+| ------------------------------------ | ------------------ | -------------------------------------------------------------------------------------------------------- |
+| single-select question               | **yes**            | `multiSelect: false`. The answer is the option's `label`.                                                |
+| multi-select question                | **yes**            | `multiSelect: true`. Labels are joined with `', '`, the pinned encoding for the `string`-valued map.     |
+| free text / "Other"                  | **yes**            | Every question carries `allowFreeText: true`; the typed text is sent verbatim, never the word "Other".   |
+| 1–4 questions in one call            | **yes**            | Raised as one ordered batch, answered as one unit. Partial answers are refused before the SDK is called. |
+| cancellation / withdrawal            | **yes**            | Aborting the request's signal denies once, detaches and retires the reference.                           |
+| option `preview`                     | no — refused whole | `toolConfig.askUserQuestion.previewFormat` is never set, so none is generated; one arriving is refused.  |
+| secret answers                       | n/a                | `AskUserQuestion` has no secret-answer concept, so `sensitive` is always `false`.                        |
+| `autoResolution` / `afkTimeoutMs`    | no                 | Output-only in the SDK, and this adapter never auto-answers. No settlement deadline is imposed.          |
+| pre-filled `answers` / `annotations` | no — refused whole | Answers arriving inbound are not a host answer; treating them as one would fabricate consent.            |
+| duplicate question text              | no — refused whole | The native answer map is keyed by question text, so duplicates cannot both be answered.                  |
+| duplicate option label               | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                 |
+| counts outside 1–4 / 2–4             | no — refused whole | The pinned tool bounds, enforced rather than assumed.                                                    |
+| `onUserDialog`, MCP elicitation      | no                 | Different native mechanisms; neither is bridged, and neither is claimed.                                 |
+
+A refused call is denied whole, on its own callback, and **raises no interaction** — a
+question a host cannot display faithfully must never be shown half-rendered. The refusal
+diagnostic carries a bounded reason token and no prompt, option or answer text.
+
+Two limitations worth stating: `canUseTool` is not called for a tool an allow rule or a
+permission mode already decided, so an `AskUserQuestion` pre-approved that way is never
+seen by this bridge; and if you pass an `allowedTools` list, include `AskUserQuestion` in
+it or the tool is never offered to the model.
+
+Questions and answers are untrusted, possibly sensitive text, and a settled answer is
+committed to the durable event log. See "Untrusted and sensitive content" below.
+
 ## What it does not do
 
-- **Questions.** No question is ever raised, so none is declared — see the approval table
-  above for why. Approvals are raised only when the host opts in with
-  `approvals: 'bridge'`; without it `permissionPrompts: 'none'` is set and a prompt nobody
-  can answer fails closed instead of parking a run, since this adapter imposes no
+- **Questions, unless asked for.** Without `questions: 'bridge'` no question is declared
+  and an `AskUserQuestion` call is denied with a message telling the model to ask in its
+  reply. Approvals are likewise raised only when the host opts in with
+  `approvals: 'bridge'`; without either, `permissionPrompts: 'none'` is set and a prompt
+  nobody can answer fails closed instead of parking a run, since this adapter imposes no
   settlement deadline. Choose a `permissionMode` to pre-authorise tool use instead.
 - **Non-text turn input.** A `file_ref` part is rejected with `capability_unsupported`
   rather than being invented into prose.
@@ -213,6 +255,28 @@ callers, and stays retryable to success if teardown rejects.
   rather than model output, so they are not published as message deltas either. A host that
   wants the raw text wraps `query` in its own binding, where it sees every SDK message and
   error without any of it reaching the durable event log.
+
+## Untrusted and sensitive content
+
+A question, its options and an answer are **untrusted input**. The prompts and option
+labels are model-authored; the answer is whatever the host's user typed. Both are durable:
+the request is committed as `interaction.requested` and the answer as
+`interaction.settled`, and both are projected into the session snapshot and replayed to
+every subscriber.
+
+What that means for a host:
+
+- **Display.** Render question and option text as inert text. It is not markup, not a
+  command, and not a trusted instruction — treat it exactly as you would any model output.
+- **Retention.** The runtime stores answers, because settlement has to be replayable. If
+  an answer must not be retained, do not collect it: refuse the interaction instead. This
+  adapter marks no `AskUserQuestion` question `sensitive`, because the tool has no such
+  concept — an absent flag is not a promise that an answer is harmless.
+- **Access.** Anyone who can read the session event stream can read every question and
+  every answer. Scope subscriptions accordingly.
+- **Logging.** This adapter copies no prompt, option or answer text into a diagnostic, an
+  `AgentError` message or a `providerCode`; refusals are bounded classification tokens.
+  A host that logs its own rendered form owns that decision.
 
 ## Testing against it
 

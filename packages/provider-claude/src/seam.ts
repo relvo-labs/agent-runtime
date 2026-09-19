@@ -57,16 +57,65 @@ export type ClaudePromptMessage = {
 /**
  * What the host answers a permission prompt with.
  *
- * Narrower than the SDK's `PermissionResult` on purpose. The adapter never
- * rewrites the tool's input and never writes a permission rule, so neither
- * `updatedInput` nor `updatedPermissions` is expressible here: a grant is for
- * the one call that asked, which is the only mode this adapter declares.
+ * Narrower than the SDK's `PermissionResult` on purpose: `updatedPermissions`
+ * is still not expressible, because this adapter writes no permission rule and
+ * a grant is for the one call that asked.
+ *
+ * `updatedInput` *is* expressible, and it is the SDK's answer route for
+ * `AskUserQuestion`. The pinned declaration
+ * (`sdk-tools.d.ts` → `AskUserQuestionInput`) carries
+ * `answers?: { [questionText: string]: string }`, described as "User answers
+ * collected by the permission component", and the CLI returns the same map as
+ * `AskUserQuestionOutput.answers`. Allowing the call with that input is
+ * therefore how a question is *answered*, not merely approved — and it is the
+ * only way the SDK lets a host supply one. An approval bridge never sets it.
  *
  * `message` on a denial is the text the model is shown so it can adapt. It is
  * the host's own words, and it is never copied into an event or an error.
  */
 export type ClaudePermissionResult =
-  { readonly behavior: 'allow' } | { readonly behavior: 'deny'; readonly message: string };
+  | { readonly behavior: 'allow'; readonly updatedInput?: Record<string, unknown> }
+  | { readonly behavior: 'deny'; readonly message: string };
+
+/**
+ * One option on an `AskUserQuestion` question, mirrored from the pinned
+ * `AskUserQuestionInput`.
+ *
+ * `preview` is declared so the adapter can *detect* it. This adapter never sets
+ * `toolConfig.askUserQuestion.previewFormat`, so the pinned CLI does not
+ * generate previews; a request that carries one anyway is refused whole rather
+ * than rendered without it, because a dropped preview changes what the user
+ * believes they are choosing between.
+ */
+export type ClaudeQuestionOption = {
+  readonly label: string;
+  readonly description: string;
+  readonly preview?: string;
+};
+
+/** One question on an `AskUserQuestion` call. */
+export type ClaudeQuestion = {
+  readonly question: string;
+  readonly header: string;
+  readonly options: readonly ClaudeQuestionOption[];
+  readonly multiSelect: boolean;
+};
+
+/**
+ * The `AskUserQuestion` tool input, as the SDK hands it to `canUseTool`.
+ *
+ * Mirrors the pinned `AskUserQuestionInput`: 1–4 questions, each with 2–4
+ * options, plus the optional answer-carrying fields the host fills in. The
+ * adapter validates the whole thing at runtime before raising anything — this
+ * type describes the shape it expects, not a shape it trusts.
+ */
+export type ClaudeAskUserQuestionInput = {
+  readonly questions: readonly ClaudeQuestion[];
+  /** Question text → answer string. Multi-select answers are `', '`-joined. */
+  readonly answers?: Readonly<Record<string, string>>;
+  readonly annotations?: Readonly<Record<string, { readonly preview?: string; readonly notes?: string }>>;
+  readonly metadata?: { readonly source?: string };
+};
 
 /**
  * The per-call context the SDK hands the permission callback.

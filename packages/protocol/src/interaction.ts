@@ -40,6 +40,82 @@ export const QuestionRequestSchema = z.strictObject({
 });
 
 /**
+ * The key a batch answer is filed under.
+ *
+ * Assigned by the adapter, unique within one request, and deliberately NOT a
+ * provider-native question id: Codex names its questions with its own `id` and
+ * Claude keys answers by the question *text*, neither of which may reach a
+ * public DTO (AGENTS.md §5). The character class keeps a key usable as a form
+ * field name and as a JSON object key without escaping.
+ */
+export const QuestionKeySchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'a question key is alphanumeric with `.`, `_` or `-`');
+
+/**
+ * One question inside a batch.
+ *
+ * Every field exists because a pinned native surface supplies it and a host
+ * needs it to render the question faithfully. An adapter that observes a native
+ * fact it cannot map here refuses the whole request rather than dropping it —
+ * see ADR-0018.
+ */
+export const QuestionItemSchema = z.strictObject({
+  key: QuestionKeySchema,
+  prompt: z.string().min(1).max(8000),
+  /** Short label for a chip or column heading, when the provider supplies one. */
+  header: z.string().min(1).max(200).optional(),
+  /** Absent means free text only. Present means selections come from this list. */
+  choices: z.array(QuestionChoiceSchema).min(1).max(64).optional(),
+  /** Whether more than one choice may be selected. */
+  multiSelect: z.boolean().default(false),
+  /**
+   * Whether typed text is accepted *in addition to* the choice list — the
+   * "Other" affordance. Meaningless without `choices`, where text is the only
+   * possible answer anyway.
+   */
+  allowFreeText: z.boolean().default(false),
+  /**
+   * Whether the answer is a secret. Advisory display guidance for the host, not
+   * an enforced control: the runtime commits settled answers to a durable event
+   * log either way. A host that must not retain a secret refuses the request.
+   */
+  sensitive: z.boolean().default(false),
+});
+
+/**
+ * Several correlated questions asked at once.
+ *
+ * Order is the provider's order and is preserved. Identity is `key`, never
+ * array position, so a response is well defined no matter how a host collects
+ * it. See ADR-0018 for why this is a separate union member rather than a
+ * widened `QuestionRequest`.
+ */
+export const QuestionSetRequestSchema = z
+  .strictObject({
+    kind: z.literal('question_set'),
+    questions: z.array(QuestionItemSchema).min(1).max(32),
+  })
+  /**
+   * Keys identify answers, so two questions sharing one key would share one
+   * answer while both appearing to have been asked.
+   *
+   * Draft 2020-12 cannot express "unique by a property across array items" —
+   * `uniqueItems` compares whole items, and two questions differing only in
+   * `prompt` are distinct items with the same key. This is therefore a
+   * documented Zod-stronger-than-JSON-Schema boundary, in the same class as the
+   * graph-acyclicity guard: enforced in Zod and at every in-process ingress
+   * (the runtime parses each `ProviderEventInput` through this schema), tested
+   * separately, and named in `schema-parity.test.ts` rather than left implicit.
+   */
+  .refine((value) => new Set(value.questions.map((question) => question.key)).size === value.questions.length, {
+    message: 'question keys must be unique within a request',
+    path: ['questions'],
+  });
+
+/**
  * A described action, not an executed one. `command` is the provider's stated
  * intent for display and audit; the runtime does not run it and cannot
  * guarantee the provider will run exactly this.
@@ -64,9 +140,15 @@ export const ApprovalRequestSchema = z.strictObject({
   riskHint: z.enum(['low', 'medium', 'high']).default('medium'),
 });
 
-export const InteractionRequestSchema = z.discriminatedUnion('kind', [QuestionRequestSchema, ApprovalRequestSchema]);
+export const InteractionRequestSchema = z.discriminatedUnion('kind', [
+  QuestionRequestSchema,
+  QuestionSetRequestSchema,
+  ApprovalRequestSchema,
+]);
 
 export type QuestionRequest = z.infer<typeof QuestionRequestSchema>;
+export type QuestionItem = z.infer<typeof QuestionItemSchema>;
+export type QuestionSetRequest = z.infer<typeof QuestionSetRequestSchema>;
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 export type InteractionRequest = z.infer<typeof InteractionRequestSchema>;
 export type InteractionKind = InteractionRequest['kind'];
@@ -81,6 +163,35 @@ export const QuestionResponseSchema = z.strictObject({
   answer: z.union([z.string().max(16_000), z.array(z.string().min(1).max(200)).min(1).max(64)]),
 });
 
+/**
+ * One question's answer.
+ *
+ * Discriminated rather than a `string | string[]` union so "the user typed
+ * `pg,sqlite`" and "the user selected two choices" can never be confused, and
+ * so a free-text answer that happens to equal a choice value is still recorded
+ * as text.
+ */
+export const QuestionAnswerSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('text'), text: z.string().min(1).max(16_000) }),
+  z.strictObject({
+    type: z.literal('selection'),
+    /** Choice `value`s, in the order the host collected them. */
+    values: z.array(z.string().min(1).max(200)).min(1).max(64),
+  }),
+]);
+
+/**
+ * The answers to a whole batch, filed under the keys the request handed out.
+ *
+ * A record, not an array of pairs: a duplicate key is then unrepresentable
+ * rather than merely invalid. Completeness is checked against the request by
+ * `checkResponseAgainstRequest`, which is what makes settlement all-or-nothing.
+ */
+export const QuestionSetResponseSchema = z.strictObject({
+  kind: z.literal('question_set'),
+  answers: z.record(QuestionKeySchema, QuestionAnswerSchema),
+});
+
 export const ApprovalResponseSchema = z.strictObject({
   kind: z.literal('approval'),
   decision: z.enum(['approved', 'denied']),
@@ -90,9 +201,15 @@ export const ApprovalResponseSchema = z.strictObject({
   reason: z.string().max(2000).optional(),
 });
 
-export const InteractionResponseSchema = z.discriminatedUnion('kind', [QuestionResponseSchema, ApprovalResponseSchema]);
+export const InteractionResponseSchema = z.discriminatedUnion('kind', [
+  QuestionResponseSchema,
+  QuestionSetResponseSchema,
+  ApprovalResponseSchema,
+]);
 
 export type QuestionResponse = z.infer<typeof QuestionResponseSchema>;
+export type QuestionAnswer = z.infer<typeof QuestionAnswerSchema>;
+export type QuestionSetResponse = z.infer<typeof QuestionSetResponseSchema>;
 export type ApprovalResponse = z.infer<typeof ApprovalResponseSchema>;
 export type InteractionResponse = z.infer<typeof InteractionResponseSchema>;
 
@@ -198,6 +315,28 @@ export const AgentInteractionSchema = z
       {
         if: {
           properties: {
+            request: { type: 'object', properties: { kind: { const: 'question_set' } }, required: ['kind'] },
+          },
+          required: ['request'],
+        },
+        then: {
+          properties: {
+            settlement: {
+              type: 'object',
+              properties: {
+                response: {
+                  type: 'object',
+                  properties: { kind: { const: 'question_set' } },
+                  required: ['kind'],
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        if: {
+          properties: {
             request: { type: 'object', properties: { kind: { const: 'approval' } }, required: ['kind'] },
           },
           required: ['request'],
@@ -221,6 +360,60 @@ export const AgentInteractionSchema = z
   });
 
 export type AgentInteraction = z.infer<typeof AgentInteractionSchema>;
+
+/**
+ * Check a whole batch answer against the batch that was asked.
+ *
+ * All-or-nothing by construction: the key sets must match exactly before any
+ * individual answer is looked at, so an adapter never sees a batch it would
+ * have to answer partially. Messages name the offending `key` — an
+ * adapter-assigned token — and never the prompt or the answer text, both of
+ * which are untrusted and may be sensitive.
+ */
+function checkQuestionSetAnswers(request: QuestionSetRequest, response: QuestionSetResponse): string | undefined {
+  const asked = new Map(request.questions.map((question) => [question.key, question]));
+
+  const unanswered = request.questions.filter((question) => response.answers[question.key] === undefined);
+  if (unanswered.length > 0) {
+    return `unanswered question(s): ${unanswered.map((question) => question.key).join(', ')}`;
+  }
+  const extra = Object.keys(response.answers).filter((key) => !asked.has(key));
+  if (extra.length > 0) {
+    return `answer(s) for question(s) that ${extra.length === 1 ? 'was' : 'were'} not asked: ${extra.join(', ')}`;
+  }
+
+  for (const question of request.questions) {
+    const answer = response.answers[question.key];
+    // The completeness check above already established this, so reaching it is
+    // a defect rather than a caller error — but the contract says every
+    // question is answered, so it is stated rather than assumed.
+    if (answer === undefined) return `unanswered question(s): ${question.key}`;
+
+    if (answer.type === 'text') {
+      if (question.choices !== undefined && !question.allowFreeText) {
+        return `question \`${question.key}\` does not accept free text`;
+      }
+      continue;
+    }
+
+    if (question.choices === undefined) {
+      return `question \`${question.key}\` offers no choices to select`;
+    }
+    if (!question.multiSelect && answer.values.length > 1) {
+      return `question \`${question.key}\` does not accept multiple selections`;
+    }
+    if (new Set(answer.values).size !== answer.values.length) {
+      return `question \`${question.key}\` has a repeated selection`;
+    }
+    const permitted = new Set(question.choices.map((choice) => choice.value));
+    const unknown = answer.values.filter((value) => !permitted.has(value));
+    if (unknown.length > 0) {
+      return `question \`${question.key}\` has unknown choice value(s): ${unknown.join(', ')}`;
+    }
+  }
+
+  return undefined;
+}
 
 /**
  * Validate a response against the request it claims to answer.
@@ -255,6 +448,10 @@ export function checkResponseAgainstRequest(
       return `unknown choice value(s): ${unknown.join(', ')}`;
     }
     return undefined;
+  }
+
+  if (request.kind === 'question_set' && response.kind === 'question_set') {
+    return checkQuestionSetAnswers(request, response);
   }
 
   if (request.kind === 'approval' && response.kind === 'approval') {
