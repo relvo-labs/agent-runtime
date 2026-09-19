@@ -138,7 +138,18 @@ allow-on-timeout and no allow-on-error path:
   different answer to a settled reference is `interaction_already_settled`;
 - when the run ends for any reason (its own result, interrupt, stream EOF, stream failure,
   session disposal) every outstanding prompt it raised is denied and its references are
-  forgotten, so nothing dangles and a late answer cannot resurrect it.
+  forgotten, so nothing dangles and a late answer cannot resurrect it;
+- when the SDK withdraws a prompt — it aborts that request's own signal, and then keeps
+  waiting on the answer — the prompt is denied once, its cancellation listener is detached
+  and its reference is retired, so a host cannot answer into a request nothing is listening
+  for. A prompt that is already withdrawn when it arrives raises no interaction at all;
+- a prompt that arrives once disposal has begun, including the retry window after a
+  rejected teardown, raises no interaction and is denied.
+
+References are namespaced per session with an adapter-generated nonce, so one session's
+reference is not a valid token in another even when both hold their first pending approval.
+Unattributable prompts are announced once per session, not once per prompt: the producer is
+a separate process and must not be able to grow a durable event log by asking repeatedly.
 
 This is in-process settlement, not crash-safe exactly-once.
 
@@ -193,9 +204,11 @@ callers, and stays retryable to success if teardown rejects.
   uuid, the query handle and the child process stay inside the adapter. Tool arguments and
   results are never summarised into event detail, because they routinely contain workspace
   contents.
-- **Upstream error prose.** `AgentError.message`, `providerCode` and diagnostics carry
-  allowlisted classifications only — never SDK error text, which can contain credentials,
-  native ids, paths or the prompt. An assistant frame the SDK flagged with `error` is
+- **Upstream error prose, or caller text.** `AgentError.message`, `providerCode` and
+  diagnostics carry allowlisted classifications only — never SDK error text, which can
+  contain credentials, native ids, paths or the prompt, and never a caller-controlled value
+  such as an interaction reference or a rejected response's `kind`/`mode`: a rejection
+  states what this adapter supports, not what it was handed. An assistant frame the SDK flagged with `error` is
   reported as its classification alone: the blocks that came with it are the error body
   rather than model output, so they are not published as message deltas either. A host that
   wants the raw text wraps `query` in its own binding, where it sees every SDK message and
@@ -219,5 +232,11 @@ const provider = createClaudeProvider({
 ```
 
 The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.259** (`CLAUDE_AGENT_SDK_VERSION`).
+`ClaudeQueryOptions` is what an injected `query` **receives**, so note that its
+`permissionPrompts` is now `'host' | 'none'` rather than the literal `'none'`, and it may
+carry an optional `canUseTool`. An implementation that annotated its own parameter with the
+narrower literal has to widen it; one that infers the type, as the snippet above does,
+needs no change.
+
 See [`docs/provider-development.md`](../../docs/provider-development.md) for the SPI rules
 this adapter follows.

@@ -48,6 +48,7 @@ import type {
   ClaudeQuery,
   ClaudeQueryHandle,
   ClaudeQueryOptions,
+  ClaudeToolPermissionRequest,
 } from './seam.ts';
 
 export const CLAUDE_PROVIDER_ID = 'claude';
@@ -278,6 +279,7 @@ function createSessionFor(
    */
   let sawCorrelationStamp = false;
   let announcedUnattributedTurn = false;
+  let announcedUnattributablePermission = false;
   /**
    * The host's declaration that this producer cannot stamp at all — an older
    * CLI, where demanding a stamp that can never arrive would hang every run.
@@ -350,6 +352,26 @@ function createSessionFor(
     finalize(run, classified(run, observed));
   }
 
+  /**
+   * Announce unattributable permission traffic once per session.
+   *
+   * The producer is a separate process that can ask as often as it likes, so an
+   * announcement per denied prompt would let it grow a durable event log
+   * through a path the host never asked for. Same bound, same reason, as the
+   * frame-level announcement above.
+   */
+  function noteUnattributablePermission(): void {
+    if (announcedUnattributablePermission) return;
+    announcedUnattributablePermission = true;
+    init.sink.emit({
+      payload: {
+        type: 'diagnostic',
+        level: 'debug',
+        message: 'claude asked for tool permission outside an attributable run; it was denied',
+      },
+    });
+  }
+
   function noteUnattributedTurn(): void {
     if (announcedUnattributedTurn) return;
     announcedUnattributedTurn = true;
@@ -408,6 +430,10 @@ function createSessionFor(
    * then apply the answer to another's.
    */
   function approvalOwner(): ActiveRun | undefined {
+    // Disposal fences admission for prompts as it does for runs, and stays
+    // fenced through the retry window after a rejected teardown: the query is
+    // already aborted, so a prompt raised here could only ever be denied.
+    if (disposing || disposed) return undefined;
     const run = active;
     if (run === undefined || run.terminated || run.concluded) return undefined;
     // A run being stopped may not raise a new interaction: the runtime records
@@ -427,23 +453,23 @@ function createSessionFor(
    * never resolves `null`: the SDK reads `null` as "already answered out of
    * band" and would leave the tool blocked with no answer coming.
    */
-  function askForApproval(toolName: string, _input: Record<string, unknown>): Promise<ClaudePermissionResult> {
+  function askForApproval(
+    toolName: string,
+    _input: Record<string, unknown>,
+    request: ClaudeToolPermissionRequest | undefined,
+  ): Promise<ClaudePermissionResult> {
     const registry = approvals;
     const run = registry === undefined ? undefined : approvalOwner();
     if (registry === undefined || run === undefined) {
-      init.sink.emit({
-        payload: {
-          type: 'diagnostic',
-          level: 'debug',
-          message: 'claude asked for tool permission outside an attributable run; it was denied',
-        },
-      });
+      noteUnattributablePermission();
       return Promise.resolve({
         behavior: 'deny',
         message: 'this session has no run that can be asked to approve tool use',
       });
     }
-    return registry.request(run, run.request.sink, toolName);
+    // The SDK's per-request signal travels with the prompt: aborting it is how
+    // the CLI withdraws one, and the registry answers and retires it there.
+    return registry.request(run, run.request.sink, toolName, request?.signal);
   }
 
   function pump(): void {

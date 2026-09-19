@@ -110,6 +110,31 @@ no-active-run callbacks. RED command and intended failures recorded in
 - **In-process only.** Exactly-once here is process-local settlement, not crash-safe
   exactly-once. Stated in the README and the changeset.
 
+## Repair after semantic review (`report-a70eb0e`)
+
+One consolidated bounded repair, same slice, no new scope:
+
+1. **Reference namespace (P2-1).** `providerRef` is `approval-<randomUUID nonce>-<n>`; the
+   nonce is per registry, i.e. per session. The cross-session test now has both sessions
+   holding a _simultaneous_ pending approval and asserts the foreign reference is
+   `unknown_interaction`, that the other session's callback is still pending, and that each
+   then settles correctly on its own session.
+2. **SDK cancellation (P2-2).** The seam's per-request `signal` is passed to the registry.
+   An abort denies once, detaches the listener and retires the reference; a prompt already
+   aborted on arrival raises no interaction; the listener is also detached on ordinary
+   settlement and on teardown, so nothing leaks either way.
+3. **Disposal fence (P2-3).** `approvalOwner()` refuses while `disposing || disposed`,
+   including the retry window after a rejected teardown.
+4. **Bounded diagnostic (P2-4).** The unattributable-permission diagnostic is announced
+   once per session, matching `noteUnattributedTurn`.
+5. **Public-contract note (P2-5).** The changeset and README state the
+   `ClaudeQueryOptions.permissionPrompts` union widening and the new optional `canUseTool`.
+   Classification is unchanged: additive, pre-1.0 minor.
+6. **No caller text in errors (P2-6).** `details.requested` is gone from both
+   `capability_unsupported` rejections; a hostile-cast test asserts no echo.
+7. **Faithful recording (P2-7).** `RecordedPermissionResult` carries optional
+   `decisionClassification` on both branches; the adapter still does not return it.
+
 ## Rollback
 
 Revert the single feature commit, or ship it and leave `approvals` unset — the default

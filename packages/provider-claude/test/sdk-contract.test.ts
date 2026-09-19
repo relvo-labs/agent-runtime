@@ -63,19 +63,31 @@ type RecordedUserMessage = {
   session_id?: string;
 };
 
-/** `PermissionResult` — what the host callback may answer with. */
+/** `PermissionDecisionClassification` — how a decision was arrived at. */
+type RecordedDecisionClassification = 'user_temporary' | 'user_permanent' | 'user_reject';
+
+/**
+ * `PermissionResult` — what the host callback may answer with.
+ *
+ * `decisionClassification` is recorded on both branches because 0.3.259
+ * declares it on both. This adapter does not return it: the classification it
+ * could honestly report is already implied by a `once` grant or a denial, and
+ * emitting one would state a durability this bridge does not implement.
+ */
 type RecordedPermissionResult =
   | {
       behavior: 'allow';
       updatedInput?: Record<string, unknown>;
       updatedPermissions?: unknown[];
       toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
     }
   | {
       behavior: 'deny';
       message: string;
       interrupt?: boolean;
       toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
     };
 
 /**

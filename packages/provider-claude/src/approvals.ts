@@ -24,10 +24,16 @@
  *     approval subject carries a sanitized tool name and nothing else: tool
  *     input routinely holds paths, argv, URLs and workspace contents, and an
  *     event is durable.
- *  4. **No dangling callback.** Every entry belongs to a run. When that run
- *     ends, for any reason, its outstanding callbacks are denied and its
- *     references are forgotten, so a late answer cannot settle anything.
+ *  4. **No dangling callback, in either direction.** Every entry belongs to a
+ *     run: when that run ends, for any reason, its outstanding callbacks are
+ *     denied and its references forgotten, so a late answer cannot settle
+ *     anything. And when the SDK withdraws a prompt by aborting that request's
+ *     signal — it keeps awaiting the answer regardless — the entry is denied
+ *     once, its listener detached and its reference retired, so a host cannot
+ *     answer into a request nothing is listening for.
  */
+
+import { randomUUID } from 'node:crypto';
 
 import { agentError, type InteractionResponse, type JsonObject } from '@relvo-labs/agent-protocol';
 import { ProviderRejection, type ProviderEventSink } from '@relvo-labs/agent-provider';
@@ -39,7 +45,11 @@ import { sanitizeToolName } from './translate.ts';
 const DEFAULT_DENIAL = 'the host denied this tool use';
 /** Shown to the model when the run itself went away with the prompt open. */
 const TEARDOWN_DENIAL = 'the run that asked for this approval ended before it was answered';
+/** Shown when the SDK withdrew the request before anyone answered it. */
+const CANCELLED_DENIAL = 'claude withdrew this permission request before it was answered';
 const MAX_DENIAL_CHARS = 2000;
+/** Marks an entry retired without an answer; never equal to an applied key. */
+const RETIRED = 'retired';
 
 /**
  * Coarse category for a host to render with. Advisory only: it is derived from
@@ -72,6 +82,8 @@ type Entry = {
    * conflict, and neither reaches the callback a second time.
    */
   applied: string | undefined;
+  /** Detaches this entry's cancellation listener. Runs exactly once. */
+  release: (() => void) | undefined;
 };
 
 export type ApprovalRegistry = {
@@ -80,8 +92,18 @@ export type ApprovalRegistry = {
    * promise is what the SDK is waiting on, so it always resolves — never
    * rejects, and never with `null`, which the SDK reads as "answered out of
    * band" and would leave the tool blocked forever.
+   *
+   * `signal` is the SDK's own per-request signal. Aborting it is how the CLI
+   * withdraws a prompt, and the SDK keeps awaiting this promise afterwards, so
+   * an abort denies and retires the reference rather than leaving a host
+   * holding a prompt nothing is listening to.
    */
-  request(owner: object, sink: ProviderEventSink, toolName: string): Promise<ClaudePermissionResult>;
+  request(
+    owner: object,
+    sink: ProviderEventSink,
+    toolName: string,
+    signal: AbortSignal | undefined,
+  ): Promise<ClaudePermissionResult>;
   /** Apply one settled neutral response. Throws `ProviderRejection` if it cannot. */
   settle(providerRef: string, response: InteractionResponse): void;
   /** Deny and forget everything `owner` raised. Safe to call more than once. */
@@ -102,32 +124,68 @@ function appliedKey(response: Extract<InteractionResponse, { kind: 'approval' }>
 
 export function createApprovalRegistry(): ApprovalRegistry {
   const entries = new Map<string, Entry>();
+  /**
+   * This registry's own reference namespace.
+   *
+   * One registry exists per session, and a reference is a token a caller hands
+   * back through `respondToInteraction`. A per-registry counter alone would
+   * name every session's first prompt identically, so a caller driving the SPI
+   * directly could settle another session's prompt by guessing `approval-1`.
+   * The nonce is adapter-generated and carries nothing about the SDK, the
+   * workspace or the host.
+   */
+  const namespace = randomUUID();
   let issued = 0;
 
-  function drop(entry: Entry, providerRef: string): void {
+  /** Retire an entry unanswered: deny once, detach, and forget the reference. */
+  function retire(providerRef: string, entry: Entry, message: string): void {
     entries.delete(providerRef);
-    if (entry.applied === undefined) entry.settle({ behavior: 'deny', message: TEARDOWN_DENIAL });
+    entry.release?.();
+    entry.release = undefined;
+    if (entry.applied !== undefined) return;
+    entry.applied = RETIRED;
+    entry.settle({ behavior: 'deny', message });
   }
 
   function clear(owner: object | undefined): void {
     for (const [providerRef, entry] of [...entries]) {
       if (owner !== undefined && entry.owner !== owner) continue;
-      drop(entry, providerRef);
+      retire(providerRef, entry, TEARDOWN_DENIAL);
     }
   }
 
   return {
-    request(owner: object, sink: ProviderEventSink, toolName: string): Promise<ClaudePermissionResult> {
+    request(
+      owner: object,
+      sink: ProviderEventSink,
+      toolName: string,
+      signal: AbortSignal | undefined,
+    ): Promise<ClaudePermissionResult> {
+      // Already withdrawn: answer it and raise nothing. Emitting here would ask
+      // a host to decide something the SDK has stopped listening for.
+      if (signal?.aborted === true) {
+        return Promise.resolve({ behavior: 'deny', message: CANCELLED_DENIAL });
+      }
       issued += 1;
       // The adapter's own reference. A native `toolUseID` here would put
       // provider identity on a public event and let a caller address the SDK's
       // internals by name.
-      const providerRef = `approval-${String(issued)}`;
+      const providerRef = `approval-${namespace}-${String(issued)}`;
       const name = sanitizeToolName(toolName);
       const category = TOOL_CATEGORIES.get(toolName) ?? 'tool';
 
       return new Promise<ClaudePermissionResult>((resolve) => {
-        entries.set(providerRef, { owner, settle: resolve, applied: undefined });
+        const entry: Entry = { owner, settle: resolve, applied: undefined, release: undefined };
+        entries.set(providerRef, entry);
+        if (signal !== undefined) {
+          const onAbort = (): void => {
+            retire(providerRef, entry, CANCELLED_DENIAL);
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          entry.release = () => {
+            signal.removeEventListener('abort', onAbort);
+          };
+        }
         sink.emit({
           payload: {
             type: 'interaction.requested',
@@ -159,10 +217,14 @@ export function createApprovalRegistry(): ApprovalRegistry {
         throw rejection('unknown_interaction', 'the claude adapter has no approval outstanding for that reference');
       }
       if (response.kind !== 'approval') {
+        // `kind` and `mode` are caller-controlled exactly as `providerRef` is —
+        // the runtime validates them against the schema, but a host driving the
+        // SPI directly does not. Only what this adapter supports is stated; the
+        // rejected value is classified by the message, never copied.
         throw rejection(
           'capability_unsupported',
           'the claude adapter bridges approval interactions only; it raises no question',
-          { capability: 'interaction.kind', supported: ['approval'], requested: response.kind },
+          { capability: 'interaction.kind', supported: ['approval'] },
         );
       }
       if (response.decision === 'approved') {
@@ -173,7 +235,7 @@ export function createApprovalRegistry(): ApprovalRegistry {
           throw rejection(
             'capability_unsupported',
             'the claude adapter grants approval for the one request that asked',
-            { capability: 'interaction.approval.modes', supported: ['once'], requested: response.mode },
+            { capability: 'interaction.approval.modes', supported: ['once'] },
           );
         }
       }
@@ -187,6 +249,10 @@ export function createApprovalRegistry(): ApprovalRegistry {
         throw rejection('interaction_already_settled', 'this claude approval is already settled');
       }
       entry.applied = key;
+      // Answered: nothing is left to cancel, so the cancellation listener goes
+      // with it. The entry itself stays so an identical redelivery is a no-op.
+      entry.release?.();
+      entry.release = undefined;
       entry.settle(
         response.decision === 'approved'
           ? { behavior: 'allow' }

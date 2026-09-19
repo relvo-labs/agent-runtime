@@ -19,6 +19,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ProviderEventInputSchema,
   type AgentError,
+  type InteractionResponse,
   type JsonObject,
   type ProviderEventInput,
   type ProviderEventPayload,
@@ -65,6 +66,19 @@ function soleRequest(events: readonly ProviderEventInput[]): ApprovalRequested {
   const request = requests[0];
   if (request === undefined) throw new Error('no interaction was requested');
   return request;
+}
+
+/**
+ * Observe whether a promise has settled without waiting on it, so "still
+ * pending" is asserted at a defined quiescent point rather than by a timer.
+ */
+function pendingMarker(promise: Promise<unknown>): { settled: boolean } {
+  const state = { settled: false };
+  const mark = (): void => {
+    state.settled = true;
+  };
+  void promise.then(mark, mark);
+  return state;
 }
 
 async function rejectionOf(promise: Promise<unknown>): Promise<AgentError> {
@@ -243,7 +257,7 @@ describe('claude approval settlement failures', () => {
         bridged.session.respondToInteraction(providerRef, { kind: 'approval', decision: 'approved', mode }),
       );
       expect(error.code).toBe('capability_unsupported');
-      expect(error.details).toMatchObject({ supported: ['once'], requested: mode });
+      expect(error.details).toEqual({ capability: 'interaction.approval.modes', supported: ['once'] });
     }
 
     // Still pending: a refused response must not consume the one settlement.
@@ -290,20 +304,60 @@ describe('claude approval settlement failures', () => {
     expect(JSON.stringify(error)).not.toContain('s3nsitive');
   });
 
-  it('rejects a reference raised by another session', async () => {
-    const first = createFakeQuery();
-    const second = createFakeQuery();
-    const bridged = await boundRun(first);
-    const other = await boundRun(second);
-    const { decision, providerRef } = await ask(first, bridged);
+  it('keeps two sessions holding simultaneous approvals isolated from each other', async () => {
+    // Both sessions are at the same point in their own lives — each holding its
+    // first pending approval — so a reference namespace shared by construction
+    // would let one session's answer settle the other's tool call. The property
+    // has to hold in the adapter, not only in the runtime's per-session routing.
+    const firstFake = createFakeQuery();
+    const secondFake = createFakeQuery();
+    const first = await boundRun(firstFake);
+    const second = await boundRun(secondFake);
+    const a = await ask(firstFake, first, 'Bash');
+    const b = await ask(secondFake, second, 'Write');
+    expect(a.providerRef).not.toBe(b.providerRef);
 
-    const error = await rejectionOf(other.session.respondToInteraction(providerRef, APPROVED_ONCE));
+    const pendingB = pendingMarker(b.decision);
+    const error = await rejectionOf(second.session.respondToInteraction(a.providerRef, APPROVED_ONCE));
     expect(error.code).toBe('unknown_interaction');
+    expect(JSON.stringify(error)).not.toContain(a.providerRef);
+    await flush();
+    // The second session's own callback must still be waiting for its answer.
+    expect(pendingB.settled).toBe(false);
 
-    // The approval it names is untouched, and still settles on its own session.
+    // And each still settles correctly on the session that raised it.
+    await first.session.respondToInteraction(a.providerRef, APPROVED_ONCE);
+    await expect(a.decision).resolves.toEqual({ behavior: 'allow' });
+    await second.session.respondToInteraction(b.providerRef, { kind: 'approval', decision: 'denied' });
+    await expect(b.decision).resolves.toEqual({ behavior: 'deny', message: 'the host denied this tool use' });
+
+    await first.session.dispose();
+    await second.session.dispose();
+  });
+
+  it('does not echo a caller-controlled kind or mode into a durable error', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const { decision, providerRef } = await ask(fake, bridged);
+
+    // A host driving the SPI directly is not bound by the runtime's schema, so
+    // these fields are caller text exactly as `providerRef` is.
+    const hostile = [
+      { kind: 'question', answer: 'sure' } as unknown as InteractionResponse,
+      { kind: 'w1ldkind', answer: 'sure' } as unknown as InteractionResponse,
+      { kind: 'approval', decision: 'approved', mode: 'm0de-with-secrets' } as unknown as InteractionResponse,
+    ];
+    for (const response of hostile) {
+      const error = await rejectionOf(bridged.session.respondToInteraction(providerRef, response));
+      expect(error.code).toBe('capability_unsupported');
+      const serialized = JSON.stringify(error);
+      expect(serialized).not.toContain('w1ldkind');
+      expect(serialized).not.toContain('m0de-with-secrets');
+    }
+
+    // None of them consumed the settlement.
     await bridged.session.respondToInteraction(providerRef, APPROVED_ONCE);
     await expect(decision).resolves.toEqual({ behavior: 'allow' });
-    await other.session.dispose();
   });
 
   it('treats an identical redelivery as a no-op and refuses a conflicting one', async () => {
@@ -336,6 +390,23 @@ describe('claude approval attribution', () => {
       level: 'debug',
       message: 'claude asked for tool permission outside an attributable run; it was denied',
     });
+    await session.dispose();
+  });
+
+  it('announces unattributable permission traffic once, however much of it arrives', async () => {
+    // The producer is an external process: a loop of prompts this session
+    // cannot attribute must not be able to grow a durable event log.
+    const fake = createFakeQuery();
+    const { session, sessionEvents } = await openBridged(fake);
+
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await expect(fake.requestPermission('Bash')).resolves.toMatchObject({ behavior: 'deny' });
+    }
+    expect(
+      sessionEvents.filter(
+        (event) => event.payload.type === 'diagnostic' && event.payload.message.includes('outside an attributable run'),
+      ),
+    ).toHaveLength(1);
     await session.dispose();
   });
 
@@ -481,6 +552,85 @@ describe('claude approval lifecycle', () => {
 
     const error = await rejectionOf(bridged.session.respondToInteraction(providerRef, APPROVED_ONCE));
     expect(error.code).toBe('unknown_interaction');
+  });
+
+  it('settles a prompt the SDK itself cancelled, and refuses the reference afterwards', async () => {
+    // The pinned SDK cancels an outstanding permission control request by
+    // aborting that request's own signal; it keeps awaiting this promise, so a
+    // bridge that ignores the signal leaves the host holding a prompt nobody is
+    // listening to any more.
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const { decision, providerRef } = await ask(fake, bridged);
+    const pending = pendingMarker(decision);
+    await flush();
+    expect(pending.settled).toBe(false);
+
+    fake.cancelPermission();
+    await expect(decision).resolves.toEqual({
+      behavior: 'deny',
+      message: 'claude withdrew this permission request before it was answered',
+    });
+
+    // The reference is retired: a late answer settles nothing, and no
+    // auto-allow appears on the cancellation path.
+    const error = await rejectionOf(bridged.session.respondToInteraction(providerRef, APPROVED_ONCE));
+    expect(error.code).toBe('unknown_interaction');
+
+    // The run is untouched and still finishes on its own terms.
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
+    await expect(bridged.run.completion).resolves.toEqual({ outcome: 'succeeded' });
+  });
+
+  it('denies a prompt that is already cancelled when it arrives', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+
+    await expect(fake.requestPermission('Bash', {}, { aborted: true })).resolves.toMatchObject({ behavior: 'deny' });
+    // Nothing was raised for a request that was already withdrawn.
+    expect(requestsIn(bridged.events)).toHaveLength(0);
+  });
+
+  it('settles a cancelled prompt exactly once, whatever order teardown arrives in', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const { decision, providerRef } = await ask(fake, bridged);
+
+    fake.cancelPermission();
+    fake.cancelPermission();
+    await expect(decision).resolves.toMatchObject({ behavior: 'deny' });
+    // Run teardown must not try to settle the same callback a second time.
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
+    await expect(bridged.run.completion).resolves.toEqual({ outcome: 'succeeded' });
+    const error = await rejectionOf(bridged.session.respondToInteraction(providerRef, APPROVED_ONCE));
+    expect(error.code).toBe('unknown_interaction');
+  });
+
+  it('raises no approval while the session is disposing', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    const release = fake.holdNextReturn();
+    const disposal = bridged.session.dispose();
+    await flush();
+
+    await expect(fake.requestPermission('Bash')).resolves.toMatchObject({ behavior: 'deny' });
+    expect(requestsIn(bridged.events)).toHaveLength(0);
+
+    release();
+    await disposal;
+  });
+
+  it('raises no approval in the retry window after a rejected disposal', async () => {
+    const fake = createFakeQuery();
+    const bridged = await boundRun(fake);
+    fake.failNextReturn(new Error('teardown failed'));
+    await expect(bridged.session.dispose()).rejects.toThrow();
+
+    await expect(fake.requestPermission('Bash')).resolves.toMatchObject({ behavior: 'deny' });
+    expect(requestsIn(bridged.events)).toHaveLength(0);
+
+    // Disposal is still retryable to success, unchanged by the refusal above.
+    await expect(bridged.session.dispose()).resolves.toBeUndefined();
   });
 
   it('does not let a late approval resurrect a finished run', async () => {
