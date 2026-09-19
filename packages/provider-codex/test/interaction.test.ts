@@ -611,36 +611,191 @@ describe('teardown', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// A6 — the Runtime commit-failure retry, at the adapter seam
-// ---------------------------------------------------------------------------
-
-describe('settlement retry', () => {
-  it('does not execute the native callback twice when an exact retry follows a commit failure', async () => {
+// R1 regressions: pinned schema validation, retirement and interrupt windows.
+describe('R1 approval boundaries', () => {
+  it.each([
+    ['null kind', { kind: null }],
+    ['missing itemId', { itemId: undefined }],
+    ['non-string itemId', { itemId: 7 }],
+    ['missing timestamp', { startedAtMs: undefined }],
+    ['fractional timestamp', { startedAtMs: 0.5 }],
+    ['non-finite timestamp', { startedAtMs: Infinity }],
+    ['unsafe timestamp', { startedAtMs: Number.MAX_SAFE_INTEGER + 1 }],
+    ['object cwd', { cwd: { path: '/private' } }],
+    ['object reason', { reason: { text: 'private' } }],
+    ['malformed callback identity', { approvalId: {} }],
+    ['remote environment', { environmentId: 'remote-production' }],
+    ['malformed environment', { environmentId: {} }],
+    ['object network amendments', { proposedNetworkPolicyAmendments: {} }],
+    ['non-array actions', { commandActions: {} }],
+    ['unknown action variant', { commandActions: [{ type: 'newAction', nativeId: 'private-native-id' }] }],
+    ['extra action metadata', { commandActions: [{ type: 'unknown', command: 'ls', nativeId: 'private-native-id' }] }],
+    ['read missing path', { commandActions: [{ type: 'read', command: 'cat x', name: 'x' }] }],
+    ['listFiles invalid path', { commandActions: [{ type: 'listFiles', command: 'ls', path: {} }] }],
+    ['search invalid query', { commandActions: [{ type: 'search', command: 'rg x', query: [] }] }],
+    ['action missing command', { commandActions: [{ type: 'unknown' }] }],
+    ['unknown execution context', { futureContext: { environmentId: 'private-native-id' } }],
+  ])('rejects %s before publishing or retaining an approval', async (_label, overrides) => {
     const opened = await running();
-    const providerRef = await raise(opened);
-    const response = { kind: 'approval' as const, decision: 'approved' as const, mode: 'once' as const };
-
-    // 1. The Runtime delivers the response; the provider effect succeeds.
-    await opened.session.respondToInteraction(providerRef, response);
+    opened.fake.push(approvalFrame(overrides));
     await flush();
-    expect(repliesTo(opened.fake, APPROVAL_ID)).toEqual([{ id: APPROVAL_ID, result: { decision: 'accept' } }]);
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(0);
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toMatchObject([{ error: { code: -32602 } }]);
+    expect(JSON.stringify(opened.runSink.events)).not.toContain('private-native-id');
+    await opened.session.dispose();
+  });
 
-    // 2. The Runtime's own store commit then fails, and the host retries the
-    //    identical command. The retry must be a no-op at this seam.
-    await expect(opened.session.respondToInteraction(providerRef, response)).resolves.toBeUndefined();
-    await flush();
-    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
-
-    // 3. A *changed* answer to the same reference is a conflict, not a second
-    //    callback. This is process-local settlement, not crash-safe
-    //    exactly-once.
-    await expect(
-      opened.session.respondToInteraction(providerRef, { kind: 'approval', decision: 'denied' }),
-    ).rejects.toSatisfy(
-      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'interaction_already_settled',
+  it('reconstructs all four pinned command actions and keeps optional defaults', async () => {
+    const opened = await running();
+    const actions = [
+      { type: 'read', command: 'cat x', name: 'x', path: '/workspace/x' },
+      { type: 'listFiles', command: 'ls', path: null },
+      { type: 'search', command: 'rg x', query: 'x', path: '/workspace' },
+      { type: 'unknown', command: 'do-something' },
+      { type: 'listFiles', command: 'ls' },
+      { type: 'search', command: 'rg' },
+    ];
+    await raise(
+      opened,
+      approvalFrame({
+        kind: undefined,
+        environmentId: undefined,
+        approvalId: 'private-native-id',
+        commandActions: actions,
+      }),
     );
+    expect(soleInteraction(opened.runSink).request).toMatchObject({ subject: { detail: { commandActions: actions } } });
+    expect(JSON.stringify(opened.runSink.events)).not.toContain('private-native-id');
+    actions[0]!.command = 'changed after admission';
+    expect(JSON.stringify(opened.runSink.events)).not.toContain('changed after admission');
+    await opened.session.dispose();
+  });
+
+  it.each(['once', 'session', 'persistent'] as const)('keeps a %s mode-bearing denial answerable', async (mode) => {
+    const opened = await running();
+    const ref = await raise(opened);
+    await expect(
+      opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'denied', mode }),
+    ).rejects.toSatisfy((error: unknown) => isProviderRejection(error) && error.agentError.code === 'invalid_request');
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(0);
+    await opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'denied' });
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toEqual([{ id: APPROVAL_ID, result: { decision: 'decline' } }]);
+    await opened.session.dispose();
+  });
+
+  it.each([
+    { kind: 'approval', decision: 'unexpected' },
+    { kind: 'approval', decision: 'denied', reason: 123 },
+    { kind: 'approval', decision: 'denied', extra: 'private' },
+  ])('validates the complete neutral response before consumption: %j', async (response) => {
+    const opened = await running();
+    const ref = await raise(opened);
+    await expect(opened.session.respondToInteraction(ref, response as never)).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'invalid_request',
+    );
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(0);
+    await opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'approved', mode: 'once' });
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
+    await opened.session.dispose();
+  });
+
+  it('retires approvals before awaiting interrupt acknowledgement or completion', async () => {
+    const opened = await running();
+    const ref = await raise(opened);
+    opened.fake.setResponder('turn/interrupt', () => undefined);
+    const interrupt = opened.run.interrupt('stop');
+    // No await between initiation and the observation of the native decline.
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toEqual([{ id: APPROVAL_ID, result: { decision: 'decline' } }]);
+    await expect(
+      opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'approved', mode: 'once' }),
+    ).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'unknown_interaction',
+    );
+    opened.fake.respond('turn/interrupt', {});
+    await interrupt;
+    await expect(
+      opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'approved', mode: 'once' }),
+    ).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'unknown_interaction',
+    );
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
+    opened.fake.push(turnCompleted('interrupted'));
+    await expect(opened.run.completion).resolves.toMatchObject({ outcome: 'interrupted' });
+    await opened.session.dispose();
+  });
+
+  it('retries a rejected interrupt without reopening approvals on the old run', async () => {
+    const opened = await running();
+    const ref = await raise(opened);
+    opened.fake.setResponder('turn/interrupt', () => undefined);
+    const first = opened.run.interrupt('stop');
+    const rejection = expect(first).rejects.toSatisfy((error: unknown) => isProviderRejection(error));
+    opened.fake.respondWithError('turn/interrupt', -32603);
+    await rejection;
+    await expect(
+      opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'approved', mode: 'once' }),
+    ).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'unknown_interaction',
+    );
+    opened.fake.push(approvalFrame({}, 502));
     await flush();
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(1);
+    expect(repliesTo(opened.fake, 502)).toMatchObject([{ error: { code: -32600 } }]);
+    const retry = opened.run.interrupt('stop');
+    expect(opened.fake.requests('turn/interrupt')).toHaveLength(2);
+    opened.fake.respond('turn/interrupt', {}, 1);
+    await retry;
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toEqual([{ id: APPROVAL_ID, result: { decision: 'decline' } }]);
+    opened.fake.push(turnCompleted('interrupted'));
+    await opened.run.completion;
+    await opened.session.dispose();
+  });
+
+  it('ignores identical and conflicting native replay before and after settlement, including later runs', async () => {
+    const opened = await running();
+    const ref = await raise(opened);
+    for (const overrides of [{}, { command: 'changed' }]) opened.fake.push(approvalFrame(overrides));
+    await flush();
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(1);
+    await opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'denied' });
+    for (const overrides of [{}, { command: 'changed' }]) opened.fake.push(approvalFrame(overrides));
+    await flush();
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(1);
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
+    opened.fake.push(turnCompleted('completed'));
+    await opened.run.completion;
+    const nextTurn = 'next-native-turn';
+    opened.fake.setResponder('turn/start', () => ({ turn: { id: nextTurn } }));
+    await startRun(opened);
+    opened.fake.push(approvalFrame());
+    opened.fake.push(approvalFrame({ turnId: nextTurn, command: 'changed' }));
+    opened.fake.push(approvalFrame({ turnId: nextTurn }, 502));
+    await flush();
+    expect(opened.runSink.ofType('interaction.requested')).toHaveLength(2);
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
+    await opened.session.dispose();
+  });
+});
+
+describe('R1 native retirement overflow with an outstanding approval', () => {
+  it('explicitly rejects pending callbacks, fences the session and retains retryable disposal', async () => {
+    const opened = await running();
+    const ref = await raise(opened);
+    for (let index = 0; index < 4096; index += 1) {
+      opened.fake.push({ id: `unsupported-${String(index)}`, method: 'unsupported', params: {} });
+    }
+    await flush();
+    expect(repliesTo(opened.fake, APPROVAL_ID)).toMatchObject([{ error: { code: -32600 } }]);
+    await expect(opened.run.completion).resolves.toMatchObject({ outcome: 'failed' });
+    await expect(
+      opened.session.respondToInteraction(ref, { kind: 'approval', decision: 'approved', mode: 'once' }),
+    ).rejects.toSatisfy(
+      (error: unknown) => isProviderRejection(error) && error.agentError.code === 'unknown_interaction',
+    );
+    await expect(startRun(opened)).rejects.toSatisfy((error: unknown) => isProviderRejection(error));
+    opened.fake.failNextClose(new Error('injected close failure'));
+    await expect(opened.session.dispose()).rejects.toSatisfy((error: unknown) => isProviderRejection(error));
+    await opened.session.dispose();
     expect(repliesTo(opened.fake, APPROVAL_ID)).toHaveLength(1);
   });
 });

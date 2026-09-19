@@ -429,3 +429,30 @@ describe('close', () => {
     expect(fake.closeCalls).toBe(1);
   });
 });
+
+describe('R1 bounded native request retirement', () => {
+  it('retains declined identities and fails the connection closed at 4096 unique requests', async () => {
+    const fake = createFakeTransport();
+    const { handlers, log } = recorder();
+    const client = createCodexClient(fake.transport, handlers);
+    for (let id = 0; id < 4096; id += 1) fake.push({ id, method: 'unsupported', params: {} });
+    await flush();
+    expect(log.serverRequests).toHaveLength(4096);
+    fake.push({ id: 0, method: 'conflicting', params: {} });
+    fake.push({ id: 4096, method: 'unsupported', params: {} });
+    await flush();
+    expect(log.serverRequests).toHaveLength(4096);
+    expect(log.drops).toContain('duplicate_server_request');
+    expect(client.ended).toBe(true);
+    expect(log.ends).toEqual([{ end: 'failed', cause: 'server_request_limit' }]);
+    const replies = fake.sent.filter((frame) => 'id' in frame && !('method' in frame));
+    expect(replies.filter((frame) => 'id' in frame && frame.id === 0)).toHaveLength(1);
+    expect(replies.at(-1)).toMatchObject({ id: 4096, error: { code: -32600 } });
+    fake.push({ id: 4096, method: 'unsupported', params: {} });
+    fake.push({ id: 4097, method: 'unsupported', params: {} });
+    await flush();
+    expect(fake.sent).toHaveLength(4097);
+    await expect(client.request('turn/start')).rejects.toSatisfy((error: unknown) => isProviderRejection(error));
+    await client.close();
+  });
+});

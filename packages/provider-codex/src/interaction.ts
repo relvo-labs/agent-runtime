@@ -41,11 +41,18 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 
-import { agentError, type InteractionResponse, type JsonObject, type JsonValue } from '@relvo-labs/agent-protocol';
+import {
+  agentError,
+  InteractionResponseSchema,
+  type InteractionResponse,
+  type JsonObject,
+  type JsonValue,
+} from '@relvo-labs/agent-protocol';
 import { ProviderRejection, type ProviderEventSink } from '@relvo-labs/agent-provider';
 
-import { INVALID_PARAMS, INVALID_REQUEST, asId, asRecord, asString } from './protocol.ts';
+import { INVALID_PARAMS, INVALID_REQUEST } from './protocol.ts';
 import { sameTurn, type TurnCorrelation } from './translate.ts';
 
 /** The one server-initiated method this adapter answers with a host decision. */
@@ -101,8 +108,8 @@ const TEARDOWN_DECISION = 'decline';
  */
 export type ApprovalRefusal =
   | 'malformed'
-  | 'uncorrelated'
   | 'kind_unsupported'
+  | 'environment_unsupported'
   | 'no_reviewable_command'
   | 'policy_amendment_proposed'
   | 'detail_too_large';
@@ -120,54 +127,97 @@ function refused(reason: ApprovalRefusal): ApprovalTranslation {
 }
 
 /**
- * `CommandExecutionRequestApprovalParams` → a neutral approval subject.
- *
- * Required by the pinned JSON Schema: `threadId`, `turnId`, `itemId`,
- * `startedAtMs`. Only the first two are read — the rest is correlation the
- * runtime never sees. `kind` is optional and documented to default to
- * `command` for older servers, so an absent value is read as `command` and
- * `writeStdin` is refused: input for an already-running terminal is not a
- * command this adapter can describe.
+ * Private native schema derived from the 0.153.4 stable generated
+ * CommandExecutionRequestApprovalParams.json and its CommandAction definitions.
+ * JSON Schema defaults make kind/environment optional (unlike generated TS).
+ * Close every object deliberately: unknown context must not silently disappear.
+ * Parsing reconstructs actions from declared fields; no raw native object is
+ * forwarded to a neutral event. The safe integer bound avoids rounded int64s.
  */
+const CommandActionSchema = z.discriminatedUnion('type', [
+  z.strictObject({ type: z.literal('read'), command: z.string(), name: z.string(), path: z.string() }),
+  z.strictObject({ type: z.literal('listFiles'), command: z.string(), path: z.string().nullish() }),
+  z.strictObject({
+    type: z.literal('search'),
+    command: z.string(),
+    query: z.string().nullish(),
+    path: z.string().nullish(),
+  }),
+  z.strictObject({ type: z.literal('unknown'), command: z.string() }),
+]);
+const CommandApprovalParamsSchema = z.strictObject({
+  kind: z.enum(['command', 'writeStdin']).default('command'),
+  threadId: z.string().min(1),
+  turnId: z.string().min(1),
+  itemId: z.string(),
+  startedAtMs: z.int(),
+  approvalId: z.string().nullish(),
+  environmentId: z.string().nullish(),
+  command: z.string().nullish(),
+  cwd: z.string().nullish(),
+  reason: z.string().nullish(),
+  commandActions: z.array(CommandActionSchema).nullish(),
+  proposedExecpolicyAmendment: z.array(z.string()).nullish(),
+  proposedNetworkPolicyAmendments: z
+    .array(
+      z.strictObject({
+        action: z.enum(['allow', 'deny']),
+        host: z.string(),
+      }),
+    )
+    .nullish(),
+  networkApprovalContext: z
+    .strictObject({
+      host: z.string(),
+      protocol: z.enum(['http', 'https', 'socks5Tcp', 'socks5Udp']),
+    })
+    .nullish(),
+});
+
+/** Reconstruct JSON-only display fields, omitting absent optional properties. */
+function commandActionDetail(action: z.infer<typeof CommandActionSchema>): JsonObject {
+  const base = { type: action.type, command: action.command };
+  switch (action.type) {
+    case 'read':
+      return { ...base, name: action.name, path: action.path };
+    case 'listFiles':
+      return { ...base, ...(action.path === undefined ? {} : { path: action.path }) };
+    case 'search':
+      return {
+        ...base,
+        ...(action.path === undefined ? {} : { path: action.path }),
+        ...(action.query === undefined ? {} : { query: action.query }),
+      };
+    case 'unknown':
+      return base;
+  }
+}
+
+/** Validate the complete native request before admitting any routing state. */
 export function translateCommandApproval(params: unknown): ApprovalTranslation {
-  const record = asRecord(params);
-  if (record === undefined) return refused('malformed');
+  const parsed = CommandApprovalParamsSchema.safeParse(params);
+  if (!parsed.success) return refused('malformed');
+  const record = parsed.data;
+  const { threadId, turnId } = record;
+  if (record.kind !== 'command') return refused('kind_unsupported');
+  if (record.environmentId != null) return refused('environment_unsupported');
 
-  const threadId = asId(record.threadId);
-  const turnId = asId(record.turnId);
-  if (threadId === undefined || turnId === undefined) return refused('uncorrelated');
-
-  const kind = record.kind === undefined || record.kind === null ? 'command' : asString(record.kind);
-  if (kind !== 'command') return refused('kind_unsupported');
-
-  // A decision the server can only express with an amendment payload is one
-  // this adapter must not answer with a plain accept/decline: doing so would
-  // discard the amendment the server is actually asking about.
-  if (record.proposedExecpolicyAmendment !== undefined && record.proposedExecpolicyAmendment !== null) {
-    return refused('policy_amendment_proposed');
-  }
-  const networkAmendments = record.proposedNetworkPolicyAmendments;
-  if (Array.isArray(networkAmendments) && networkAmendments.length > 0) {
-    return refused('policy_amendment_proposed');
-  }
-  if (record.networkApprovalContext !== undefined && record.networkApprovalContext !== null) {
+  // These contexts require a response the neutral approval cannot carry.
+  if (
+    record.proposedExecpolicyAmendment != null ||
+    (record.proposedNetworkPolicyAmendments?.length ?? 0) > 0 ||
+    record.networkApprovalContext != null
+  ) {
     return refused('policy_amendment_proposed');
   }
 
-  // `command` is optional on the wire, but an approval with nothing to review
-  // is a prompt no host can answer honestly.
-  const command = asString(record.command);
-  if (command === undefined || command === '') return refused('no_reviewable_command');
-
-  const cwd = asString(record.cwd);
-  const reason = asString(record.reason);
-  const actions = Array.isArray(record.commandActions) ? (record.commandActions as JsonValue[]) : undefined;
-
+  const { command, cwd, reason, commandActions } = record;
+  if (command == null || command === '') return refused('no_reviewable_command');
   const detail: JsonObject = {
     command,
-    ...(cwd === undefined ? {} : { cwd }),
-    ...(reason === undefined ? {} : { reason }),
-    ...(actions === undefined ? {} : { commandActions: actions }),
+    ...(cwd == null ? {} : { cwd }),
+    ...(reason == null ? {} : { reason }),
+    ...(commandActions == null ? {} : { commandActions: commandActions.map(commandActionDetail) }),
   };
   // Nothing here is truncated. Either the whole subject is publishable, or the
   // request is refused and the server is told so.
@@ -362,6 +412,11 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
         // classified, never echoed.
         throw rejection('unknown_interaction', 'the codex adapter has no approval outstanding for that reference');
       }
+      const parsed = InteractionResponseSchema.safeParse(response);
+      if (!parsed.success) {
+        throw rejection('invalid_request', 'the codex approval response is malformed');
+      }
+      response = parsed.data;
       if (response.kind !== 'approval') {
         throw rejection(
           'capability_unsupported',
@@ -379,6 +434,10 @@ export function createInteractionRegistry(sessionSink: ProviderEventSink): Codex
             supported: [...CODEX_APPROVAL_MODES],
           });
         }
+      }
+
+      if (response.decision === 'denied' && response.mode !== undefined) {
+        throw rejection('invalid_request', 'a denial must not carry an approval mode');
       }
 
       // Validation completes before settlement is consumed, so a response this

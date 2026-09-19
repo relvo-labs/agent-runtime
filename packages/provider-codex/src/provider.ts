@@ -163,6 +163,8 @@ type ActiveRun = {
   /** The turn's own terminal frame has arrived; the run takes no more output. */
   concluded: boolean;
   interruptRequested: boolean;
+  /** Permanent for this run, even if delivery of interrupt fails and is retried. */
+  approvalsFenced: boolean;
   interruptReason: string | undefined;
   interruptAttempt: Promise<void> | undefined;
   buffered: BufferedFrame[];
@@ -487,7 +489,7 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
    */
   function approvalOwner(): ApprovalOwner | undefined {
     const run = active;
-    if (run === undefined || run.terminated || run.concluded || run.interruptRequested) return undefined;
+    if (run === undefined || run.terminated || run.concluded || run.approvalsFenced) return undefined;
     if (run.correlation === undefined) return undefined;
     if (disposing || disposed || streamEnded || fencedReason !== undefined) return undefined;
     return { key: run, correlation: run.correlation, sink: run.request.sink };
@@ -582,6 +584,7 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       terminated: false,
       concluded: false,
       interruptRequested: false,
+      approvalsFenced: false,
       interruptReason: undefined,
       interruptAttempt: undefined,
       buffered: [],
@@ -665,6 +668,10 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
         if (run.interruptAttempt !== undefined) return run.interruptAttempt;
         if (run.interruptRequested) return Promise.resolve();
         run.interruptRequested = true;
+        run.approvalsFenced = true;
+        // Retire before awaiting delivery: acknowledgement is not completion,
+        // and a rejected interrupt must never reopen an old authorization.
+        interactions?.retire(run);
         run.interruptReason = reason === undefined ? undefined : reason.slice(0, MAX_REASON_CHARS);
         const attempt = deliverInterrupt();
         run.interruptAttempt = attempt;

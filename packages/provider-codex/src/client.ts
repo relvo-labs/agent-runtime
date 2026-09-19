@@ -29,13 +29,16 @@
 import { agentError, type JsonValue } from '@relvo-labs/agent-protocol';
 import { ProviderRejection } from '@relvo-labs/agent-provider';
 
-import { METHOD_NOT_SUPPORTED, classifyServerMessage, type JsonlDropReason } from './protocol.ts';
+import { INVALID_REQUEST, METHOD_NOT_SUPPORTED, classifyServerMessage, type JsonlDropReason } from './protocol.ts';
 import { classifyThrown } from './translate.ts';
 import type { CodexServerRequestOffer } from './interaction.ts';
 import type { CodexRequestId, CodexTransport, CodexTransportEnd, CodexWireError } from './seam.ts';
 
 /** Default per-request deadline. Turns are unbounded; RPC round-trips are not. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+
+/** Pending and retired native request ids retained for the connection lifetime. */
+const MAX_SERVER_REQUEST_IDS = 4096;
 
 /**
  * JSON-RPC codes the pinned app-server is known to emit.
@@ -178,13 +181,14 @@ export function createCodexClient(
   /** Ids this adapter chose, awaiting the server's reply. */
   const pending = new Map<CodexRequestId, Pending>();
   /**
-   * Ids the *server* chose, awaiting this adapter's reply.
+   * Ids the *server* chose, including requests already answered.
+   * Never evict an identity while the connection can still deliver its replay.
    *
    * Kept strictly apart from `pending`. The two id spaces are independent —
    * both sides number from 1 — so merging them would let a server request
    * resolve one of this adapter's own in-flight calls, or the reverse.
    */
-  const serverRequests = new Set<CodexRequestId>();
+  const serverRequests = new Map<CodexRequestId, { answered: boolean }>();
   // Monotonic and never reused, so a late reply to a retired request can never
   // be mistaken for the answer to a current one.
   let nextId = 1;
@@ -224,6 +228,7 @@ export function createCodexClient(
   }
 
   function handleFrame(value: unknown): void {
+    if (ended) return;
     const message = classifyServerMessage(value);
     if (message === undefined) {
       handlers.onDrop('unclassifiable');
@@ -236,28 +241,40 @@ export function createCodexClient(
         return;
 
       case 'request': {
-        // A second request reusing an id that is still outstanding cannot be
-        // answered: a reply frame naming that id would settle the *first*
-        // request. So it is recorded and ignored rather than answered or
-        // allowed to raise anything.
+        // Identical and conflicting reuse of a native id are both duplicates,
+        // even after settlement or across runs. Never reply again on that id.
         if (serverRequests.has(message.id)) {
           handlers.onDrop('duplicate_server_request');
           return;
         }
-        serverRequests.add(message.id);
+        if (serverRequests.size >= MAX_SERVER_REQUEST_IDS) {
+          // We cannot safely admit or retire another identity. Reject this
+          // request once and fence the entire connection, without eviction.
+          // Explicitly reject outstanding callbacks while writes still work;
+          // the session observes failure and retains transport disposal ownership.
+          const error = { code: INVALID_REQUEST, message: 'server request limit reached' };
+          transport.send({ id: message.id, error });
+          for (const [id, state] of serverRequests) {
+            if (state.answered) continue;
+            state.answered = true;
+            transport.send({ id, error });
+          }
+          finishStream('failed', 'server_request_limit');
+          return;
+        }
+        const state = { answered: false };
+        serverRequests.set(message.id, state);
 
         // At most one reply per server request, guaranteed here rather than
         // trusted to the handler. `serverRequests` is deliberately a separate
         // map from `pending`: one tracks ids the *server* chose and this
         // adapter must answer, the other tracks ids this adapter chose and the
         // server must answer. Sharing them would let one side settle the other.
-        let answered = false;
         const reply = (
           body: { id: CodexRequestId; result: JsonValue } | { id: CodexRequestId; error: CodexWireError },
         ): boolean => {
-          if (answered || ended) return false;
-          answered = true;
-          serverRequests.delete(message.id);
+          if (state.answered || ended) return false;
+          state.answered = true;
           transport.send(body);
           return true;
         };
