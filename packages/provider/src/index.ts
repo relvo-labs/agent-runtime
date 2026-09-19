@@ -27,6 +27,7 @@ export {
   defineProviderDescriptor,
   canInterruptRun,
   canRaiseApproval,
+  canAskQuestionSet,
   canAcceptWorkspace,
   interruptPreservesSession,
   checkWireCompatibility,

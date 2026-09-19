@@ -70,7 +70,7 @@ import { validateWorkspaceLease, type WorkspaceLease, type WorkspaceProvider } f
 
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 import { createSubscriptionHub, type SubscriptionHub } from './subscriptions.ts';
-import { createInMemoryStore, type RuntimeStore } from './store.ts';
+import { createInMemoryStore, type RuntimeStore, type StoreTransaction } from './store.ts';
 
 export type AgentRuntimeOptions = {
   readonly workspaces: WorkspaceProvider;
@@ -126,6 +126,8 @@ type LiveSession = {
   readonly refToInteraction: Map<string, InteractionId>;
   /** Which run raised an interaction. */
   readonly interactionRuns: Map<InteractionId, RunId>;
+  /** At most one process-local withdrawal per routed interaction, until committed. */
+  readonly withdrawals: Map<InteractionId, { readonly runId: RunId; readonly settledAt: Timestamp }>;
   turnAttempts: Map<TurnId, number>;
   startingRun: boolean;
   closing: boolean;
@@ -392,9 +394,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
    * inspect — rather than as an exception they have to catch.
    */
   type SafeParser<T> = {
-    safeParse(
-      value: unknown,
-    ): { success: true; data: T } | { success: false; error: { issues: readonly { message: string }[] } };
+    safeParse(value: unknown): { success: true; data: T } | { success: false };
   };
 
   function ownDataString(value: unknown, key: string): string | undefined {
@@ -446,13 +446,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     try {
       parsed = schema.safeParse(raw);
     } catch {
-      parsed = { success: false, error: { issues: [{ message: 'command could not be inspected safely' }] } };
+      parsed = { success: false };
     }
     if (parsed.success) return { ok: true, command: parsed.data };
 
     const commandId = CommandIdSchema.safeParse(ownDataString(raw, 'commandId'));
     if (!commandId.success) {
-      throw new AgentRuntimeError(agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'));
+      throw new AgentRuntimeError(agentError('invalid_request', 'command does not match the required schema'));
     }
     const acceptedAt = clock.now();
     return {
@@ -466,7 +466,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           commandId: commandId.data,
           commandType,
           disposition: 'rejected',
-          error: agentError('invalid_request', parsed.error.issues[0]?.message ?? 'invalid command'),
+          error: agentError('invalid_request', 'command does not match the required schema'),
           acceptedAt,
         }),
       },
@@ -574,11 +574,74 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     }
   }
 
+  function retainWithdrawal(
+    sessionId: SessionId,
+    runId: RunId | undefined,
+    captured: CapturedProviderEvent,
+  ): InteractionId | undefined {
+    if (!captured.valid || captured.input.payload.type !== 'interaction.withdrawn' || runId === undefined) return;
+    const session = live.get(sessionId);
+    const interactionId = session?.refToInteraction.get(captured.input.payload.providerRef);
+    if (
+      !session ||
+      interactionId === undefined ||
+      session.interactionRuns.get(interactionId) !== runId ||
+      pendingResponsesByInteraction.has(interactionId)
+    )
+      return;
+    if (!session.withdrawals.has(interactionId)) {
+      session.withdrawals.set(interactionId, { runId, settledAt: clock.now() });
+    }
+    return interactionId;
+  }
+
+  function materializeWithdrawals(
+    tx: StoreTransaction,
+    sessionId: SessionId,
+    runId: RunId,
+    only?: InteractionId,
+  ): void {
+    const session = live.get(sessionId);
+    if (!session) return;
+    for (const [interactionId, withdrawal] of session.withdrawals) {
+      if (withdrawal.runId !== runId || (only !== undefined && only !== interactionId)) continue;
+      const interaction = tx.session(sessionId).interactions.get(interactionId);
+      if (interaction?.status !== 'pending') continue;
+      tx.emit({
+        sessionId,
+        runId,
+        payload: {
+          type: 'interaction.settled',
+          interactionId,
+          turnId: interaction.turnId,
+          settlement: { outcome: 'withdrawn', settledAt: withdrawal.settledAt },
+        },
+      });
+    }
+  }
+
+  /** Called only after the settlement transaction succeeds. */
+  function clearWithdrawals(sessionId: SessionId, runId: RunId, only?: InteractionId): void {
+    const session = live.get(sessionId);
+    if (!session) return;
+    for (const [interactionId, withdrawal] of session.withdrawals) {
+      if (withdrawal.runId !== runId || (only !== undefined && only !== interactionId)) continue;
+      const providerRef = session.interactionRefs.get(interactionId);
+      session.withdrawals.delete(interactionId);
+      session.interactionRefs.delete(interactionId);
+      session.interactionRuns.delete(interactionId);
+      if (providerRef !== undefined) session.refToInteraction.delete(providerRef);
+    }
+  }
+
   async function ingestProviderEvent(
     sessionId: SessionId,
     runId: RunId | undefined,
     captured: CapturedProviderEvent,
   ): Promise<void> {
+    // Reserve before even entering the store: a rejection may precede its callback.
+    // This also fences a response already waiting on asynchronous store reads.
+    let withdrawalId = retainWithdrawal(sessionId, runId, captured);
     // A provider must never be able to break the runtime by emitting
     // something malformed; the worst outcome is a recorded diagnostic.
     await commitAndPublish((tx) => {
@@ -616,6 +679,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       if (runId !== undefined) {
         const run = tx.session(sessionId).runs.get(runId);
         if (!run || (run.termination !== undefined && payload.type !== 'interaction.requested')) return;
+      }
+
+      if (payload.type === 'interaction.withdrawn') {
+        // Also resolve a reference installed by an earlier queued request.
+        withdrawalId ??= retainWithdrawal(sessionId, runId, captured);
+        if (runId !== undefined && withdrawalId !== undefined) {
+          materializeWithdrawals(tx, sessionId, runId, withdrawalId);
+        }
+        return;
       }
 
       if (payload.type === 'interaction.requested') {
@@ -683,9 +755,14 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         ...(runId === undefined ? {} : { runId }),
         payload,
       });
-    }).catch(() => {
-      // Losing one provider event must not take down the session.
-    });
+    })
+      .then(() => {
+        if (runId !== undefined && withdrawalId !== undefined) clearWithdrawals(sessionId, runId, withdrawalId);
+      })
+      .catch(() => {
+        // Withdrawals remain retained for redelivery, completion or cleanup.
+        // Losing one provider event must not take down the session.
+      });
   }
 
   function stagedSinkFor(sessionId: SessionId, runId: RunId | undefined, owner: 'session' | 'run') {
@@ -779,6 +856,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
                       : `provider returned an invalid completion: ${parsed?.error.issues[0]?.message ?? 'schema mismatch'}`,
                 ),
               };
+        let committed = false;
         try {
           await commitAndPublish((tx) => {
             if (!tx.hasSession(sessionId)) return;
@@ -786,6 +864,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             // Exactly one terminal outcome: if the run is already terminal, the
             // second completion is dropped rather than double-counted.
             if (!run || run.termination !== undefined) return;
+
+            materializeWithdrawals(tx, sessionId, runId);
+            run = tx.session(sessionId).runs.get(runId);
+            if (!run) return;
 
             // A response that already reached the provider is logically ahead
             // of a completion even when its first persistence attempt failed.
@@ -873,9 +955,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
               },
             });
           });
+          committed = true;
         } finally {
           const session = live.get(sessionId);
-          if (session) {
+          if (session && committed) {
+            clearWithdrawals(sessionId, runId);
             session.runs.delete(runId);
             session.interruptingRuns.delete(runId);
             for (const [interactionId, interactionRunId] of session.interactionRuns) {
@@ -963,6 +1047,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         interactionRefs: new Map(),
         refToInteraction: new Map(),
         interactionRuns: new Map(),
+        withdrawals: new Map(),
         turnAttempts: new Map(),
         startingRun: false,
         closing: false,
@@ -1275,7 +1360,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     if (pendingResponse !== undefined) return await finishPendingResponse(pendingResponse);
 
     const retainedForInteraction = pendingResponsesByInteraction.get(command.interactionId);
-    if (retainedForInteraction !== undefined) {
+    if (retainedForInteraction !== undefined || live.get(command.sessionId)?.withdrawals.has(command.interactionId)) {
       return await rejectAndRecord(
         command,
         receipt(
@@ -1363,6 +1448,20 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       );
     }
 
+    // Ingress can retain a withdrawal during any of the store reads above.
+    if (session.withdrawals.has(command.interactionId)) {
+      return await rejectAndRecord(
+        command,
+        receipt(
+          command,
+          'rejected',
+          {
+            error: agentError('interaction_already_settled', 'the interaction was withdrawn'),
+          },
+          acceptedAt,
+        ),
+      );
+    }
     reserveCommandAttempt(command, acceptedAt);
     try {
       await session.providerSession.respondToInteraction(providerRef, command.response);
@@ -1540,15 +1639,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         const record = tx.session(command.sessionId);
         for (const [runId, run] of record.runs) {
           if (run.termination !== undefined) continue;
-          if (run.state !== 'interrupting') {
+          materializeWithdrawals(tx, command.sessionId, runId);
+          const currentState = tx.session(command.sessionId).runs.get(runId)?.state;
+          if (currentState === undefined) continue;
+          if (currentState !== 'interrupting') {
             tx.emit({
               sessionId: command.sessionId,
               runId,
-              payload: { type: 'run.state_changed', from: run.state, to: 'interrupting' },
+              payload: { type: 'run.state_changed', from: currentState, to: 'interrupting' },
             });
           }
           for (const interactionId of run.pendingInteractionIds) {
-            const interaction = record.interactions.get(interactionId);
+            const interaction = tx.session(command.sessionId).interactions.get(interactionId);
             if (!interaction || interaction.status === 'settled') continue;
             tx.emit({
               sessionId: command.sessionId,
@@ -1573,6 +1675,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           });
         }
       });
+      for (const { runId } of session.withdrawals.values()) clearWithdrawals(command.sessionId, runId);
       session.runs.clear();
       for (const stop of session.stopSupervision.values()) stop();
       session.stopSupervision.clear();

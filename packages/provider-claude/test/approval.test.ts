@@ -165,8 +165,17 @@ describe('claude approval capability', () => {
     const fake = createFakeQuery();
     const descriptor = createClaudeProvider({ query: fake.query, approvals: 'bridge' }).describe();
     expect(descriptor.interaction.approval).toEqual({ supported: true, modes: ['once'], blocking: true });
-    // The SDK can express no question this adapter could answer faithfully.
-    expect(descriptor.interaction.question).toEqual({ supported: false, choices: false, multiSelect: false });
+    // Bridging approvals claims nothing about questions: the two bridges are
+    // separate options, and `questions: 'bridge'` is what declares this block.
+    expect(descriptor.interaction.question).toEqual({
+      supported: false,
+      choices: false,
+      multiSelect: false,
+      batch: false,
+      maxQuestions: null,
+      freeText: false,
+      sensitive: false,
+    });
     expect(descriptor.interaction.settlementTimeoutMs).toBeNull();
 
     await openBridged(fake);

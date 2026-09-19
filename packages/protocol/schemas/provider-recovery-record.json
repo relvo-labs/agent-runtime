@@ -44,7 +44,7 @@
           "type": "string"
         },
         "wireVersion": {
-          "const": "0.4",
+          "const": "0.5",
           "type": "string"
         }
       },
@@ -57,9 +57,9 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/provider-recovery-record.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/provider-recovery-record.json",
   "$ref": "#/$defs/provider-recovery-record",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "provider-recovery-record",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

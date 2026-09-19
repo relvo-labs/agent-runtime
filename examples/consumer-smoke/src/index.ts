@@ -3,16 +3,27 @@ import {
   WIRE_VERSION,
   createCounterIdFactory,
   createFixedClock,
+  checkResponseAgainstRequest,
   CommandIdSchema,
+  InteractionIdSchema,
+  QuestionSetRequestSchema,
+  QuestionSetResponseSchema,
   type CommandReceipt,
+  type InteractionResponse,
+  type QuestionAnswer,
+  type QuestionItem,
+  type QuestionSetRequest,
+  type QuestionSetResponse,
   type SessionId,
   type WorkspaceLeaseDescriptor,
   type WorkspaceSpec,
 } from '@relvo-labs/agent-protocol';
 import {
   ProviderRunTerminationSchema,
+  canAskQuestionSet,
   defineProviderDescriptor,
   type AgentProvider,
+  type CapabilityCheck,
   type ProviderRunTermination,
 } from '@relvo-labs/agent-provider';
 import {
@@ -20,9 +31,11 @@ import {
   CLAUDE_ADAPTER_VERSION,
   CLAUDE_AGENT_SDK_PACKAGE,
   CLAUDE_AGENT_SDK_VERSION,
+  CLAUDE_QUESTION_TOOL,
   ClaudePermissionModeSchema,
   ClaudeSessionOptionsSchema,
   createClaudeProvider,
+  type ClaudeAskUserQuestionInput,
   type ClaudeCanUseTool,
   type ClaudeInterruptReceipt,
   type ClaudeMessageUuid,
@@ -35,11 +48,14 @@ import {
   type ClaudeQueryHandle,
   type ClaudeQueryMessage,
   type ClaudeQueryParams,
+  type ClaudeQuestion,
+  type ClaudeQuestionOption,
   type ClaudeSessionOptions,
   type ClaudeToolPermissionRequest,
 } from '@relvo-labs/agent-provider-claude';
 import {
   CODEX_ADAPTER_STATUS,
+  CODEX_BRIDGED_QUESTION,
   CODEX_ADAPTER_VERSION,
   CODEX_APP_SERVER_ARGV,
   CODEX_APP_SERVER_VERSION,
@@ -131,6 +147,9 @@ const claudeOptions: ClaudeProviderOptions = {
   // `respondToInteraction`. Omit it and the adapter declares no approval
   // capability, exactly as before.
   approvals: 'bridge',
+  // Opt in to the host question bridge: `AskUserQuestion` becomes a neutral
+  // `question_set` interaction this host answers, and the same run resumes.
+  questions: 'bridge',
 };
 
 /**
@@ -228,6 +247,157 @@ async function runCodexTurn(sessionId: SessionId): Promise<CommandReceipt> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Structured questions (ADR-0018)
+// ---------------------------------------------------------------------------
+
+/**
+ * A host renders a batch and answers it as one unit.
+ *
+ * The answer is keyed by the request's own `key`, never by array position, and
+ * the whole batch is answered or none of it is. `checkResponseAgainstRequest`
+ * is the same check the runtime applies before any provider is touched, so a
+ * host can validate its own form before submitting a command.
+ */
+const questionBatch: QuestionSetRequest = QuestionSetRequestSchema.parse({
+  kind: 'question_set',
+  questions: [
+    {
+      key: 'q1',
+      prompt: 'Which database should the service use?',
+      header: 'Database',
+      choices: [
+        { value: 'o1', label: 'PostgreSQL', description: 'Relational' },
+        { value: 'o2', label: 'SQLite', description: 'Embedded' },
+      ],
+      allowFreeText: true,
+    },
+    { key: 'q2', prompt: 'Paste the deploy token', sensitive: true },
+  ],
+});
+
+/**
+ * The answers a person gave, one per question, keyed by the request's own key.
+ *
+ * Written out rather than derived from the request: a host that answers by
+ * picking "the first choice" has not asked anyone anything, and an example that
+ * does so teaches a consent-bypassing pattern. `q1` names a choice value; `q2`
+ * is free text because that question offers no choices.
+ */
+const collectedAnswers: Readonly<Record<string, QuestionAnswer>> = {
+  q1: { type: 'selection', values: ['o1'] },
+  q2: { type: 'text', text: 'typed by the user' },
+};
+
+/** A batch is answered completely or not at all, so every key is present. */
+const everyQuestionAnswered: boolean = questionBatch.questions.every((question: QuestionItem) =>
+  Object.hasOwn(collectedAnswers, question.key),
+);
+
+const questionAnswers: QuestionSetResponse = QuestionSetResponseSchema.parse({
+  kind: 'question_set',
+  answers: collectedAnswers,
+});
+
+/** `undefined` means the batch is answered completely and validly. */
+const questionMismatch: string | undefined = checkResponseAgainstRequest(questionBatch, questionAnswers);
+
+/** A host submits it as an ordinary command, narrowed by the response union. */
+async function answerQuestions(sessionId: SessionId): Promise<CommandReceipt> {
+  const response: InteractionResponse = questionAnswers;
+  return claudeRuntime.respondToInteraction({
+    type: 'respond_to_interaction',
+    commandId: CommandIdSchema.parse('claude-consumer-answer-1'),
+    sessionId,
+    interactionId: InteractionIdSchema.parse('int_0000000000000001'),
+    response,
+  });
+}
+
+/** Capability gating before a host offers a batch surface at all. */
+const batchSupported: CapabilityCheck = canAskQuestionSet(claude.describe(), questionBatch.questions.length);
+
+/**
+ * What this host's user actually chose, keyed by the question they were shown.
+ *
+ * Supplied explicitly, because the point of the seam is that a *person*
+ * answers. A handler that picked each question's first option would be
+ * answering on their behalf, which is exactly what the surrounding consent
+ * guidance forbids and what an "automatic" example would teach.
+ */
+const hostSuppliedAnswers: Readonly<Record<string, string>> = {
+  'Which database should the service use?': 'PostgreSQL',
+  'Which regions should it serve?': 'EU, US',
+};
+
+/**
+ * Narrow the tool input without an unchecked cast.
+ *
+ * `canUseTool` receives `Record<string, unknown>` because the SDK routes every
+ * tool through it. `ClaudeAskUserQuestionInput` describes the shape this host
+ * expects; a guard is how a consumer gets from one to the other honestly, and
+ * it would stop compiling if the exported type changed.
+ */
+function asAskUserQuestionInput(input: Record<string, unknown>): ClaudeAskUserQuestionInput | undefined {
+  const questions: unknown = input.questions;
+  if (!Array.isArray(questions)) return undefined;
+  const narrowed: ClaudeQuestion[] = [];
+  for (const candidate of questions as readonly unknown[]) {
+    if (typeof candidate !== 'object' || candidate === null) return undefined;
+    const record = candidate as Record<string, unknown>;
+    const { question, header, options, multiSelect } = record;
+    if (typeof question !== 'string' || typeof header !== 'string' || typeof multiSelect !== 'boolean') {
+      return undefined;
+    }
+    if (!Array.isArray(options)) return undefined;
+    const narrowedOptions: ClaudeQuestionOption[] = [];
+    for (const option of options as readonly unknown[]) {
+      if (typeof option !== 'object' || option === null) return undefined;
+      const { label, description } = option as Record<string, unknown>;
+      if (typeof label !== 'string' || typeof description !== 'string') return undefined;
+      narrowedOptions.push({ label, description });
+    }
+    narrowed.push({ question, header, options: narrowedOptions, multiSelect });
+  }
+  return { questions: narrowed };
+}
+
+/**
+ * The Claude question seam is a named public type, so a host that drives
+ * `canUseTool` itself answers `AskUserQuestion` with the pinned route and gets
+ * a compile error if the shape is wrong.
+ *
+ * It answers only questions this host already has a person's answer for, and
+ * denies the call otherwise. Answers are assembled with `Object.fromEntries`
+ * so a question whose text is `__proto__` becomes an own property rather than
+ * a prototype assignment that would serialise to `{}`.
+ */
+const askUserQuestionHandler: ClaudeCanUseTool = (toolName, input, request) => {
+  if (toolName !== CLAUDE_QUESTION_TOOL || request.signal.aborted) {
+    return Promise.resolve({ behavior: 'deny', message: 'not answerable by this host' });
+  }
+  const parsed = asAskUserQuestionInput(input);
+  if (parsed === undefined) {
+    return Promise.resolve({ behavior: 'deny', message: 'this host could not read that question' });
+  }
+  const pairs: [string, string][] = [];
+  for (const question of parsed.questions) {
+    const answer = Object.hasOwn(hostSuppliedAnswers, question.question)
+      ? hostSuppliedAnswers[question.question]
+      : undefined;
+    // No answer collected means nobody answered it. Denying tells the model to
+    // ask in its reply; inventing one would put words in the user's mouth.
+    if (answer === undefined) {
+      return Promise.resolve({ behavior: 'deny', message: 'this host has no answer for that question' });
+    }
+    pairs.push([question.question, answer]);
+  }
+  return Promise.resolve({
+    behavior: 'allow',
+    updatedInput: { questions: parsed.questions, answers: Object.fromEntries(pairs) },
+  });
+};
+
 assertReadOnly(['status', '--short']);
 void runtime;
 void descriptor;
@@ -260,3 +430,9 @@ void hostPermissionCallback;
 void runClaudeTurn;
 void claudeRuntime;
 void claudeSessionOptions;
+void questionMismatch;
+void everyQuestionAnswered;
+void answerQuestions;
+void batchSupported;
+void askUserQuestionHandler;
+void CODEX_BRIDGED_QUESTION;

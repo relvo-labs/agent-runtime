@@ -37,6 +37,7 @@ import {
 } from '@relvo-labs/agent-provider';
 
 import { createApprovalRegistry, type ApprovalRegistry } from './approvals.ts';
+import { CLAUDE_QUESTION_TOOL, createQuestionRegistry, type QuestionRegistry } from './questions.ts';
 import { loadClaudeQuery, CLAUDE_AGENT_SDK_PACKAGE } from './binding.ts';
 import { ClaudeSessionOptionsSchema, type ClaudeProviderOptions, type ClaudeSessionOptions } from './options.ts';
 import { classifyThrown, correlationStampsOf, createRunTranslator } from './translate.ts';
@@ -236,6 +237,8 @@ function createSessionFor(
   const prompts = createPromptStream();
   const approvals: ApprovalRegistry | undefined =
     defaults.approvals === 'bridge' ? createApprovalRegistry() : undefined;
+  const questions: QuestionRegistry | undefined =
+    defaults.questions === 'bridge' ? createQuestionRegistry() : undefined;
 
   let handle: ClaudeQueryHandle;
   try {
@@ -246,7 +249,7 @@ function createSessionFor(
         defaults,
         overrides,
         abortController,
-        approvals === undefined ? undefined : askForApproval,
+        approvals === undefined && questions === undefined ? undefined : onToolPermission,
       ),
     });
   } catch (error) {
@@ -298,6 +301,7 @@ function createSessionFor(
     // here releases the SDK call that is still waiting and retires the run's
     // references, so a late response settles nothing and resurrects nothing.
     approvals?.cancel(run);
+    questions?.cancel(run);
     run.settle(termination);
   }
 
@@ -447,21 +451,45 @@ function createSessionFor(
   }
 
   /**
-   * The SDK's host permission callback.
+   * The SDK's host callback, which carries two different questions.
    *
-   * Installed only when the host asked for the bridge. It never rejects and
-   * never resolves `null`: the SDK reads `null` as "already answered out of
-   * band" and would leave the tool blocked with no answer coming.
+   * `AskUserQuestion` is Claude asking the *user* something and waiting for the
+   * answer; every other tool name is Claude asking whether it may act. The SDK
+   * routes both here, so this function dispatches on the tool name and hands
+   * each to the registry that can answer it faithfully.
+   *
+   * Installed when either bridge is enabled. It never rejects and never
+   * resolves `null`: the SDK reads `null` as "already answered out of band" and
+   * would leave the tool blocked with no answer coming.
    */
-  function askForApproval(
+  function onToolPermission(
     toolName: string,
-    _input: Record<string, unknown>,
+    input: Record<string, unknown>,
     request: ClaudeToolPermissionRequest | undefined,
   ): Promise<ClaudePermissionResult> {
+    if (toolName === CLAUDE_QUESTION_TOOL) {
+      const registry = questions;
+      const run = registry === undefined ? undefined : approvalOwner();
+      if (registry === undefined || run === undefined) {
+        // Denying is the fail-closed answer: without a run to own the batch, or
+        // without the bridge, nobody can answer, and allowing the call would
+        // run the tool with no answers at all.
+        if (registry !== undefined) noteUnattributablePermission();
+        return Promise.resolve({
+          behavior: 'deny',
+          message:
+            registry === undefined
+              ? 'this host does not display questions; ask in your reply instead'
+              : 'this session has no run that can be asked this question',
+        });
+      }
+      return registry.request(run, run.request.sink, input, request?.signal);
+    }
+
     const registry = approvals;
     const run = registry === undefined ? undefined : approvalOwner();
     if (registry === undefined || run === undefined) {
-      noteUnattributablePermission();
+      if (registry !== undefined) noteUnattributablePermission();
       return Promise.resolve({
         behavior: 'deny',
         message: 'this session has no run that can be asked to approve tool use',
@@ -660,12 +688,24 @@ function createSessionFor(
       // Silently accepting a reference this session cannot settle would let a
       // caller believe an approval landed. The reference itself is never
       // echoed: it is caller-controlled text on a durable error.
-      if (approvals === undefined) {
+      if (approvals === undefined && questions === undefined) {
         return Promise.reject(
           new ProviderRejection(agentError('unknown_interaction', 'the claude adapter does not raise interactions')),
         );
       }
       try {
+        // Questions first: the registry reports whether the reference is one of
+        // its own, so a reference belonging to neither registry produces one
+        // `unknown_interaction`, not a misleading kind error from whichever was
+        // asked first.
+        if (questions?.settle(providerRef, response) === true) return Promise.resolve();
+        if (approvals === undefined) {
+          return Promise.reject(
+            new ProviderRejection(
+              agentError('unknown_interaction', 'the claude adapter has no question outstanding for that reference'),
+            ),
+          );
+        }
         approvals.settle(providerRef, response);
         return Promise.resolve();
       } catch (error) {
@@ -684,6 +724,7 @@ function createSessionFor(
       // answered once the query is aborted, and a teardown that then rejects
       // must not leave the SDK holding a promise nothing will settle.
       approvals?.cancelAll();
+      questions?.cancelAll();
       // One teardown at a time, shared by concurrent callers.
       if (teardown !== undefined) return teardown;
 
@@ -750,11 +791,25 @@ export function createClaudeProvider(options: ClaudeProviderOptions = {}): Agent
       // not offered. Without the bridge nothing is claimed and a prompt fails
       // closed inside the SDK instead of waiting for an answer.
       approval: options.approvals === 'bridge' ? { supported: true, modes: ['once'], blocking: true } : {},
-      // The SDK's question-shaped surfaces — `AskUserQuestion` tool input,
-      // `onUserDialog`, MCP elicitation — carry forms this adapter cannot
-      // represent as one neutral question without dropping fields, so none is
-      // claimed and none is bridged.
-      question: {},
+      // Claimed only when the host asked for the question bridge, and only to
+      // the degree `AskUserQuestion` can express: a batch of 1–4 choice
+      // questions, each single- or multi-select, each accepting typed text as
+      // an "Other" answer. `maxQuestions` is the pinned tool bound, not a guess.
+      // No secret-answer concept exists, so `sensitive` stays false. The SDK's
+      // other question-shaped surfaces — `onUserDialog`, MCP elicitation — are
+      // still not bridged; see the adapter README.
+      question:
+        options.questions === 'bridge'
+          ? {
+              supported: true,
+              choices: true,
+              multiSelect: true,
+              batch: true,
+              maxQuestions: 4,
+              freeText: true,
+              sensitive: false,
+            }
+          : {},
       // No settlement deadline is imposed here; a prompt waits for the host.
       settlementTimeoutMs: null,
     },

@@ -13,9 +13,10 @@
  *      child-process exit surfaces;
  *   3. a per-request deadline, for a live peer that simply never answers.
  *
- * It also guarantees that every *server-initiated* request is answered exactly
- * once. The session may take ownership of one and answer it later — that is how
- * an approval reaches a host — but anything it does not take is declined here
+ * It also guarantees that every *server-initiated* request settles at most
+ * once, by a reply or by server-side resolution. The session may take ownership
+ * of one and answer it later — that is how an approval reaches a host — but
+ * anything it does not take is declined here
  * and now. Silence is not an option: `item/tool/requestUserInput` carries
  * `isBlocking`, so an unanswered request can stall a turn indefinitely
  * (research, "Wire and initialization").
@@ -141,7 +142,7 @@ export type CodexClientHandlers = {
    * Return `true` to take responsibility for answering it — now or later,
    * through the offer's own `respond`/`reject`. Return `false` and this layer
    * declines it immediately, so an unhandled request can never hang a turn.
-   * The native id is not passed: the ability to answer it once is.
+   * The native id is private correlation; reply and retirement use the offer's closures.
    */
   onServerRequest(request: CodexServerRequestOffer): boolean;
   /** An inbound frame could not be used. Bounded, allowlisted reason token. */
@@ -181,14 +182,14 @@ export function createCodexClient(
   /** Ids this adapter chose, awaiting the server's reply. */
   const pending = new Map<CodexRequestId, Pending>();
   /**
-   * Ids the *server* chose, including requests already answered.
+   * Ids the *server* chose, including requests already answered or retired.
    * Never evict an identity while the connection can still deliver its replay.
    *
    * Kept strictly apart from `pending`. The two id spaces are independent —
    * both sides number from 1 — so merging them would let a server request
    * resolve one of this adapter's own in-flight calls, or the reverse.
    */
-  const serverRequests = new Map<CodexRequestId, { answered: boolean }>();
+  const serverRequests = new Map<CodexRequestId, { settled: boolean }>();
   // Monotonic and never reused, so a late reply to a retired request can never
   // be mistaken for the answer to a current one.
   let nextId = 1;
@@ -255,14 +256,14 @@ export function createCodexClient(
           const error = { code: INVALID_REQUEST, message: 'server request limit reached' };
           transport.send({ id: message.id, error });
           for (const [id, state] of serverRequests) {
-            if (state.answered) continue;
-            state.answered = true;
+            if (state.settled) continue;
+            state.settled = true;
             transport.send({ id, error });
           }
           finishStream('failed', 'server_request_limit');
           return;
         }
-        const state = { answered: false };
+        const state = { settled: false };
         serverRequests.set(message.id, state);
 
         // At most one reply per server request, guaranteed here rather than
@@ -273,14 +274,24 @@ export function createCodexClient(
         const reply = (
           body: { id: CodexRequestId; result: JsonValue } | { id: CodexRequestId; error: CodexWireError },
         ): boolean => {
-          if (state.answered || ended) return false;
-          state.answered = true;
+          if (state.settled || ended) return false;
+          state.settled = true;
           transport.send(body);
           return true;
         };
         const offer: CodexServerRequestOffer = {
+          // Adapter-private correlation for `serverRequest/resolved`, which
+          // names a request by this id and nothing else. The reply itself
+          // still goes through the closures below, so handing the id over
+          // cannot produce a second reply on it.
+          id: message.id,
           method: message.method,
           params: message.params,
+          // A correlated server resolution closes the reply channel without
+          // writing. Keep the identity tombstone for replay and bound checks.
+          retire: () => {
+            state.settled = true;
+          },
           respond: (result: JsonValue) => reply({ id: message.id, result }),
           reject: (code: number, text: string) => reply({ id: message.id, error: { code, message: text } }),
         };

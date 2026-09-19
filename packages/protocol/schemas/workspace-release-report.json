@@ -48,9 +48,9 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/workspace-release-report.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/workspace-release-report.json",
   "$ref": "#/$defs/workspace-release-report",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "workspace-release-report",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

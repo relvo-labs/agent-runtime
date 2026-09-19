@@ -21,6 +21,8 @@ export {
 
 export { CLAUDE_AGENT_SDK_PACKAGE } from './binding.ts';
 
+export { CLAUDE_QUESTION_TOOL } from './questions.ts';
+
 export {
   ClaudePermissionModeSchema,
   ClaudeSessionOptionsSchema,
@@ -30,6 +32,7 @@ export {
 } from './options.ts';
 
 export type {
+  ClaudeAskUserQuestionInput,
   ClaudeCanUseTool,
   ClaudeInterruptReceipt,
   ClaudeMessageUuid,
@@ -41,6 +44,8 @@ export type {
   ClaudeQueryMessage,
   ClaudeQueryOptions,
   ClaudeQueryParams,
+  ClaudeQuestion,
+  ClaudeQuestionOption,
   ClaudeToolPermissionRequest,
 } from './seam.ts';
 

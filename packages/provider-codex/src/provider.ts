@@ -40,10 +40,18 @@ import {
 } from '@relvo-labs/agent-provider';
 
 import { createCodexClient, isAuthoritativeRejection, type CodexClient, type CodexClientEnd } from './client.ts';
-import { CODEX_METHOD, CODEX_NOTIFICATION, CODEX_SERVER_REQUEST, asId, asRecord } from './protocol.ts';
+import {
+  CODEX_METHOD,
+  CODEX_NOTIFICATION,
+  CODEX_SERVER_REQUEST,
+  asId,
+  asRecord,
+  asServerRequestResolved,
+} from './protocol.ts';
 import {
   CODEX_APPROVAL_MODES,
   CODEX_BRIDGED_APPROVAL,
+  CODEX_BRIDGED_QUESTION,
   createInteractionRegistry,
   type ApprovalOwner,
   type CodexInteractionRegistry,
@@ -333,6 +341,24 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
   }
 
   function onNotification(method: string, params: unknown): void {
+    // Handled before correlation, because it is the one notification that
+    // carries no `turnId`: `serverRequest/resolved` is `{ threadId, requestId }`
+    // and is correlated by the native request id the registry retained. It
+    // both confirms an answer this adapter already sent and retires one the
+    // server resolved itself — the app-server's withdrawal signal. Dropping it
+    // for want of a `turnId` is what leaves a withdrawn question pending in
+    // the Runtime while the adapter keeps a reply channel it must not use.
+    if (method === CODEX_NOTIFICATION.serverRequestResolved) {
+      const resolved = asServerRequestResolved(params);
+      if (resolved === undefined) return;
+      if (resolved.threadId !== threadId) {
+        noteForeignTraffic();
+        return;
+      }
+      interactions?.resolveNative(resolved.requestId);
+      return;
+    }
+
     const correlation = correlationOf(params);
     if (correlation === undefined) {
       // Thread- and app-scoped notifications carry no turn. Nothing in the
@@ -836,7 +862,10 @@ async function openConnection(
     // must fail closed rather than hang a run nobody can answer. With the
     // bridge on, `on-request` lets the server ask when it needs to escalate,
     // and each request becomes one neutral approval the host decides.
-    // No question shape is bridged either way.
+    // The question bridge deliberately does not move this. `approvalPolicy`
+    // governs whether the server may ask permission to *act*; a
+    // `item/tool/requestUserInput` is the model asking the user something and
+    // is unrelated to it. Enabling questions must not widen what Codex may do.
     approvalPolicy: options.approvals === 'bridge' ? 'on-request' : 'never',
     sandbox,
     // In-memory only. Nothing about this conversation is materialised on disk
@@ -940,6 +969,7 @@ async function closeQuietly(transport: CodexTransport): Promise<{ ok: true } | {
  */
 export function createCodexProvider(options: CodexProviderOptions = {}): CodexProvider {
   const bridgesApprovals = options.approvals === 'bridge';
+  const bridgesQuestions = options.questions === 'bridge';
   const descriptor = defineProviderDescriptor({
     providerId: CODEX_PROVIDER_ID,
     providerVersion: CODEX_ADAPTER_VERSION,
@@ -969,12 +999,27 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
       // neutral response has nowhere to put. The app-server blocks the command
       // on the answer, so `blocking` is true rather than advisory.
       approval: bridgesApprovals ? { supported: true, modes: [...CODEX_APPROVAL_MODES], blocking: true } : {},
-      // No question is claimed. The only question-shaped server request in the
-      // pinned surface is `item/tool/requestUserInput`, which is EXPERIMENTAL
-      // and gated behind `experimentalApi` — never opted into — and whose
-      // multi-question, `isSecret` and `isOther` payload cannot be carried by a
-      // single neutral `QuestionRequest` anyway. It is declined, not mapped.
-      question: {},
+      // Claimed only when the host asked for the question bridge, and only to
+      // the degree `item/tool/requestUserInput` declares. `multiSelect` stays
+      // false because `ToolRequestUserInputQuestion` has no field that permits
+      // several answers — the reply array can hold them, but the request never
+      // says they are allowed, and offering an unstated capability is a guess.
+      // `maxQuestions` is left unstated: the native schema bounds nothing, so
+      // this adapter's own bound is the protocol's and is enforced by refusal
+      // rather than advertised as the server's.
+      question: bridgesQuestions
+        ? {
+            supported: true,
+            choices: true,
+            multiSelect: false,
+            batch: true,
+            maxQuestions: null,
+            // `isOther`, and any question the server sends with no options.
+            freeText: true,
+            // `isSecret`.
+            sensitive: true,
+          }
+        : {},
       // This adapter imposes no settlement deadline: an approval waits for a
       // host, a run, or teardown, never a timer.
       settlementTimeoutMs: null,
@@ -1009,12 +1054,17 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
       declaredSandboxMode: options.sandboxMode ?? 'read-only',
       /**
        * The approval policy this adapter will request from the app-server, and
-       * the exact server-initiated methods it bridges. Every other
-       * `ServerRequest` method is declined on its own native request id — see
-       * the mapping table in `interaction.ts`.
+       * the exact server-initiated methods it bridges — each listed only when
+       * its own bridge was opted into, so the list always matches what this
+       * session will actually answer. Every other `ServerRequest` method is
+       * declined on its own native request id — see the mapping table in
+       * `interaction.ts`.
        */
       declaredApprovalPolicy: bridgesApprovals ? 'on-request' : 'never',
-      bridgedServerRequests: bridgesApprovals ? [CODEX_BRIDGED_APPROVAL] : [],
+      bridgedServerRequests: [
+        ...(bridgesApprovals ? [CODEX_BRIDGED_APPROVAL] : []),
+        ...(bridgesQuestions ? [CODEX_BRIDGED_QUESTION] : []),
+      ],
       /**
        * `CommandExecutionRequestApprovalResponse` carries `decision` and
        * nothing else, so a host's denial `reason` cannot be transmitted to the
@@ -1159,7 +1209,13 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
           sink: init.sink,
           // One registry per session: references never cross sessions, and a
           // session's teardown retires exactly its own.
-          interactions: bridgesApprovals ? createInteractionRegistry(init.sink) : undefined,
+          // Each native method is gated by its own flag, so enabling questions
+          // cannot quietly re-enable the approval bridge the descriptor says
+          // is off.
+          interactions:
+            bridgesApprovals || bridgesQuestions
+              ? createInteractionRegistry(init.sink, { approvals: bridgesApprovals, questions: bridgesQuestions })
+              : undefined,
         },
         {
           attach(runtime: SessionRuntime): void {

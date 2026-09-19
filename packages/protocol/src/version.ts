@@ -9,8 +9,15 @@
  * See docs/adr/ADR-0011-public-api-and-versioning.md.
  */
 
-/** The contract version carried on every envelope that crosses a boundary. */
-export const WIRE_VERSION = '0.4';
+/**
+ * The contract version carried on every envelope that crosses a boundary.
+ *
+ * `0.5` added the `question_set` member to the closed interaction request and
+ * response unions and widened the strict `QuestionCapability` object. Both are
+ * breaking for a pre-1.0 reader, which rejects rather than ignores an unknown
+ * union member or property. See docs/adr/ADR-0018-structured-question-sets.md.
+ */
+export const WIRE_VERSION = '0.5';
 
 /**
  * Stable base for generated JSON Schema `$id` values.

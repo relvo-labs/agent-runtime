@@ -33,6 +33,8 @@ export {
   type CodexStdioTransportConfig,
 } from './transport.ts';
 
+export { CODEX_BRIDGED_APPROVAL, CODEX_BRIDGED_QUESTION } from './interaction.ts';
+
 export {
   CodexSandboxModeSchema,
   CodexSessionOptionsSchema,
