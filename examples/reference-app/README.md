@@ -193,8 +193,8 @@ guesses, stores, or forwards one:
 - **Claude** — `REFERENCE_APP_ENABLE_CLAUDE=1`, optionally `REFERENCE_APP_CLAUDE_MODEL=<model id>`
   (defaults to `claude-sonnet-4-6`, this repository's own documented example model). Permission
   mode is fixed at the conservative `plan` — never `acceptEdits`/`bypassPermissions`. Requires the
-  host-installed optional peer `@anthropic-ai/claude-agent-sdk@0.3.280`
-  (`pnpm add @anthropic-ai/claude-agent-sdk@0.3.280`); without it, `open_session` rejects with a
+  host-installed optional peer `@anthropic-ai/claude-agent-sdk@0.3.260`
+  (`pnpm add @anthropic-ai/claude-agent-sdk@0.3.260`); without it, `open_session` rejects with a
   retryable `provider_unavailable` naming the package — never a silent fallback to the scripted
   lane. The SDK itself reads `ANTHROPIC_API_KEY` (or an alternative provider's env flags — Bedrock,
   the Claude Platform on AWS, Vertex, Foundry) from this process's environment; this app never

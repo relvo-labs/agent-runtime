@@ -32,7 +32,7 @@ await runtime.submitTurn({
 by the adapter's default binding. Install it in the host application:
 
 ```bash
-pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.280
+pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.260
 ```
 
 The peer range is the exact pin the seam was derived from (`CLAUDE_AGENT_SDK_VERSION`).
@@ -63,12 +63,16 @@ has been observed against a real Claude model.
 | Bridges host permission prompts             | Deterministic tests invoke the installed `canUseTool` exactly as the SDK does — approve, deny, unsupported mode/kind, unknown, cross-session, redelivered, conflicting, unattributable, and every teardown path. |
 | Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                              |
 
-The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.280**
+The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.260**
 (`CLAUDE_AGENT_SDK_VERSION`), which is the pinned peer range. There is no captured
 live-model acceptance for this adapter anywhere in this repository, so a behaviour this
 adapter infers from the SDK's documented message shapes — correlation fields, interrupt
 receipts, terminal subtypes — is verified only to the extent that those shapes are what the
-SDK actually emits at that version.
+SDK actually emits at that version. Later SDK releases (`0.3.261+`) add a
+first-command prewait interrupt latch: the same `still_queued` receipt can mean
+a prompt is already abort-latched or that it will run later. The adapter
+cannot infer a safe stop acknowledgement from that receipt alone. Do not
+relax the exact peer pin without a separately verified reconciliation design.
 
 Do not read `'live'` as "verified against a live model". Those are different claims and
 only the first is made here.
@@ -161,7 +165,7 @@ published; the category (`command`, `file_write`, `network`, `tool`) is an advis
 derived from the tool name, not an enforced classification. A host that needs the arguments
 to decide wraps `query` in its own binding, where it sees the full `canUseTool` context.
 
-One limitation, stated rather than papered over: a permission callback in 0.3.280 carries
+One limitation, stated rather than papered over: a permission callback in 0.3.260 carries
 no `user_message_uuid`, so it cannot be correlated the way a message frame is. Attribution
 rests on this adapter running one turn per session at a time plus the stream binding — a
 prompt is raised for the active run only while nothing contradicts it, and is denied
@@ -178,18 +182,16 @@ produced before the stop is still delivered.
 
 That intent is provisional until the round-trip answers. A result that lands while the
 control request is still in flight closes the run to further output but does not settle it
-yet: if the request is refused, no stop happened, and the run settles with the outcome
-the turn itself reported.
+yet: if the request is then refused, or reports the input as still queued, no stop
+happened, and the run settles with the outcome the turn itself reported.
 
-The pinned 0.3.280 CLI **latches** an interrupt in the first-command prewait window:
-its receipt still lists that first run's uuid under `still_queued`, but the pending turn
-starts already aborted and emits its ordinary terminal result. The adapter therefore
-keeps the stop intent for a listed first run. On later runs, `still_queued` means input
-may actually survive. The public SDK `interrupt()` takes no `cancel_queued` argument,
-so the adapter rejects that later stop with `details.reason === 'input_still_queued'`
-and a session warning, leaving the run active; a subsequent stop after the turn starts
-can interrupt it. A host-injected query or alternate CLI that lacks the pinned prewait
-latch does not satisfy this first-run safety guarantee.
+The SDK answers with an `interrupt_receipt_v1` receipt listing input that **survived** the
+stop. The pinned public `interrupt()` takes no arguments, so `cancel_queued` cannot be
+requested and a survivor cannot be recalled. When the run's own input is listed there, the
+adapter reports the stop as not applied — a typed `provider_rejected` with
+`details.reason === 'input_still_queued'`, plus a session warning — and leaves the run
+active, so the turn that does run is reported for what it actually was. Retrying the
+interrupt once the turn has started stops it normally.
 
 Disposal fences new runs the instant it begins, shares one teardown between concurrent
 callers, and stays retryable to success if teardown rejects.
@@ -237,7 +239,7 @@ is emitted on that run's sink, so the interaction settles `withdrawn`, its routi
 a later answer is `interaction_already_settled`, the next question can be raised, and the
 run's own success stays a success instead of becoming a `provider_contract_violation`.
 
-In the pinned SDK 0.3.280, `tools` controls the available tool inventory; `allowedTools`
+In the pinned SDK 0.3.260, `tools` controls the available tool inventory; `allowedTools`
 auto-approves tool calls. This adapter forwards `allowedTools` but does not expose the
 SDK's `tools` option. Do not add `AskUserQuestion` to `allowedTools` to enable questions:
 auto-approved calls bypass `canUseTool`, preventing this bridge from creating a structured
@@ -316,7 +318,7 @@ const provider = createClaudeProvider({
 });
 ```
 
-The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.280** (`CLAUDE_AGENT_SDK_VERSION`).
+The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.260** (`CLAUDE_AGENT_SDK_VERSION`).
 `ClaudeQueryOptions` is what an injected `query` **receives**, so note that its
 `permissionPrompts` is now `'host' | 'none'` rather than the literal `'none'`, and it may
 carry an optional `canUseTool`. An implementation that annotated its own parameter with the

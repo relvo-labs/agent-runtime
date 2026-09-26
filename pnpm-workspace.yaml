@@ -20,9 +20,11 @@ catalog:
   # this workspace: the package is published under Anthropic's proprietary
   # terms and carries a ~200 MB per-platform native payload, so the adapter
   # resolves it at runtime from the host's own installation instead.
-  # 0.3.280 (2026-09-22) is the newest stable release older than the
-  # 3-day cooldown at this upgrade's verification time (2026-09-26).
-  '@anthropic-ai/claude-agent-sdk': 0.3.280
+  # 0.3.260 (2026-09-03) is the newest baseline without the first-command
+  # prewait interrupt latch added in 0.3.261. Newer receipts cannot prove
+  # whether a still_queued UUID was latched or will execute later; fail closed
+  # until that ambiguity has a verified reconciliation strategy.
+  '@anthropic-ai/claude-agent-sdk': 0.3.260
 
   # --- toolchain (dev only) ------------------------------------------------
   # The npm CLI this repository publishes with, and the one the release

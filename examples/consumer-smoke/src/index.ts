@@ -425,7 +425,7 @@ void releaseAbandonedCodexConnections;
 void CLAUDE_ADAPTER_STATUS;
 void CLAUDE_ADAPTER_VERSION;
 void CLAUDE_AGENT_SDK_PACKAGE;
-const pinnedClaudeSdkVersion: '0.3.280' = CLAUDE_AGENT_SDK_VERSION;
+const pinnedClaudeSdkVersion: '0.3.260' = CLAUDE_AGENT_SDK_VERSION;
 void pinnedClaudeSdkVersion;
 void claudePermissionMode;
 void hostPermissionCallback;

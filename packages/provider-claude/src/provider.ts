@@ -56,7 +56,7 @@ export const CLAUDE_PROVIDER_ID = 'claude';
 /** This adapter's own version, reported for diagnostics. Not the wire version. */
 export const CLAUDE_ADAPTER_VERSION = '0.1.0';
 /** The SDK line the query seam in `seam.ts` mirrors. */
-export const CLAUDE_AGENT_SDK_VERSION = '0.3.280';
+export const CLAUDE_AGENT_SDK_VERSION = '0.3.260';
 
 const PART_SEPARATOR = '\n\n';
 const MAX_REASON_CHARS = 300;
@@ -264,7 +264,6 @@ function createSessionFor(
   let disposing = false;
   let disposed = false;
   let teardown: Promise<void> | undefined;
-  let firstRunPending = true;
 
   /**
    * What the wire says about the turn currently producing output.
@@ -559,7 +558,12 @@ function createSessionFor(
     })();
   }
 
-  /** Client uuids listed in an `interrupt_receipt_v1` response. */
+  /**
+   * Client uuids the interrupt receipt says survived the stop.
+   *
+   * `interrupt_receipt_v1` reports these on a CLI that supports it; an older
+   * CLI resolves with `undefined`, which reads here as "nothing reported".
+   */
   function survivedInterrupt(receipt: unknown, uuid: string): boolean {
     if (typeof receipt !== 'object' || receipt === null) return false;
     const queued = (receipt as { still_queued?: unknown }).still_queued;
@@ -575,8 +579,6 @@ function createSessionFor(
       rejection('illegal_state_transition', 'the claude adapter runs one turn per session at a time');
     }
     const text = promptTextFor(request.input);
-    const firstRun = firstRunPending;
-    firstRunPending = false;
 
     let settleCompletion!: (termination: ProviderRunTermination) => void;
     const completion = new Promise<ProviderRunTermination>((resolve) => {
@@ -632,16 +634,6 @@ function createSessionFor(
       // applied has to withdraw its intent, or a result the turn produced on
       // its own stays labelled as an interruption that never happened.
       if (!survivedInterrupt(receipt, run.uuid)) return;
-
-      // The pinned 0.3.280 CLI latches an interrupt received before the
-      // session's first turn arms. Its receipt *still* lists that first
-      // command under still_queued, but the pending turn is guaranteed to
-      // start already aborted (SDKControlInterruptResponse). This adapter
-      // admits only one run at a time and has submitted no other user turn,
-      // so a listed first-run uuid is precisely that prewait work. Keep the
-      // stop intent and wait for the ordinary terminal frame. Later turns do
-      // not have the first-command latch; their queued input still survives.
-      if (firstRun) return;
 
       // The submitted message outlived the stop and WILL run. The pinned
       // public `interrupt()` takes no arguments, so `cancel_queued` cannot be

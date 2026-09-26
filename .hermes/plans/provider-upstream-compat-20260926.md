@@ -6,7 +6,7 @@
 
 **Decision and acceptance**
 
-1. Respect the workspace's three-day supply-chain age: Claude Agent SDK `0.3.280` is the newest mature stable release; Codex CLI/app-server `0.156.1` is the newest mature stable CLI release at the verification cutoff. Do not install Codex as a workspace runtime dependency or bundle the proprietary Claude SDK.
+1. Respect the workspace's three-day supply-chain age and compatibility boundary: Claude Agent SDK `0.3.260` (2026-09-03) is the newest pre-latch version; newer versions (`0.3.261+`) have an ambiguous queued-interrupt receipt that cannot support the current fail-closed stop contract without a separate design. Codex CLI/app-server `0.156.1` is the newest mature stable CLI release at the verification cutoff. Do not install Codex as a workspace runtime dependency or bundle the proprietary Claude SDK.
 2. Compare authentic upstream declarations and generated stable app-server schemas with the bounded adapter seams. Preserve approval/question separation, fail-closed unknown requests, explicit capability opt-out, no provider-native IDs in public DTOs, and no expanded workspace writes.
 3. Update the catalog peer and version diagnostics plus living docs/recorded tests; add a real changeset. Keep lockfile frozen/no-op if the optional peer isn't resolved into it. Add code/test changes only for verified incompatibilities.
 4. Validate with Node from `.nvmrc`, `pnpm install --frozen-lockfile`, `pnpm gate`, production audit/license check, independent read-only compatibility review, and real no-credential Codex app-server protocol handshake. No model invocation is implied by schema/handshake verification.

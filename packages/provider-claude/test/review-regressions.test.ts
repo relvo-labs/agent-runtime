@@ -147,21 +147,13 @@ describe('claude terminal result versus interrupt rejection', () => {
   });
 
   it('reconciles a queued-survivor receipt that arrives after the result', async () => {
-    // On a later turn, `still_queued` says the stop was not applied. The
-    // pinned CLI's first-command prewait latch does not apply here.
+    // `still_queued` says the stop was not applied. Skipping that reconciliation
+    // because the run is already terminal leaves the completion mislabelled.
     const fake = createFakeQuery();
     const { session } = await openSession(fake);
-    const first = await session.startRun({
-      input: textInput('first job'),
-      sink: recordingSink().sink,
-      runRef: 'run-1',
-    });
+    const run = await session.startRun({ input: textInput('queued job'), sink: recordingSink().sink, runRef: 'run-1' });
     await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
-    await first.completion;
-    const run = await session.startRun({ input: textInput('queued job'), sink: recordingSink().sink, runRef: 'run-2' });
-    await flush();
-    const uuid = submittedUuid(fake, 1);
+    const uuid = submittedUuid(fake, 0);
 
     const release = fake.holdNextInterrupt();
     const attempt = run.interrupt('user asked to stop');
@@ -203,13 +195,9 @@ async function successThenStreamTermination(terminate: (fake: FakeQuery) => void
 }> {
   const fake = createFakeQuery();
   const { session } = await openSession(fake);
-  const first = await session.startRun({ input: textInput('first job'), sink: recordingSink().sink, runRef: 'run-1' });
+  const run = await session.startRun({ input: textInput('long job'), sink: recordingSink().sink, runRef: 'run-1' });
   await flush();
-  fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
-  await first.completion;
-  const run = await session.startRun({ input: textInput('long job'), sink: recordingSink().sink, runRef: 'run-2' });
-  await flush();
-  const uuid = submittedUuid(fake, 1);
+  const uuid = submittedUuid(fake, 0);
 
   const release = fake.holdNextInterrupt();
   const attempt = run.interrupt('user asked to stop');

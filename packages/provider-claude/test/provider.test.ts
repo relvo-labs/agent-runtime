@@ -343,58 +343,16 @@ describe('claude run interrupt', () => {
     expect(fake.returnCalls).toBe(0);
   });
 
-  it('accepts a first-command prewait interrupt even when its uuid is still queued', async () => {
-    // In the pinned 0.3.280 CLI this first turn is latched and starts already
-    // aborted; still_queued is not a promise it will run to completion.
-    const fake = createFakeQuery();
-    const { session } = await openSession(fake);
-    const run = await session.startRun({
-      input: textInput('first queued job'),
-      sink: recordingSink().sink,
-      runRef: 'run-1',
-    });
-    await flush();
-    const uuid = submittedUuid(fake);
-    fake.setInterruptReceipt({ still_queued: [uuid] });
-
-    await expect(run.interrupt('stop')).resolves.toBeUndefined();
-    fake.push({
-      type: 'result',
-      subtype: 'error_during_execution',
-      is_error: true,
-      errors: ['aborted'],
-      user_message_uuid: uuid,
-    });
-    await expect(run.completion).resolves.toEqual({ outcome: 'interrupted', reason: 'stop' });
-
-    const next = await session.startRun({
-      input: textInput('after stop'),
-      sink: recordingSink().sink,
-      runRef: 'run-2',
-    });
-    await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 1) });
-    await expect(next.completion).resolves.toEqual({ outcome: 'succeeded' });
-  });
-
-  it('refuses to claim interruption while a later turn is still queued', async () => {
-    // The first-command latch does not apply to later turns. Their survivor
-    // receipt means the command may still run; do not publish a false stop.
+  it('refuses to claim interruption while the submitted input is still queued', async () => {
+    // `still_queued` lists client uuids that survived the stop and WILL run.
+    // The pinned public `interrupt()` takes no arguments, so the survivor cannot
+    // be recalled; claiming `interrupted` would mislabel the turn that follows.
     const fake = createFakeQuery();
     const { session, events: sessionEvents } = await openSession(fake);
-    const first = await session.startRun({
-      input: textInput('first job'),
-      sink: recordingSink().sink,
-      runRef: 'run-1',
-    });
-    await flush();
-    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake) });
-    await first.completion;
-
     const recorder = recordingSink();
-    const run = await session.startRun({ input: textInput('queued job'), sink: recorder.sink, runRef: 'run-2' });
+    const run = await session.startRun({ input: textInput('queued job'), sink: recorder.sink, runRef: 'run-1' });
     await flush();
-    const uuid = submittedUuid(fake, 1);
+    const uuid = submittedUuid(fake);
     fake.setInterruptReceipt({ still_queued: [uuid] });
 
     const error = await rejectionOf(run.interrupt('stop'));
