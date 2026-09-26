@@ -16,7 +16,7 @@
  *
  * The shapes below are narrow on purpose: they describe only the fields this
  * adapter reads or writes, mirrored from `@anthropic-ai/claude-agent-sdk`
- * 0.3.259. Anything the SDK adds is carried through as `unknown` and validated
+ * 0.3.260. Anything the SDK adds is carried through as `unknown` and validated
  * at runtime, because an external process is untrusted input even when it is
  * first-party.
  */

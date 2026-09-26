@@ -32,10 +32,15 @@ await runtime.submitTurn({
 by the adapter's default binding. Install it in the host application:
 
 ```bash
-pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.259
+pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.260
 ```
 
-The peer range is the exact pin the seam was derived from (`CLAUDE_AGENT_SDK_VERSION`).
+The optional peer accepts `>=0.3.259 <0.3.261` (stable releases only); install
+either `0.3.259` or the recommended recorded baseline `0.3.260`. This is the
+**Agent SDK** version, not a compatibility claim for an arbitrary standalone
+`claude` executable on `PATH` (this adapter does not spawn one). The published
+peer window is deliberately separate from the exact catalog baseline and from
+`CLAUDE_AGENT_SDK_VERSION` (which records the version used for the seam).
 
 It is a peer, not a dependency, because it is published under Anthropic's proprietary
 terms and ships a per-platform native payload of roughly 200 MB. Making it a runtime
@@ -63,12 +68,17 @@ has been observed against a real Claude model.
 | Bridges host permission prompts             | Deterministic tests invoke the installed `canUseTool` exactly as the SDK does — approve, deny, unsupported mode/kind, unknown, cross-session, redelivered, conflicting, unattributable, and every teardown path. |
 | Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                              |
 
-The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.259**
-(`CLAUDE_AGENT_SDK_VERSION`), which is the pinned peer range. There is no captured
+The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.260**
+(`CLAUDE_AGENT_SDK_VERSION`); the separately checked `0.3.259` is also within the
+published peer window. There is no captured
 live-model acceptance for this adapter anywhere in this repository, so a behaviour this
 adapter infers from the SDK's documented message shapes — correlation fields, interrupt
 receipts, terminal subtypes — is verified only to the extent that those shapes are what the
-SDK actually emits at that version.
+SDK actually emits at that version. Later SDK releases (`0.3.261+`) add a
+first-command prewait interrupt latch: the same `still_queued` receipt can mean
+a prompt is already abort-latched or that it will run later. The adapter
+cannot infer a safe stop acknowledgement from that receipt alone. Do not
+extend the peer window beyond `0.3.260` without a separately verified reconciliation design.
 
 Do not read `'live'` as "verified against a live model". Those are different claims and
 only the first is made here.
@@ -161,7 +171,7 @@ published; the category (`command`, `file_write`, `network`, `tool`) is an advis
 derived from the tool name, not an enforced classification. A host that needs the arguments
 to decide wraps `query` in its own binding, where it sees the full `canUseTool` context.
 
-One limitation, stated rather than papered over: a permission callback in 0.3.259 carries
+One limitation, stated rather than papered over: a permission callback in 0.3.260 carries
 no `user_message_uuid`, so it cannot be correlated the way a message frame is. Attribution
 rests on this adapter running one turn per session at a time plus the stream binding — a
 prompt is raised for the active run only while nothing contradicts it, and is denied
@@ -235,7 +245,7 @@ is emitted on that run's sink, so the interaction settles `withdrawn`, its routi
 a later answer is `interaction_already_settled`, the next question can be raised, and the
 run's own success stays a success instead of becoming a `provider_contract_violation`.
 
-In the pinned SDK 0.3.259, `tools` controls the available tool inventory; `allowedTools`
+In the pinned SDK 0.3.260, `tools` controls the available tool inventory; `allowedTools`
 auto-approves tool calls. This adapter forwards `allowedTools` but does not expose the
 SDK's `tools` option. Do not add `AskUserQuestion` to `allowedTools` to enable questions:
 auto-approved calls bypass `canUseTool`, preventing this bridge from creating a structured
@@ -314,7 +324,7 @@ const provider = createClaudeProvider({
 });
 ```
 
-The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.259** (`CLAUDE_AGENT_SDK_VERSION`).
+The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.260** (`CLAUDE_AGENT_SDK_VERSION`).
 `ClaudeQueryOptions` is what an injected `query` **receives**, so note that its
 `permissionPrompts` is now `'host' | 'none'` rather than the literal `'none'`, and it may
 carry an optional `canUseTool`. An implementation that annotated its own parameter with the

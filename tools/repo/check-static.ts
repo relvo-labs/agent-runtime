@@ -117,6 +117,9 @@ if (claudeManifest.dependencies?.[CLAUDE_SDK_PACKAGE] !== undefined) {
 if (claudeManifest.peerDependencies?.[CLAUDE_SDK_PACKAGE] === undefined) {
   problems.push(`packages/provider-claude: ${CLAUDE_SDK_PACKAGE} must be declared as a peer dependency`);
 }
+if (claudeManifest.peerDependencies?.[CLAUDE_SDK_PACKAGE] !== '>=0.3.259 <0.3.261') {
+  problems.push(`packages/provider-claude: ${CLAUDE_SDK_PACKAGE} must declare only the reviewed pre-latch window`);
+}
 if (claudeManifest.peerDependenciesMeta?.[CLAUDE_SDK_PACKAGE]?.optional !== true) {
   problems.push(`packages/provider-claude: the ${CLAUDE_SDK_PACKAGE} peer must be optional`);
 }

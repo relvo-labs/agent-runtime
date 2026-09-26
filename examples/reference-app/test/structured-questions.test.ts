@@ -17,8 +17,8 @@
  *
  * **No authentic provider or model call is made by this file.** The frames
  * below are hand-built instances of the pinned official shapes
- * (`AskUserQuestionInput` from `@anthropic-ai/claude-agent-sdk@0.3.259`;
- * `ToolRequestUserInputParams` from codex-cli 0.153.4). They prove the adapter
+ * (`AskUserQuestionInput` from `@anthropic-ai/claude-agent-sdk@0.3.260`;
+ * `ToolRequestUserInputParams` from codex-cli 0.156.1). They prove the adapter
  * handles the official shape; they do not prove the shipped provider emits it.
  */
 
@@ -502,7 +502,10 @@ function fakeCodexTransport() {
       send(message: Record<string, unknown>): void {
         sent.push(message);
         const { id, method } = message;
-        if (method === 'initialize') emit({ id, result: { userAgent: 'fixture' } });
+        if (method === 'initialize') {
+          const name = (message.params as { clientInfo: { name: string } }).clientInfo.name;
+          emit({ id, result: { userAgent: `${name}/0.156.1 (test; x86_64)` } });
+        }
         if (method === 'thread/start') emit({ id, result: { thread: { id: CODEX_THREAD } } });
         if (method === 'turn/start') emit({ id, result: { turn: { id: CODEX_TURN } } });
         if (method === 'turn/interrupt') emit({ id, result: {} });

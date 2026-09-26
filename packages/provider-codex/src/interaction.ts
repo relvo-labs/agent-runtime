@@ -12,7 +12,7 @@
  * question is the model asking the *user* something and an approval is the
  * model asking permission to *act*.
  *
- * ## The mapping table, pinned to codex-cli 0.153.4 (stable surface only)
+ * ## The mapping table, pinned to codex-cli 0.156.1 (stable surface only)
  *
  * | `ServerRequest` method                   | Bridged | Why                                                                                                                          |
  * | ---------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------- |
@@ -147,7 +147,7 @@ function refused(reason: ApprovalRefusal): ApprovalTranslation {
 }
 
 /**
- * Private native schema derived from the 0.153.4 stable generated
+ * Private native schema derived from the 0.156.1 stable generated
  * CommandExecutionRequestApprovalParams.json and its CommandAction definitions.
  * JSON Schema defaults make kind/environment optional (unlike generated TS).
  * Close every object deliberately: unknown context must not silently disappear.
@@ -278,7 +278,7 @@ export type QuestionRefusal =
   | 'neutral_bounds';
 
 /**
- * Private native schema derived from the 0.153.4 generated
+ * Private native schema derived from the 0.156.1 generated
  * `ToolRequestUserInputParams.json`. The JSON Schema gives `isOther`,
  * `isSecret` and `autoResolutionMs` defaults, so they are optional on the wire
  * even though the generated TypeScript declares them required. Closed
@@ -404,7 +404,7 @@ export function translateUserInputRequest(params: unknown): QuestionTranslation 
       prompt: question.question,
       ...(question.header === '' ? {} : { header: question.header }),
       ...(choices.length === 0 ? {} : { choices }),
-      // `ToolRequestUserInputQuestion` has no multi-select field in 0.153.4.
+      // `ToolRequestUserInputQuestion` has no multi-select field in 0.156.1.
       // The answer is an array, so several answers are *representable*, but
       // nothing in the request says several are *permitted* — so none is
       // offered rather than guessed at.

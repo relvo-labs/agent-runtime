@@ -223,12 +223,12 @@ export function classifyServerMessage(value: unknown): CodexServerMessage | unde
 }
 
 // ---------------------------------------------------------------------------
-// Method names — pinned to the 0.153.4 stable surface
+// Method names — pinned to the 0.156.1 stable surface
 // ---------------------------------------------------------------------------
 
 /**
  * Every method this adapter sends or reads, verified present in
- * `typescript-stable/` for codex-cli 0.153.4. Nothing experimental appears here.
+ * `typescript-stable/` for codex-cli 0.156.1. Nothing experimental appears here.
  */
 export const CODEX_METHOD = {
   initialize: 'initialize',
@@ -279,7 +279,7 @@ export function asServerRequestResolved(
 
 /**
  * Every server-initiated request in the pinned stable surface
- * (`typescript-stable/ServerRequest.ts`, codex-cli 0.153.4).
+ * (`typescript-stable/ServerRequest.ts`, codex-cli 0.156.1).
  *
  * This adapter bridges exactly one of them —
  * `item/commandExecution/requestApproval`, and only when

@@ -108,7 +108,7 @@ export type CodexProviderOptions = {
    *
    * **No capability opt-in accompanies this.** `initialize.params.capabilities`
    * stays `null`: `item/tool/requestUserInput` and its parameter types are in
-   * the pinned *stable* generated surface for 0.153.4, byte-identical to their
+   * the pinned *stable* generated surface for 0.156.1, byte-identical to their
    * `--experimental` counterparts, while genuinely experimental methods such as
    * `thread/queue/*` are absent from that surface. Setting `experimentalApi`
    * would additionally widen `CommandExecutionRequestApprovalParams`, which the

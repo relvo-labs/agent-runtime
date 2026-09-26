@@ -9,7 +9,7 @@
  *
  * What is maintained here instead is a *recorded* description of the exact
  * entry point this adapter uses, authored from the published contract of
- * `@anthropic-ai/claude-agent-sdk@0.3.259` — names and shapes required for
+ * `@anthropic-ai/claude-agent-sdk@0.3.260` — names and shapes required for
  * interoperability, no copied text. The assertions below are compile-time:
  * `pnpm --filter @relvo-labs/agent-provider-claude typecheck` (and the gate's
  * workspace typecheck, which includes `test/**`) fails if the seam stops
@@ -45,10 +45,10 @@ import type {
 } from '../src/seam.ts';
 
 /** The SDK release this recording was derived from. */
-const RECORDED_SDK_VERSION = '0.3.259';
+const RECORDED_SDK_VERSION = '0.3.260';
 
 // ---------------------------------------------------------------------------
-// Recorded SDK surface (0.3.259)
+// Recorded SDK surface (0.3.260)
 // ---------------------------------------------------------------------------
 
 type RecordedUuid = `${string}-${string}-${string}-${string}-${string}`;
@@ -70,7 +70,7 @@ type RecordedDecisionClassification = 'user_temporary' | 'user_permanent' | 'use
 /**
  * `PermissionResult` — what the host callback may answer with.
  *
- * `decisionClassification` is recorded on both branches because 0.3.259
+ * `decisionClassification` is recorded on both branches because 0.3.260
  * declares it on both. This adapter does not return it: the classification it
  * could honestly report is already implied by a `once` grant or a denial, and
  * emitting one would state a durability this bridge does not implement.
@@ -264,6 +264,6 @@ describe('pinned SDK contract', () => {
     // Deliberate limitation, kept visible: this file proves seam ↔ recording,
     // never recording ↔ the SDK on disk, which policy keeps out of this
     // workspace. The header documents the out-of-repository step.
-    expect(RECORDED_SDK_VERSION).toBe('0.3.259');
+    expect(RECORDED_SDK_VERSION).toBe('0.3.260');
   });
 });

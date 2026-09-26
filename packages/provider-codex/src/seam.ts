@@ -2,7 +2,7 @@
  * The transport seam.
  *
  * These types are hand-authored against the pinned Codex app-server protocol
- * (codex-cli 0.153.4, upstream `openai/codex@3d2ee51c`). They are deliberately
+ * (codex-cli 0.156.1, upstream `openai/codex@b412ff32`). They are deliberately
  * **not** generated from, or imported out of, any Codex package: this adapter
  * has no Codex npm dependency at all, so nothing here can drag a third-party
  * runtime closure — or its licence — into a published artifact.

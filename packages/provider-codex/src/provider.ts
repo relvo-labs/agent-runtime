@@ -19,7 +19,7 @@
  * Native identity — thread ids, turn ids, item ids, request ids, the child
  * process — stays inside this package. Nothing below emits it.
  *
- * Pinned against codex-cli 0.153.4 (`openai/codex@3d2ee51c`), **stable**
+ * Pinned against codex-cli 0.156.1 (`openai/codex@b412ff32`), **stable**
  * protocol surface only: `initialize.params.capabilities` is sent as `null`,
  * which by construction cannot opt into `experimentalApi`.
  */
@@ -59,6 +59,7 @@ import {
 } from './interaction.ts';
 import { CodexSessionOptionsSchema, type CodexProviderOptions, type CodexSessionOptions } from './options.ts';
 import { CODEX_APP_SERVER_VERSION, createCodexStdioTransport } from './transport.ts';
+import { CODEX_SUPPORTED_APP_SERVER_VERSIONS, isCompatibleCodexUserAgent } from './version.ts';
 import {
   classifyThrown,
   correlationOf,
@@ -844,14 +845,26 @@ async function openConnection(
   // shape that cannot opt into `experimentalApi` or `requestAttestation` —
   // and because attestation is not requested, `attestation/generate` is never
   // sent to this client.
-  await client.request(CODEX_METHOD.initialize, {
+  const clientName = options.clientName ?? 'relvo_agent_runtime';
+  const initialized = await client.request(CODEX_METHOD.initialize, {
     clientInfo: {
-      name: options.clientName ?? 'relvo_agent_runtime',
+      name: clientName,
       title: 'Relvo Agent Runtime',
       version: options.clientVersion ?? CODEX_ADAPTER_VERSION,
     },
     capabilities: null,
   });
+  // InitializeResponse.userAgent is the only stable-response field carrying
+  // the running CLI version. Reject unknown or out-of-window formats *before*
+  // thread/start can bind a workspace or any turn can execute. Do not echo
+  // untrusted server text into durable AgentError fields.
+  if (!isCompatibleCodexUserAgent(asRecord(initialized)?.userAgent, clientName)) {
+    throw new ProviderRejection(
+      agentError('provider_unavailable', 'codex app-server version is outside the reviewed compatibility window', {
+        providerCode: 'unsupported_app_server_version',
+      }),
+    );
+  }
   client.notify(CODEX_METHOD.initialized);
 
   const sandbox = overrides.sandboxMode ?? options.sandboxMode ?? 'read-only';
@@ -1041,6 +1054,7 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
     recovery: {},
     extensions: {
       appServerVersion: CODEX_APP_SERVER_VERSION,
+      supportedAppServerVersions: [...CODEX_SUPPORTED_APP_SERVER_VERSIONS],
       protocolSurface: 'stable',
       transport: 'stdio-jsonl',
       /** Deltas arrive per streamed text fragment, not per whole message. */

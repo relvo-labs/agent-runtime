@@ -13,7 +13,7 @@
  * { behavior: 'allow', updatedInput: { questions, answers: { [questionText]: answerString } } }
  * ```
  *
- * `answers` is declared in `@anthropic-ai/claude-agent-sdk@0.3.259`'s generated
+ * `answers` is declared in `@anthropic-ai/claude-agent-sdk@0.3.260`'s generated
  * tool schemas as "User answers collected by the permission component", and the
  * CLI hands the same map back as `AskUserQuestionOutput.answers`. This is a
  * structured tool path, not an approval: a bare `{behavior:'allow'}` would run

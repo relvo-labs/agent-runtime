@@ -117,6 +117,14 @@ describe('descriptor', () => {
     expect(descriptor.recovery.exportsRecoveryRecord).toBe(false);
     expect(descriptor.workspace.requires).toBe('directory');
     expect(descriptor.extensions.protocolSurface).toBe('stable');
+    expect(descriptor.extensions.supportedAppServerVersions).toEqual([
+      '0.153.4',
+      '0.154.0',
+      '0.155.0',
+      '0.155.1',
+      '0.156.0',
+      '0.156.1',
+    ]);
   });
 
   it('reports the package as live', () => {
@@ -193,6 +201,34 @@ describe('handshake', () => {
     expect(fake.requests('initialize')[0]?.params).toMatchObject({
       clientInfo: { name: 'acme_ide', version: '9.9.9' },
     });
+  });
+
+  it('accepts the oldest reviewed CLI and refuses an unsupported version before starting a thread', async () => {
+    const old = defaultResponders();
+    old.initialize = (params) => ({
+      userAgent: `${(params as { clientInfo: { name: string } }).clientInfo.name}/0.153.4 (test; x86_64)`,
+    });
+    const accepted = await openSession({}, old);
+    expect(accepted.fake.requests('thread/start')).toHaveLength(1);
+    await accepted.session.dispose();
+
+    const future = defaultResponders();
+    future.initialize = () => ({ userAgent: 'relvo_agent_runtime/0.157.0 (test; x86_64)' });
+    const fake = createFakeTransport({ responders: future });
+    const provider = createCodexProvider({ transport: () => fake.transport });
+    await expect(
+      provider.createSession({
+        options: {},
+        workspace: { root: '/workspace', ownership: 'borrowed' },
+        sink: createSink().sink,
+      }),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        isProviderRejection(error) && error.agentError.providerCode === 'unsupported_app_server_version',
+    );
+    expect(fake.requests('thread/start')).toHaveLength(0);
+    expect(fake.closeCalls).toBe(1);
+    expect(provider.abandonedConnectionCount).toBe(0);
   });
 
   it('rejects a relative or empty workspace root', async () => {

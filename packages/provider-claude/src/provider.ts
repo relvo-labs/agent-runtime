@@ -56,7 +56,7 @@ export const CLAUDE_PROVIDER_ID = 'claude';
 /** This adapter's own version, reported for diagnostics. Not the wire version. */
 export const CLAUDE_ADAPTER_VERSION = '0.1.0';
 /** The SDK line the query seam in `seam.ts` mirrors. */
-export const CLAUDE_AGENT_SDK_VERSION = '0.3.259';
+export const CLAUDE_AGENT_SDK_VERSION = '0.3.260';
 
 const PART_SEPARATOR = '\n\n';
 const MAX_REASON_CHARS = 300;
