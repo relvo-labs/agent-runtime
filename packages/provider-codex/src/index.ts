@@ -29,6 +29,8 @@ export {
   createCodexStdioTransport,
   CODEX_APP_SERVER_ARGV,
   CODEX_APP_SERVER_VERSION,
+  CODEX_APP_SERVER_MIN_VERSION,
+  CODEX_APP_SERVER_MAX_VERSION,
   CODEX_DEFAULT_EXECUTABLE,
   type CodexStdioTransportConfig,
 } from './transport.ts';

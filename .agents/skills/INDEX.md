@@ -109,7 +109,7 @@ Regenerate with `pnpm skills:index`. Verify with `pnpm skills:check`.
 
 ### `pnpm-supply-chain`
 
-- **Version:** 1.0.0 (stable)
+- **Version:** 1.1.0 (stable)
 - **Path:** `.agents/skills/pnpm-supply-chain/SKILL.md`
 - **Description:** Add or update third-party dependencies, keep the lockfile authoritative and keep dependency lifecycle scripts denied by default.
 - **Tags:** `audit`, `catalog`, `dependencies`, `install-scripts`, `lockfile`, `pnpm`

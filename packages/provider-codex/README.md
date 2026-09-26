@@ -12,7 +12,19 @@ Upstream labels the `codex app-server` subcommand itself `[experimental]`. This 
 
 ### Protocol evidence
 
-Pinned to **codex-cli 0.156.1** — upstream `openai/codex` tree `b412ff32c417f855c2b2d1581b77058eed87c84b`, release tag `rust-v0.156.1`.
+The recorded stable-protocol seam baseline is **codex-cli 0.156.1** — upstream `openai/codex` tree `b412ff32c417f855c2b2d1581b77058eed87c84b`, release tag `rust-v0.156.1`.
+
+The supported host executable window is the reviewed stable releases **0.153.4, 0.154.0,
+0.155.0, 0.155.1, 0.156.0, 0.156.1**, inclusive endpoints. It is a finite allowlist, not a
+promise that any as-yet-unreviewed release inside a numerical interval will work. After
+`initialize` and before `thread/start`, the adapter checks the server's reported
+`InitializeResponse.userAgent` version. An unknown format, prerelease, older or newer
+version rejects with `provider_unavailable` / `unsupported_app_server_version`, and the
+half-open connection is closed. Custom host-managed transports must supply the same
+initialize response; the adapter cannot authenticate that self-reported version. The
+exported `CODEX_APP_SERVER_VERSION` identifies the seam baseline, while
+`CODEX_APP_SERVER_MIN_VERSION` / `CODEX_APP_SERVER_MAX_VERSION` and
+`descriptor.extensions.supportedAppServerVersions` describe the reviewed window.
 
 The wire types in `seam.ts` are hand-authored against that release's generated stable schemas — `json-schema-stable/` and `typescript-stable/`, produced by `codex app-server generate-json-schema` / `generate-ts` without `--experimental`. **Those generated schemas are the primary evidence.** The hand-authored types and the test fixtures are derived from them and cite the exact source file at the point of use; where the two ever disagree, the schema is correct and this package has a bug.
 
@@ -20,10 +32,10 @@ The wire types in `seam.ts` are hand-authored against that release's generated s
 
 ### Evidence classification
 
-| Claim                                       | Evidence                                                                                                                                                        |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire compatibility with 0.156.1 stable      | Deterministic tests against the pinned frame shapes, plus an end-to-end suite driving the real production transport over real pipes to a local stand-in server. |
-| Behaviour against a live credentialed model | **None.** No test in this repository executes a real Codex turn, and none is permitted to: the gate is credential-free and network-free by policy.              |
+| Claim                                                | Evidence                                                                                                                                                                                                 |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire compatibility with reviewed stable CLI releases | Generated schemas and no-credential initialize/thread-start handshakes for each release in the window, deterministic frame tests against the baseline and real production transport to a local stand-in. |
+| Behaviour against a live credentialed model          | **None.** No test in this repository executes a real Codex turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                       |
 
 Do not read "compatible" as "verified against a live model". Those are different claims and only the first is made here.
 

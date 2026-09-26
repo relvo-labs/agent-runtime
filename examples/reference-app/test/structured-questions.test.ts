@@ -502,7 +502,10 @@ function fakeCodexTransport() {
       send(message: Record<string, unknown>): void {
         sent.push(message);
         const { id, method } = message;
-        if (method === 'initialize') emit({ id, result: { userAgent: 'fixture' } });
+        if (method === 'initialize') {
+          const name = (message.params as { clientInfo: { name: string } }).clientInfo.name;
+          emit({ id, result: { userAgent: `${name}/0.156.1 (test; x86_64)` } });
+        }
         if (method === 'thread/start') emit({ id, result: { thread: { id: CODEX_THREAD } } });
         if (method === 'turn/start') emit({ id, result: { turn: { id: CODEX_TURN } } });
         if (method === 'turn/interrupt') emit({ id, result: {} });

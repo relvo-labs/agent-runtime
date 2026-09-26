@@ -58,6 +58,8 @@ import {
   CODEX_BRIDGED_QUESTION,
   CODEX_ADAPTER_VERSION,
   CODEX_APP_SERVER_ARGV,
+  CODEX_APP_SERVER_MAX_VERSION,
+  CODEX_APP_SERVER_MIN_VERSION,
   CODEX_APP_SERVER_VERSION,
   CODEX_DEFAULT_EXECUTABLE,
   CODEX_PROVIDER_ID,
@@ -413,6 +415,10 @@ void CODEX_ADAPTER_VERSION;
 void CODEX_APP_SERVER_ARGV;
 const pinnedCodexVersion: '0.156.1' = CODEX_APP_SERVER_VERSION;
 void pinnedCodexVersion;
+const oldestCodexVersion: '0.153.4' = CODEX_APP_SERVER_MIN_VERSION;
+const newestCodexVersion: '0.156.1' = CODEX_APP_SERVER_MAX_VERSION;
+void oldestCodexVersion;
+void newestCodexVersion;
 void CODEX_PROVIDER_ID;
 void codexSessionOptions;
 void codexSandboxMode;

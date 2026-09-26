@@ -143,7 +143,7 @@ process.stdin.on('end', () => { if (MODE !== 'ignore-term') process.exit(0); });
 function handle(message) {
   switch (message.method) {
     case 'initialize':
-      send({ id: message.id, result: { userAgent: 'fake', codexHome: '/tmp/codex', platformFamily: 'unix', platformOs: 'linux' } });
+      send({ id: message.id, result: { userAgent: (message.params?.clientInfo?.name ?? 'relvo_agent_runtime') + '/0.156.1 (test; x86_64)', codexHome: '/tmp/codex', platformFamily: 'unix', platformOs: 'linux' } });
       return;
     case 'initialized':
       return;

@@ -27,6 +27,14 @@ function checkDependencyMap(owner: string, dependencies: Record<string, string> 
   for (const [name, specifier] of Object.entries(dependencies ?? {})) {
     if (name.startsWith('@relvo-labs/')) {
       if (specifier !== 'workspace:^') problems.push(`${owner}: workspace dependency ${name} must use workspace:^`);
+    } else if (
+      owner === 'packages/provider-claude peerDependencies' &&
+      name === '@anthropic-ai/claude-agent-sdk' &&
+      specifier === '>=0.3.259 <0.3.261'
+    ) {
+      // A published optional peer is not resolved into this workspace. Keep its
+      // *tested compatibility window* distinct from the exact catalog baseline.
+      continue;
     } else if (specifier !== 'catalog:') {
       problems.push(`${owner}: third-party dependency ${name} must use catalog:`);
     }
@@ -54,4 +62,6 @@ if (problems.length > 0) {
   for (const problem of problems) process.stderr.write(`supply-chain: ${problem}\n`);
   process.exit(1);
 }
-process.stdout.write('supply-chain: OK — exact catalog pins, strict 3-day cooldown, lifecycle scripts denied\n');
+process.stdout.write(
+  'supply-chain: OK — exact catalog pins, bounded optional Claude peer, strict 3-day cooldown, lifecycle scripts denied\n',
+);

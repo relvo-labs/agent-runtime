@@ -1,7 +1,7 @@
 ---
 name: pnpm-supply-chain
 description: Add or update third-party dependencies, keep the lockfile authoritative and keep dependency lifecycle scripts denied by default.
-version: 1.0.0
+version: 1.1.0
 stability: stable
 tags: [pnpm, lockfile, dependencies, catalog, install-scripts, audit]
 ---
@@ -72,6 +72,14 @@ Do not use this skill when:
 
    Never write a literal range in a package. Exact pins plus a committed lockfile give a
    reproducible tree; ranges give a lockfile that drifts on every unrelated install.
+
+   Exception: the proprietary Claude Agent SDK is a host-installed **optional peer**,
+   not a workspace resolution. Its explicitly checked published range
+   `>=0.3.259 <0.3.261` names the releases whose SDK seam/lifecycle were
+   reviewed; `catalog:` still pins the exact recorded baseline `0.3.260`.
+   Do not widen this exception based only on semver, a typecheck, or a handshake:
+   check queued-interrupt semantics and the packed peer manifest first. See
+   `docs/adr/ADR-0013-supply-chain-policy.md`.
 
 3. **Verify compatibility, do not assume latest works.** Check `engines` and
    `peerDependencies` of the candidate against our Node matrix and our TypeScript line

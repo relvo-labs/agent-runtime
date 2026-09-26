@@ -77,8 +77,8 @@ export const FAKE_TURN_ID = 'turn-0199a0b1-0000-7000-8000-000000000002';
 export function defaultResponders(): Record<string, Responder> {
   return {
     // `InitializeResponse.ts`
-    initialize: () => ({
-      userAgent: 'codex-test-agent',
+    initialize: (params) => ({
+      userAgent: `${(params as { clientInfo: { name: string } }).clientInfo.name}/0.156.1 (test; x86_64)`,
       codexHome: '/home/example/.codex',
       platformFamily: 'unix',
       platformOs: 'linux',
