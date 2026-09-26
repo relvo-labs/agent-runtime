@@ -66,11 +66,11 @@ export const FAKE_THREAD_ID = 'thread-0199a0b1-0000-7000-8000-000000000001';
 export const FAKE_TURN_ID = 'turn-0199a0b1-0000-7000-8000-000000000002';
 
 /**
- * The responses a healthy 0.153.4 app-server gives for the bounded surface.
+ * The responses a healthy 0.156.1 app-server gives for the bounded surface.
  *
  * These are handwritten fixtures, so they are *secondary* evidence. The
  * generated stable schemas are primary, and each shape below names the exact
- * file in `codex-protocol-evidence-0.153.4/typescript-stable/` it was derived
+ * file in `codex-protocol-evidence-0.156.1/typescript-stable/` it was derived
  * from. If a fixture and its cited schema ever disagree, the schema is right and
  * the fixture is a bug.
  */

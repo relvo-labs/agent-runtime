@@ -32,7 +32,7 @@ await runtime.submitTurn({
 by the adapter's default binding. Install it in the host application:
 
 ```bash
-pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.259
+pnpm add @relvo-labs/agent-provider-claude @anthropic-ai/claude-agent-sdk@0.3.280
 ```
 
 The peer range is the exact pin the seam was derived from (`CLAUDE_AGENT_SDK_VERSION`).
@@ -63,7 +63,7 @@ has been observed against a real Claude model.
 | Bridges host permission prompts             | Deterministic tests invoke the installed `canUseTool` exactly as the SDK does — approve, deny, unsupported mode/kind, unknown, cross-session, redelivered, conflicting, unattributable, and every teardown path. |
 | Behaviour against a live credentialed model | **None.** No test in this repository executes a real Claude turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                              |
 
-The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.259**
+The seam is hand-authored against `@anthropic-ai/claude-agent-sdk` **0.3.280**
 (`CLAUDE_AGENT_SDK_VERSION`), which is the pinned peer range. There is no captured
 live-model acceptance for this adapter anywhere in this repository, so a behaviour this
 adapter infers from the SDK's documented message shapes — correlation fields, interrupt
@@ -161,7 +161,7 @@ published; the category (`command`, `file_write`, `network`, `tool`) is an advis
 derived from the tool name, not an enforced classification. A host that needs the arguments
 to decide wraps `query` in its own binding, where it sees the full `canUseTool` context.
 
-One limitation, stated rather than papered over: a permission callback in 0.3.259 carries
+One limitation, stated rather than papered over: a permission callback in 0.3.280 carries
 no `user_message_uuid`, so it cannot be correlated the way a message frame is. Attribution
 rests on this adapter running one turn per session at a time plus the stream binding — a
 prompt is raised for the active run only while nothing contradicts it, and is denied
@@ -235,7 +235,7 @@ is emitted on that run's sink, so the interaction settles `withdrawn`, its routi
 a later answer is `interaction_already_settled`, the next question can be raised, and the
 run's own success stays a success instead of becoming a `provider_contract_violation`.
 
-In the pinned SDK 0.3.259, `tools` controls the available tool inventory; `allowedTools`
+In the pinned SDK 0.3.280, `tools` controls the available tool inventory; `allowedTools`
 auto-approves tool calls. This adapter forwards `allowedTools` but does not expose the
 SDK's `tools` option. Do not add `AskUserQuestion` to `allowedTools` to enable questions:
 auto-approved calls bypass `canUseTool`, preventing this bridge from creating a structured
@@ -314,7 +314,7 @@ const provider = createClaudeProvider({
 });
 ```
 
-The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.259** (`CLAUDE_AGENT_SDK_VERSION`).
+The seam mirrors `@anthropic-ai/claude-agent-sdk` **0.3.280** (`CLAUDE_AGENT_SDK_VERSION`).
 `ClaudeQueryOptions` is what an injected `query` **receives**, so note that its
 `permissionPrompts` is now `'host' | 'none'` rather than the literal `'none'`, and it may
 carry an optional `canUseTool`. An implementation that annotated its own parameter with the

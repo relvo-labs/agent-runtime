@@ -2,7 +2,7 @@
  * The `item/tool/requestUserInput` bridge, end to end, with no process and no
  * credentials.
  *
- * Every frame below is a hand-built instance of the pinned 0.153.4
+ * Every frame below is a hand-built instance of the pinned 0.156.1
  * `ToolRequestUserInputParams` / `ToolRequestUserInputResponse` shapes, pushed
  * through the transport seam, so each ordering is a fact about the adapter
  * rather than a race that settled the right way.

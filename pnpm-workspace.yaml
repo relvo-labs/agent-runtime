@@ -20,8 +20,9 @@ catalog:
   # this workspace: the package is published under Anthropic's proprietary
   # terms and carries a ~200 MB per-platform native payload, so the adapter
   # resolves it at runtime from the host's own installation instead.
-  # 0.3.259 is the newest release older than the 3-day cooldown window.
-  '@anthropic-ai/claude-agent-sdk': 0.3.259
+  # 0.3.280 (2026-09-22) is the newest stable release older than the
+  # 3-day cooldown at this upgrade's verification time (2026-09-26).
+  '@anthropic-ai/claude-agent-sdk': 0.3.280
 
   # --- toolchain (dev only) ------------------------------------------------
   # The npm CLI this repository publishes with, and the one the release

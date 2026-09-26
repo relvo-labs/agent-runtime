@@ -19,7 +19,7 @@
  * Native identity — thread ids, turn ids, item ids, request ids, the child
  * process — stays inside this package. Nothing below emits it.
  *
- * Pinned against codex-cli 0.153.4 (`openai/codex@3d2ee51c`), **stable**
+ * Pinned against codex-cli 0.156.1 (`openai/codex@b412ff32`), **stable**
  * protocol surface only: `initialize.params.capabilities` is sent as `null`,
  * which by construction cannot opt into `experimentalApi`.
  */

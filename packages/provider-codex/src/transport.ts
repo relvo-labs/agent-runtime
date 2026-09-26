@@ -46,7 +46,7 @@ export const CODEX_APP_SERVER_ARGV: readonly string[] = ['app-server', '--stdio'
 export const CODEX_DEFAULT_EXECUTABLE = 'codex';
 
 /** The upstream release this transport and the seam types were pinned against. */
-export const CODEX_APP_SERVER_VERSION = '0.153.4';
+export const CODEX_APP_SERVER_VERSION = '0.156.1';
 
 /** How long a closing connection may take to exit on its own before SIGTERM. */
 export const DEFAULT_CLOSE_GRACE_MS = 2_000;

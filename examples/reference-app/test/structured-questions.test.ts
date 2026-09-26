@@ -17,8 +17,8 @@
  *
  * **No authentic provider or model call is made by this file.** The frames
  * below are hand-built instances of the pinned official shapes
- * (`AskUserQuestionInput` from `@anthropic-ai/claude-agent-sdk@0.3.259`;
- * `ToolRequestUserInputParams` from codex-cli 0.153.4). They prove the adapter
+ * (`AskUserQuestionInput` from `@anthropic-ai/claude-agent-sdk@0.3.280`;
+ * `ToolRequestUserInputParams` from codex-cli 0.156.1). They prove the adapter
  * handles the official shape; they do not prove the shipped provider emits it.
  */
 

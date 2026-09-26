@@ -176,7 +176,7 @@ describe('frame classification', () => {
 });
 
 describe('pinned method names', () => {
-  it('names only stable 0.153.4 methods', () => {
+  it('names only stable 0.156.1 methods', () => {
     expect(CODEX_METHOD).toEqual({
       initialize: 'initialize',
       initialized: 'initialized',

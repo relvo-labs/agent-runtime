@@ -12,8 +12,8 @@
  * supplies the executable (or its own transport). That keeps the published
  * runtime closure permissive and free of a large platform payload.
  *
- * Pinned against **codex-cli 0.153.4** (`openai/codex@3d2ee51c`, tag
- * `rust-v0.153.4`), **stable** protocol surface only — `initialize` sends
+ * Pinned against **codex-cli 0.156.1** (`openai/codex@b412ff32`, tag
+ * `rust-v0.156.1`), **stable** protocol surface only — `initialize` sends
  * `capabilities: null`, which cannot opt into the experimental API.
  */
 

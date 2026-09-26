@@ -7,7 +7,7 @@
  *
  * The child is a small Node program passed with `-e`, so the suite stays
  * credential-free, network-free, and needs no Codex installation. It speaks the
- * pinned 0.153.4 frame shapes and always terminates.
+ * pinned 0.156.1 frame shapes and always terminates.
  *
  * Every test here runs inside `withFixture`, which bounds each wait and cleans
  * up the exact processes it created — see `fixture.ts`. Nothing in this file

@@ -12,7 +12,7 @@ Upstream labels the `codex app-server` subcommand itself `[experimental]`. This 
 
 ### Protocol evidence
 
-Pinned to **codex-cli 0.153.4** — upstream `openai/codex` tree `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`, release tag `rust-v0.153.4`.
+Pinned to **codex-cli 0.156.1** — upstream `openai/codex` tree `b412ff32c417f855c2b2d1581b77058eed87c84b`, release tag `rust-v0.156.1`.
 
 The wire types in `seam.ts` are hand-authored against that release's generated stable schemas — `json-schema-stable/` and `typescript-stable/`, produced by `codex app-server generate-json-schema` / `generate-ts` without `--experimental`. **Those generated schemas are the primary evidence.** The hand-authored types and the test fixtures are derived from them and cite the exact source file at the point of use; where the two ever disagree, the schema is correct and this package has a bug.
 
@@ -22,7 +22,7 @@ The wire types in `seam.ts` are hand-authored against that release's generated s
 
 | Claim                                       | Evidence                                                                                                                                                        |
 | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire compatibility with 0.153.4 stable      | Deterministic tests against the pinned frame shapes, plus an end-to-end suite driving the real production transport over real pipes to a local stand-in server. |
+| Wire compatibility with 0.156.1 stable      | Deterministic tests against the pinned frame shapes, plus an end-to-end suite driving the real production transport over real pipes to a local stand-in server. |
 | Behaviour against a live credentialed model | **None.** No test in this repository executes a real Codex turn, and none is permitted to: the gate is credential-free and network-free by policy.              |
 
 Do not read "compatible" as "verified against a live model". Those are different claims and only the first is made here.
@@ -89,7 +89,7 @@ const codex = createCodexProvider({ approvals: 'bridge', sandboxMode: 'workspace
 
 The command then runs only after a `{ kind: 'approval', decision: 'approved', mode: 'once' | 'session' }` response reaches `respondToInteraction`. There is no auto-approve, no allow-on-timeout and no allow-on-error path anywhere in this package.
 
-Every `ServerRequest` method in the pinned 0.153.4 stable surface, and what this adapter does with it:
+Every `ServerRequest` method in the pinned 0.156.1 stable surface, and what this adapter does with it:
 
 | Method                                  | Bridged    | Why                                                                                                                                                                                                                                         |
 | --------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
