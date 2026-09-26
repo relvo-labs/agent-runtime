@@ -1,6 +1,6 @@
-# Provider compatibility windows (local candidate)
+# Provider compatibility windows
 
-Base: PR #39 candidate `9985dc9c0c70c2362f9025d97a51df00f628ff3e`. Isolated local worktree/branch `feat/provider-compatibility-windows-20260926`. Do not push, merge or publish; the existing PR remains untouched remotely.
+Base: PR #39 candidate `9985dc9c0c70c2362f9025d97a51df00f628ff3e`. Isolated worktree/branch `feat/provider-compatibility-windows-20260926`. The user subsequently authorized updating PR #39 with this verified candidate. Do not merge or publish.
 
 User correction: support a bounded _range_ of Codex app-server and Claude Code/Agent SDK versions, not a single release. Distinguish the SDK npm version (actual adapter integration) from separately installed Claude Code CLI version: the provider does not spawn `claude` on PATH.
 
@@ -13,4 +13,4 @@ Acceptance:
 
 Stop if the proof does not support the full interval; narrow the interval or report the blocker, never guess coverage.
 
-Evidence: `/opt/data/cache/provider-window-evidence/REPORT.md` and `evidence.json` contain stable schemas and isolated initialize/thread-start for every Codex release in the allowlist; all adapter-reachable methods are present. The adapter itself completed a no-model session open/dispose with official 0.153.4 and 0.156.1 binaries. Claude 0.3.259 and 0.3.260 both compiled against the seam in an isolated strict typecheck; the published packed manifest retained the bounded optional peer. The first independent read-only review found a P1 in the reference-app fake initializer, which was repaired and re-run green. No authenticated provider model run or turn sandboxing is claimed. After the project-local supply-chain skill/index update, `pnpm install --frozen-lockfile`, all 20 `pnpm gate` steps, production audit and license checks passed. No remote change is authorized.
+Evidence: `/opt/data/cache/provider-window-evidence/REPORT.md` and `evidence.json` contain stable schemas and isolated initialize/thread-start for every Codex release in the allowlist; all adapter-reachable methods are present. The adapter itself completed a no-model session open/dispose with official 0.153.4 and 0.156.1 binaries. Claude 0.3.259 and 0.3.260 both compiled against the seam in an isolated strict typecheck; the published packed manifest retained the bounded optional peer. The first independent read-only review found a P1 in the reference-app fake initializer, which was repaired and re-run green. No authenticated provider model run or turn sandboxing is claimed. After the project-local supply-chain skill/index update, `pnpm install --frozen-lockfile`, all 20 `pnpm gate` steps, production audit and license checks passed. PR #39 update is authorized; merge and publish are not.
