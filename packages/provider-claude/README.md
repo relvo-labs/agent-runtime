@@ -178,16 +178,18 @@ produced before the stop is still delivered.
 
 That intent is provisional until the round-trip answers. A result that lands while the
 control request is still in flight closes the run to further output but does not settle it
-yet: if the request is then refused, or reports the input as still queued, no stop
-happened, and the run settles with the outcome the turn itself reported.
+yet: if the request is refused, no stop happened, and the run settles with the outcome
+the turn itself reported.
 
-The SDK answers with an `interrupt_receipt_v1` receipt listing input that **survived** the
-stop. The pinned public `interrupt()` takes no arguments, so `cancel_queued` cannot be
-requested and a survivor cannot be recalled. When the run's own input is listed there, the
-adapter reports the stop as not applied — a typed `provider_rejected` with
-`details.reason === 'input_still_queued'`, plus a session warning — and leaves the run
-active, so the turn that does run is reported for what it actually was. Retrying the
-interrupt once the turn has started stops it normally.
+The pinned 0.3.280 CLI **latches** an interrupt in the first-command prewait window:
+its receipt still lists that first run's uuid under `still_queued`, but the pending turn
+starts already aborted and emits its ordinary terminal result. The adapter therefore
+keeps the stop intent for a listed first run. On later runs, `still_queued` means input
+may actually survive. The public SDK `interrupt()` takes no `cancel_queued` argument,
+so the adapter rejects that later stop with `details.reason === 'input_still_queued'`
+and a session warning, leaving the run active; a subsequent stop after the turn starts
+can interrupt it. A host-injected query or alternate CLI that lacks the pinned prewait
+latch does not satisfy this first-run safety guarantee.
 
 Disposal fences new runs the instant it begins, shares one teardown between concurrent
 callers, and stays retryable to success if teardown rejects.

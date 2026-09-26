@@ -446,11 +446,23 @@ describe('claude approval attribution', () => {
 
   it('resumes raising approvals when a refused stop withdraws its intent', async () => {
     const fake = createFakeQuery();
-    const bridged = await boundRun(fake);
-    // The submitted input survived the stop, so the turn still runs — and a
-    // tool it then asks about is a tool this run really is about to use.
-    fake.setInterruptReceipt({ still_queued: [submittedUuid(fake, 0)] });
-    await rejectionOf(bridged.run.interrupt('stop'));
+    const { session, sessionEvents } = await openBridged(fake);
+    const first = await session.startRun({ input: textInput('first'), sink: recordingSink().sink, runRef: 'run-1' });
+    await flush();
+    fake.push({ type: 'result', subtype: 'success', is_error: false, user_message_uuid: submittedUuid(fake, 0) });
+    await first.completion;
+
+    const recorder = recordingSink();
+    const run = await session.startRun({ input: textInput('later'), sink: recorder.sink, runRef: 'run-2' });
+    await flush();
+    // A later queued input can survive the stop, so its tool prompt still
+    // belongs to this run once the native turn starts and stamps its uuid.
+    const uuid = submittedUuid(fake, 1);
+    fake.setInterruptReceipt({ still_queued: [uuid] });
+    await rejectionOf(run.interrupt('stop'));
+    fake.push({ type: 'assistant', message: { role: 'assistant', content: [] }, user_message_uuid: uuid });
+    await flush();
+    const bridged = { session, run, events: recorder.events, sessionEvents };
 
     const { decision, providerRef } = await ask(fake, bridged);
     await bridged.session.respondToInteraction(providerRef, APPROVED_ONCE);

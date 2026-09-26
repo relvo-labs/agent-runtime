@@ -286,8 +286,10 @@ in this section remain the pinned evidence for the original question-set design;
 current adapter pins and installation instructions live in the provider READMEs.
 The 0.156.1 stable `ServerRequest` union and its question/approval types are
 unchanged from 0.153.4. The SDK question answer map, callback result, and query
-signature are unchanged on the bounded seam. This is a declaration/schema
-compatibility check, not an authenticated model-run acceptance.
+signature are unchanged on the bounded seam. Claude 0.3.280 also changed the
+first-command prewait interrupt semantics; the adapter's first-run receipt
+reconciliation was updated separately. This is a declaration/schema and
+deterministic-adapter compatibility check, not an authenticated model-run acceptance.
 
 ## Sensitive content
 
