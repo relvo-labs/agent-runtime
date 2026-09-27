@@ -157,7 +157,7 @@ export function classifyResultSubtype(subtype: string | undefined): string {
  * Tool names are model- and MCP-declared, so they are attacker-influenced text
  * on a public event. Bound them to printable, non-credential-shaped characters.
  */
-function sanitizeToolName(name: string): string {
+export function sanitizeToolName(name: string): string {
   const redacted = redact(name).replace(/[^A-Za-z0-9 _.:/[\]-]/gu, '');
   return redacted.trim().slice(0, MAX_TOOL_NAME_CHARS);
 }

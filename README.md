@@ -49,8 +49,10 @@ Install the exact pnpm version declared by `packageManager` before running these
 Corepack is not required. Node `^22.18.0`, `^24.11.0`, and `^26.0.0` are supported and
 exercised in CI. Node 20 and Node 27+ are not supported.
 
-All eight public packages have an immutable `0.2.0` release; none of those exact versions
-may be republished or named in another dispatch. Publication is manual, explicitly scoped and approved
+All eight public packages have immutable `0.2.0` and `0.3.0` releases; a 2026-09-27
+registry observation found `latest=0.3.0` for each. Neither published version may be
+republished or named in another dispatch. Provider `0.4.0` is not yet published.
+Publication is manual, explicitly scoped and approved
 per run through [`.github/workflows/release.yml`](.github/workflows/release.yml); see the
 [release runbook](docs/release.md) for what it proves before anything reaches the registry
 and which human approvals every future release still requires.

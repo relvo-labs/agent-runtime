@@ -6,7 +6,7 @@
  * tasks, scheduled/synthetic turns, and — after a stop that could not recall an
  * already-submitted message — its own retired input.
  *
- * The pinned SDK (0.3.259) makes those distinguishable: a client uuid stamped on
+ * The pinned SDK (0.3.260) makes those distinguishable: a client uuid stamped on
  * a submitted user message comes back as `user_message_uuid` on the turn's first
  * reply frame and on its result (`user_message_uuids` when a batch was
  * coalesced). These tests hold the adapter to that contract: a frame that is not

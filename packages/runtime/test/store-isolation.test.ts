@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  WIRE_VERSION,
   CommandIdSchema,
   InteractionIdSchema,
   RunIdSchema,
@@ -35,7 +36,7 @@ function setup() {
     sessionId,
     state: 'opening',
     providerId: 'scripted',
-    wireVersion: '0.4',
+    wireVersion: WIRE_VERSION,
     workspace: {
       leaseId: WorkspaceLeaseIdSchema.parse(idFactory.next('workspaceLease')),
       ownership: 'borrowed',

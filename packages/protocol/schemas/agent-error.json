@@ -91,9 +91,9 @@
       ]
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-error.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/agent-error.json",
   "$ref": "#/$defs/agent-error",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "agent-error",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

@@ -3,16 +3,17 @@
 This repository has a reviewed, manual npm publication path. Running it is a human
 decision, not an automated consequence of merging.
 
-**All eight public packages have an immutable `0.2.0` release.** The protocol package was
-accepted and published by run 34753860073 attempt 3; the registry serves it with integrity,
-shasum and tarball digest matching the reviewed artifact. Registry readback on 2026-09-18
-also confirmed that the other seven exact versions are public, carry integrity metadata and
-have `latest` pointing to `0.2.0`. Never name any of these versions in another dispatch,
-never republish them, and do not treat unpublishing as a recovery plan. Every future version
-needs a fresh plan from the current tip of `main`, fresh registry reconciliation, explicit
-human authority for that scope and a new environment approval. Preparing a version still
-authorises nothing by itself. Exact package links are recorded in the
-[release notes](release-notes.md#020--all-eight-packages-published).
+**All eight public packages have immutable `0.2.0` and `0.3.0` releases.** A fresh no-cache
+packument readback on 2026-09-27 found both versions for each package and `latest=0.3.0`;
+the version entries carry registry integrity metadata. That readback did not compare served
+artifacts with reviewed tarballs. The first protocol 0.2.0 upload has separate historical
+integrity, shasum and tarball-digest evidence from run 34753860073 attempt 3. Never name
+either published version in another dispatch, republish it, or treat unpublishing as a
+recovery plan. Provider `0.4.0` is not published. Every future version needs a fresh plan
+from the current tip of `main`, fresh registry reconciliation, explicit human authority for
+that exact scope and a new environment approval. Preparing a version authorizes nothing by
+itself. Exact package links and historical preparation evidence are in the
+[release notes](release-notes.md).
 
 That same run is why this document now has a section on
 [what happens when npm accepts a version it does not serve yet](#when-npm-accepts-a-version-it-does-not-serve-yet):
@@ -23,7 +24,7 @@ about twelve seconds later.
 - Decision record: [ADR-0017](adr/ADR-0017-manual-npm-release.md)
 - Owning skill: `.agents/skills/npm-release/SKILL.md`
 - Structure is machine-checked by `pnpm release:check`, which the canonical gate runs.
-- What 0.2.0 contains: [release notes](release-notes.md)
+- What 0.2.0 and 0.3.0 contain: [release notes](release-notes.md)
 
 ## What the path guarantees
 
@@ -256,18 +257,18 @@ something unparseable, reports no `refs/heads/main`, or reports it more than
 once, the run refuses rather than proceeding. The correct response to that is to
 find out why the remote is unreadable — not to remove the check.
 
-## Authorized version preparation
+## Historical 0.2.0 version preparation
 
-Preparation of all eight packages at 0.2.0 is authorized, and PR #28 is where it happened.
-Its baseline contains the issue #27 gate repair, so the transition below is proven rather
-than asserted. Preparation does not authorize merging, dispatching or publishing. The
-publication decisions below remain separate human approvals.
+PR #28 prepared all eight packages at 0.2.0. Its baseline contains the issue #27 gate
+repair, so the transition below was proven rather than asserted. This is a record of a
+completed preparation and release, not a current approval or a dispatch plan.
 
 1. **Authorized version preparation.** _Prepared and merged in PR #28._ `changeset version`
    consumed all three pending changesets and produced exactly the outcome the pinned
    release plan predicted. That completed version preparation only; it did not authorize
    publication, and the full canonical matrix remains required for any future dispatch.
-   The pinned release plan and `linked` configuration keep the eight in step:
+   The pinned release plan included all eight; `linked` aligned those entrants. Linked
+   packages outside a plan are not automatically released:
 
    | Package                             | From  | To    | Bump  |
    | ----------------------------------- | ----- | ----- | ----- |
@@ -282,7 +283,9 @@ publication decisions below remain separate human approvals.
 
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
-   `.changeset/` now holds no pending intent. `@relvo-labs/reference-app` is private, was
+   `.changeset/` held no pending intent after that preparation. It does now contain new
+   provider compatibility intent, which must be consumed before any future dispatch.
+   `@relvo-labs/reference-app` is private, was
    deliberately left at `0.0.0`, and is never published. No other manifest field moved:
    the version-only proof compares every workspace manifest against the baseline and
    admits exactly the planned `version`.
@@ -294,9 +297,10 @@ publication decisions below remain separate human approvals.
    0.2.0 actually contains.
 
    Preparing the versions did not authorize publication. Separate authorized runs have now
-   published all eight `0.2.0` packages. A future release can only be dispatched against a
+   published all eight `0.2.0` packages. The eight `0.3.0` versions were subsequently
+   published and are likewise immutable. A future release can only be dispatched against a
    commit that is the exact current tip of `main`, with the canonical gate green on that
-   commit, a scope that excludes every immutable `0.2.0` version, fresh human authority for
+   commit, a scope that excludes every immutable `0.2.0` and `0.3.0` version, fresh human authority for
    every named package, and the `npm-release` environment approval given for that run.
 
    The gate step that once refused this shape of PR is issue #27, fixed in PR #29 and
@@ -308,6 +312,10 @@ publication decisions below remain separate human approvals.
 ## Outstanding human approvals
 
 Every future publication still requires the following human-controlled prerequisites.
+The current `main` has pending provider compatibility version intent and is not dispatchable
+until a separate reviewed version-only change consumes that intent, with the gate and
+preflight rerun on the then-current tip. Provider `0.4.0` is not published; this runbook
+does not choose that version or approve any scope.
 
 1. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
    the `NPM_TOKEN` secret (granular, write-limited to this scope, short-lived) and the
@@ -321,6 +329,8 @@ Every future publication still requires the following human-controlled prerequis
 
 A future pre-1.0 version may be published only when the evidence below exists and is stated
 accurately. This policy is not weakened by prior releases or by the existence of a release path.
+The heading preserves links from historical release notes; these checks apply to every new
+release.
 
 - **Deterministic evidence, complete.** `pnpm gate` green on Node 22/24/26, including
   packed-tarball install, typecheck and import from a clean store (`artifacts:check`) and
@@ -341,12 +351,15 @@ accurately. This policy is not weakened by prior releases or by the existence of
 
 1. Freeze the exact current tip of `main` that carries the reviewed versions; that commit is
    `source_sha`. If a version-preparation change was required, it must already be merged.
-2. Confirm the canonical gate is green on that commit and reconcile every package in the
-   proposed scope against the registry. Exclude every version already published.
+2. Confirm no version intent is pending, the canonical gate is green on that commit, and
+   reconcile every package in the proposed scope against the registry. Exclude every
+   version already published, including all eight `0.2.0` and `0.3.0` versions.
 3. Actions → **release** → _Run workflow_ on `main`, with, for example:
    - `source_sha`: `<the 40-character merge commit>`
    - `packages`: `@relvo-labs/<package>@<reviewed-version> ...` (list the exact,
-     dependency-closed scope; never substitute an already-published `0.2.0` version)
+     dependency-closed scope; never substitute an already-published `0.2.0` or `0.3.0`
+     version). Linked Changesets align only packages entering the plan; a leaf-adapter
+     plan can contain the two adapters without the other six.
    - `dist_tag`: `latest` (a prerelease version may never be published under `latest`)
    - `confirm`: `publish <count> package(s) from <source_sha> to latest`
 4. Read the `verify` job output: it prints the full plan, the plan digest, the publication
@@ -440,9 +453,9 @@ export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
 
-The one-package example is diagnostic only. It deliberately names the already-published,
-immutable protocol version so registry preflight must reject it; never copy that package
-scope into a real dispatch.
+The one-package example is rejection-only diagnostics. It deliberately names the
+already-published, immutable protocol version so registry preflight must reject it;
+never copy that package scope into a real dispatch.
 
 Read the findings rather than the exit code alone: the question a rehearsal answers is
 _which_ facts it could not establish, not merely that it said no. With honest inputs the

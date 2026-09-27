@@ -26,8 +26,10 @@ Do not use this skill when:
 - you are changing what a package ships — use `package-artifact-validation`
 - you are changing the canonical gate or the validation workflow — use `local-ci-parity`
 - you want to publish _now_: publication is a human decision with an environment approval,
-  not something an agent may initiate. All eight public packages have an immutable `0.2.0`
-  version; none is ever republished or named in a dispatch again.
+  not something an agent may initiate. All eight public packages have immutable `0.2.0`
+  and `0.3.0` versions; none is ever republished or named in a dispatch again. A
+  2026-09-27 registry observation found `latest` at `0.3.0` for all eight. Provider
+  `0.4.0` is not published.
 
 ## Owns
 
@@ -91,7 +93,8 @@ Do not use this skill when:
    a well-formed packument. A packument missing `dist-tags`, naming a tag that is not an
    exact version, or pointing a tag at a version it does not list is malformed: the
    dist-tag is the mutable half of a packument and reading it as "unset" is how a release
-   moves `latest` backwards while reporting success.
+   moves `latest` backwards while reporting success. For linked packages, only packages
+   entering a Changesets plan are aligned; an adapter-only plan can contain two packages.
 
 5. **An artifact has exactly one identity, or it is refused.** What this repository
    reads out of a tarball and what npm extracts from it must never be two different

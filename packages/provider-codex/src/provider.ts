@@ -19,7 +19,7 @@
  * Native identity — thread ids, turn ids, item ids, request ids, the child
  * process — stays inside this package. Nothing below emits it.
  *
- * Pinned against codex-cli 0.153.4 (`openai/codex@3d2ee51c`), **stable**
+ * Pinned against codex-cli 0.156.1 (`openai/codex@b412ff32`), **stable**
  * protocol surface only: `initialize.params.capabilities` is sent as `null`,
  * which by construction cannot opt into `experimentalApi`.
  */
@@ -40,9 +40,26 @@ import {
 } from '@relvo-labs/agent-provider';
 
 import { createCodexClient, isAuthoritativeRejection, type CodexClient, type CodexClientEnd } from './client.ts';
-import { CODEX_METHOD, CODEX_NOTIFICATION, CODEX_SERVER_REQUEST, asId, asRecord } from './protocol.ts';
+import {
+  CODEX_METHOD,
+  CODEX_NOTIFICATION,
+  CODEX_SERVER_REQUEST,
+  asId,
+  asRecord,
+  asServerRequestResolved,
+} from './protocol.ts';
+import {
+  CODEX_APPROVAL_MODES,
+  CODEX_BRIDGED_APPROVAL,
+  CODEX_BRIDGED_QUESTION,
+  createInteractionRegistry,
+  type ApprovalOwner,
+  type CodexInteractionRegistry,
+  type CodexServerRequestOffer,
+} from './interaction.ts';
 import { CodexSessionOptionsSchema, type CodexProviderOptions, type CodexSessionOptions } from './options.ts';
 import { CODEX_APP_SERVER_VERSION, createCodexStdioTransport } from './transport.ts';
+import { CODEX_SUPPORTED_APP_SERVER_VERSIONS, isCompatibleCodexUserAgent } from './version.ts';
 import {
   classifyThrown,
   correlationOf,
@@ -155,6 +172,8 @@ type ActiveRun = {
   /** The turn's own terminal frame has arrived; the run takes no more output. */
   concluded: boolean;
   interruptRequested: boolean;
+  /** Permanent for this run, even if delivery of interrupt fails and is retried. */
+  approvalsFenced: boolean;
   interruptReason: string | undefined;
   interruptAttempt: Promise<void> | undefined;
   buffered: BufferedFrame[];
@@ -171,10 +190,12 @@ type SessionContext = {
   readonly client: CodexClient;
   readonly threadId: string;
   readonly sink: ProviderEventSink;
+  /** Present only when this provider was created with `approvals: 'bridge'`. */
+  readonly interactions: CodexInteractionRegistry | undefined;
 };
 
 function createSessionFor(context: SessionContext, wiring: { attach(session: SessionRuntime): void }): ProviderSession {
-  const { client, threadId, sink } = context;
+  const { client, threadId, sink, interactions } = context;
 
   let active: ActiveRun | undefined;
   let streamEnded = false;
@@ -221,6 +242,10 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     run.concluded = true;
     if (run.correlation !== undefined) retire(run.correlation.turnId);
     if (active === run) active = undefined;
+    // Before the run is handed its outcome: an approval this run raised and
+    // nobody answered is declined now, and its reference retired, so no native
+    // callback dangles and no late response can settle one.
+    interactions?.retire(run);
     run.settle(termination);
   }
 
@@ -317,6 +342,24 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
   }
 
   function onNotification(method: string, params: unknown): void {
+    // Handled before correlation, because it is the one notification that
+    // carries no `turnId`: `serverRequest/resolved` is `{ threadId, requestId }`
+    // and is correlated by the native request id the registry retained. It
+    // both confirms an answer this adapter already sent and retires one the
+    // server resolved itself — the app-server's withdrawal signal. Dropping it
+    // for want of a `turnId` is what leaves a withdrawn question pending in
+    // the Runtime while the adapter keeps a reply channel it must not use.
+    if (method === CODEX_NOTIFICATION.serverRequestResolved) {
+      const resolved = asServerRequestResolved(params);
+      if (resolved === undefined) return;
+      if (resolved.threadId !== threadId) {
+        noteForeignTraffic();
+        return;
+      }
+      interactions?.resolveNative(resolved.requestId);
+      return;
+    }
+
     const correlation = correlationOf(params);
     if (correlation === undefined) {
       // Thread- and app-scoped notifications carry no turn. Nothing in the
@@ -462,11 +505,33 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     });
   }
 
+  /**
+   * The run an approval may belong to right now, or `undefined`.
+   *
+   * Every condition here is a reason a request must not create routing state:
+   * there is no run, the turn it names is not yet bound (so it cannot be
+   * checked), the run already concluded, interruption has begun — at which
+   * point a new interaction is a contract violation, not a prompt — or the
+   * session is fenced, disposing or off the air.
+   */
+  function approvalOwner(): ApprovalOwner | undefined {
+    const run = active;
+    if (run === undefined || run.terminated || run.concluded || run.approvalsFenced) return undefined;
+    if (run.correlation === undefined) return undefined;
+    if (disposing || disposed || streamEnded || fencedReason !== undefined) return undefined;
+    return { key: run, correlation: run.correlation, sink: run.request.sink };
+  }
+
   const runtime: SessionRuntime = {
     onNotification,
-    onServerRequest(method: string): void {
-      // Declined by the client layer already; recorded so a host can see that
-      // an unimplemented interaction was requested and refused.
+    onServerRequest(request: CodexServerRequestOffer): boolean {
+      // The registry answers the one bridged method — including refusing it,
+      // when the payload or the correlation does not hold. Anything else falls
+      // through to an explicit decline by the client layer.
+      if (interactions?.offer(request, approvalOwner()) === 'taken') return true;
+
+      // Recorded so a host can see that an unimplemented interaction was
+      // requested and refused.
       //
       // The method name is republished only when it is one of the pinned stable
       // `ServerRequest` methods. Anything else is a string chosen by another
@@ -477,11 +542,12 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
         payload: {
           type: 'diagnostic',
           level: 'warning',
-          message: CODEX_SERVER_REQUEST.has(method)
-            ? `codex requested an interaction this adapter does not implement (${method}); it was declined`
+          message: CODEX_SERVER_REQUEST.has(request.method)
+            ? `codex requested an interaction this adapter does not implement (${request.method}); it was declined`
             : 'codex sent an unrecognised request this adapter does not implement; it was declined',
         },
       });
+      return false;
     },
     onDrop(reason: string): void {
       sink.emit({
@@ -494,6 +560,11 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
     },
     onEnd(end: CodexClientEnd): void {
       streamEnded = true;
+      // The connection is gone, so no decision can be written for anything
+      // still outstanding. The references go regardless: a run must not be
+      // revivable, and a host must not be able to answer into a callback that
+      // no longer exists.
+      interactions?.retireAll();
       if (!disposing) {
         sink.emit({
           payload: {
@@ -540,6 +611,7 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       terminated: false,
       concluded: false,
       interruptRequested: false,
+      approvalsFenced: false,
       interruptReason: undefined,
       interruptAttempt: undefined,
       buffered: [],
@@ -623,6 +695,10 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
         if (run.interruptAttempt !== undefined) return run.interruptAttempt;
         if (run.interruptRequested) return Promise.resolve();
         run.interruptRequested = true;
+        run.approvalsFenced = true;
+        // Retire before awaiting delivery: acknowledgement is not completion,
+        // and a rejected interrupt must never reopen an old authorization.
+        interactions?.retire(run);
         run.interruptReason = reason === undefined ? undefined : reason.slice(0, MAX_REASON_CHARS);
         const attempt = deliverInterrupt();
         run.interruptAttempt = attempt;
@@ -642,15 +718,25 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       }
     },
 
-    respondToInteraction(_providerRef: string, _response: InteractionResponse): Promise<void> {
-      // The adapter never raises an interaction — it declines every
-      // server-initiated request — so any reference is unknown. Silently
-      // accepting one would let a caller believe an approval landed. The
-      // reference itself is not echoed: it is caller-controlled text on a
-      // durable error.
-      return Promise.reject(
-        new ProviderRejection(agentError('unknown_interaction', 'the codex adapter does not raise interactions')),
-      );
+    respondToInteraction(providerRef: string, response: InteractionResponse): Promise<void> {
+      const registry = interactions;
+      if (registry === undefined) {
+        // This provider raises no interaction at all, so any reference is
+        // unknown. Silently accepting one would let a caller believe an
+        // approval landed. The reference itself is not echoed: it is
+        // caller-controlled text on a durable error.
+        return Promise.reject(
+          new ProviderRejection(agentError('unknown_interaction', 'the codex adapter does not raise interactions')),
+        );
+      }
+      try {
+        registry.settle(providerRef, response);
+        return Promise.resolve();
+      } catch (error) {
+        // Every rejection reaches the runtime as a rejected promise, never as
+        // a synchronous throw at the call site.
+        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+      }
     },
 
     dispose(): Promise<void> {
@@ -658,6 +744,10 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
       // Fence first: admission must close before anything is awaited, so a run
       // can never be accepted against a connection that is already closing.
       disposing = true;
+      // Decline outstanding approvals while the connection can still carry the
+      // frames, and before anything is awaited. Idempotent, so a retried
+      // disposal after a failed teardown cannot answer the same request twice.
+      interactions?.retireAll();
       if (teardown !== undefined) return teardown;
 
       const attempt = (async () => {
@@ -694,7 +784,8 @@ function createSessionFor(context: SessionContext, wiring: { attach(session: Ses
 /** Callbacks the client layer drives, wired after the session object exists. */
 type SessionRuntime = {
   onNotification(method: string, params: unknown): void;
-  onServerRequest(method: string): void;
+  /** Returns whether the session took responsibility for the reply. */
+  onServerRequest(request: CodexServerRequestOffer): boolean;
   onDrop(reason: string): void;
   onEnd(end: CodexClientEnd): void;
 };
@@ -729,8 +820,10 @@ async function openConnection(
         }
         runtime.onNotification(method, params);
       },
-      onServerRequest(method: string): void {
-        box.runtime?.onServerRequest(method);
+      onServerRequest(request: CodexServerRequestOffer): boolean {
+        // A request that arrives before the session is wired belongs to no run
+        // and cannot be owned, so it is declined by the client layer.
+        return box.runtime?.onServerRequest(request) ?? false;
       },
       onDrop(reason: string): void {
         box.runtime?.onDrop(reason);
@@ -752,24 +845,41 @@ async function openConnection(
   // shape that cannot opt into `experimentalApi` or `requestAttestation` —
   // and because attestation is not requested, `attestation/generate` is never
   // sent to this client.
-  await client.request(CODEX_METHOD.initialize, {
+  const clientName = options.clientName ?? 'relvo_agent_runtime';
+  const initialized = await client.request(CODEX_METHOD.initialize, {
     clientInfo: {
-      name: options.clientName ?? 'relvo_agent_runtime',
+      name: clientName,
       title: 'Relvo Agent Runtime',
       version: options.clientVersion ?? CODEX_ADAPTER_VERSION,
     },
     capabilities: null,
   });
+  // InitializeResponse.userAgent is the only stable-response field carrying
+  // the running CLI version. Reject unknown or out-of-window formats *before*
+  // thread/start can bind a workspace or any turn can execute. Do not echo
+  // untrusted server text into durable AgentError fields.
+  if (!isCompatibleCodexUserAgent(asRecord(initialized)?.userAgent, clientName)) {
+    throw new ProviderRejection(
+      agentError('provider_unavailable', 'codex app-server version is outside the reviewed compatibility window', {
+        providerCode: 'unsupported_app_server_version',
+      }),
+    );
+  }
   client.notify(CODEX_METHOD.initialized);
 
   const sandbox = overrides.sandboxMode ?? options.sandboxMode ?? 'read-only';
   const model = overrides.model ?? options.model;
   const started = await client.request(CODEX_METHOD.threadStart, {
     cwd: root,
-    // No approval or question is bridged, so none may be requested: anything
-    // that would ask a human must fail closed rather than hang a run nobody
-    // can answer.
-    approvalPolicy: 'never',
+    // `never` unless approvals are bridged: anything that would ask a human
+    // must fail closed rather than hang a run nobody can answer. With the
+    // bridge on, `on-request` lets the server ask when it needs to escalate,
+    // and each request becomes one neutral approval the host decides.
+    // The question bridge deliberately does not move this. `approvalPolicy`
+    // governs whether the server may ask permission to *act*; a
+    // `item/tool/requestUserInput` is the model asking the user something and
+    // is unrelated to it. Enabling questions must not widen what Codex may do.
+    approvalPolicy: options.approvals === 'bridge' ? 'on-request' : 'never',
     sandbox,
     // In-memory only. Nothing about this conversation is materialised on disk
     // by the adapter, and `thread.path` is null.
@@ -871,6 +981,8 @@ async function closeQuietly(transport: CodexTransport): Promise<{ ok: true } | {
  * run against a host-managed connection or a deterministic double.
  */
 export function createCodexProvider(options: CodexProviderOptions = {}): CodexProvider {
+  const bridgesApprovals = options.approvals === 'bridge';
+  const bridgesQuestions = options.questions === 'bridge';
   const descriptor = defineProviderDescriptor({
     providerId: CODEX_PROVIDER_ID,
     providerVersion: CODEX_ADAPTER_VERSION,
@@ -893,8 +1005,38 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
       },
       maxConcurrentRunsPerSession: 1,
     },
-    // Every server-initiated request is declined, so no interaction is claimed.
-    interaction: { approval: {}, question: {}, settlementTimeoutMs: null },
+    interaction: {
+      // Exactly what the bridge can encode, and nothing more. `once` is
+      // `accept` and `session` is `acceptForSession`; `persistent` would need
+      // the execpolicy-amendment decision variant, which carries a payload the
+      // neutral response has nowhere to put. The app-server blocks the command
+      // on the answer, so `blocking` is true rather than advisory.
+      approval: bridgesApprovals ? { supported: true, modes: [...CODEX_APPROVAL_MODES], blocking: true } : {},
+      // Claimed only when the host asked for the question bridge, and only to
+      // the degree `item/tool/requestUserInput` declares. `multiSelect` stays
+      // false because `ToolRequestUserInputQuestion` has no field that permits
+      // several answers — the reply array can hold them, but the request never
+      // says they are allowed, and offering an unstated capability is a guess.
+      // `maxQuestions` is left unstated: the native schema bounds nothing, so
+      // this adapter's own bound is the protocol's and is enforced by refusal
+      // rather than advertised as the server's.
+      question: bridgesQuestions
+        ? {
+            supported: true,
+            choices: true,
+            multiSelect: false,
+            batch: true,
+            maxQuestions: null,
+            // `isOther`, and any question the server sends with no options.
+            freeText: true,
+            // `isSecret`.
+            sensitive: true,
+          }
+        : {},
+      // This adapter imposes no settlement deadline: an approval waits for a
+      // host, a run, or teardown, never a timer.
+      settlementTimeoutMs: null,
+    },
     workspace: {
       requires: 'directory',
       acceptsOwnership: ['borrowed', 'managed'],
@@ -912,6 +1054,7 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
     recovery: {},
     extensions: {
       appServerVersion: CODEX_APP_SERVER_VERSION,
+      supportedAppServerVersions: [...CODEX_SUPPORTED_APP_SERVER_VERSIONS],
       protocolSurface: 'stable',
       transport: 'stdio-jsonl',
       /** Deltas arrive per streamed text fragment, not per whole message. */
@@ -923,6 +1066,25 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
        * what was configured, not as an enforcement claim.
        */
       declaredSandboxMode: options.sandboxMode ?? 'read-only',
+      /**
+       * The approval policy this adapter will request from the app-server, and
+       * the exact server-initiated methods it bridges — each listed only when
+       * its own bridge was opted into, so the list always matches what this
+       * session will actually answer. Every other `ServerRequest` method is
+       * declined on its own native request id — see the mapping table in
+       * `interaction.ts`.
+       */
+      declaredApprovalPolicy: bridgesApprovals ? 'on-request' : 'never',
+      bridgedServerRequests: [
+        ...(bridgesApprovals ? [CODEX_BRIDGED_APPROVAL] : []),
+        ...(bridgesQuestions ? [CODEX_BRIDGED_QUESTION] : []),
+      ],
+      /**
+       * `CommandExecutionRequestApprovalResponse` carries `decision` and
+       * nothing else, so a host's denial `reason` cannot be transmitted to the
+       * model on this protocol. Stated here rather than dropped quietly.
+       */
+      approvalDenialReasonDelivered: false,
       /**
        * Stated explicitly so no consumer infers it from the sandbox mode: a
        * read-only policy does not isolate MCP servers, hooks or plugins started
@@ -1055,7 +1217,20 @@ export function createCodexProvider(options: CodexProviderOptions = {}): CodexPr
       }
 
       const session = createSessionFor(
-        { client: opened.client, threadId: opened.threadId, sink: init.sink },
+        {
+          client: opened.client,
+          threadId: opened.threadId,
+          sink: init.sink,
+          // One registry per session: references never cross sessions, and a
+          // session's teardown retires exactly its own.
+          // Each native method is gated by its own flag, so enabling questions
+          // cannot quietly re-enable the approval bridge the descriptor says
+          // is off.
+          interactions:
+            bridgesApprovals || bridgesQuestions
+              ? createInteractionRegistry(init.sink, { approvals: bridgesApprovals, questions: bridgesQuestions })
+              : undefined,
+        },
         {
           attach(runtime: SessionRuntime): void {
             opened.wiring.runtime = runtime;

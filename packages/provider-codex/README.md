@@ -12,7 +12,19 @@ Upstream labels the `codex app-server` subcommand itself `[experimental]`. This 
 
 ### Protocol evidence
 
-Pinned to **codex-cli 0.153.4** — upstream `openai/codex` tree `3d2ee51ca2d5db578f328aa75e20aa22c0197c9a`, release tag `rust-v0.153.4`.
+The recorded stable-protocol seam baseline is **codex-cli 0.156.1** — upstream `openai/codex` tree `b412ff32c417f855c2b2d1581b77058eed87c84b`, release tag `rust-v0.156.1`.
+
+The supported host executable window is the reviewed stable releases **0.153.4, 0.154.0,
+0.155.0, 0.155.1, 0.156.0, 0.156.1**, inclusive endpoints. It is a finite allowlist, not a
+promise that any as-yet-unreviewed release inside a numerical interval will work. After
+`initialize` and before `thread/start`, the adapter checks the server's reported
+`InitializeResponse.userAgent` version. An unknown format, prerelease, older or newer
+version rejects with `provider_unavailable` / `unsupported_app_server_version`, and the
+half-open connection is closed. Custom host-managed transports must supply the same
+initialize response; the adapter cannot authenticate that self-reported version. The
+exported `CODEX_APP_SERVER_VERSION` identifies the seam baseline, while
+`CODEX_APP_SERVER_MIN_VERSION` / `CODEX_APP_SERVER_MAX_VERSION` and
+`descriptor.extensions.supportedAppServerVersions` describe the reviewed window.
 
 The wire types in `seam.ts` are hand-authored against that release's generated stable schemas — `json-schema-stable/` and `typescript-stable/`, produced by `codex app-server generate-json-schema` / `generate-ts` without `--experimental`. **Those generated schemas are the primary evidence.** The hand-authored types and the test fixtures are derived from them and cite the exact source file at the point of use; where the two ever disagree, the schema is correct and this package has a bug.
 
@@ -20,27 +32,29 @@ The wire types in `seam.ts` are hand-authored against that release's generated s
 
 ### Evidence classification
 
-| Claim                                       | Evidence                                                                                                                                                        |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Wire compatibility with 0.153.4 stable      | Deterministic tests against the pinned frame shapes, plus an end-to-end suite driving the real production transport over real pipes to a local stand-in server. |
-| Behaviour against a live credentialed model | **None.** No test in this repository executes a real Codex turn, and none is permitted to: the gate is credential-free and network-free by policy.              |
+| Claim                                                | Evidence                                                                                                                                                                                                 |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire compatibility with reviewed stable CLI releases | Generated schemas and no-credential initialize/thread-start handshakes for each release in the window, deterministic frame tests against the baseline and real production transport to a local stand-in. |
+| Behaviour against a live credentialed model          | **None.** No test in this repository executes a real Codex turn, and none is permitted to: the gate is credential-free and network-free by policy.                                                       |
 
 Do not read "compatible" as "verified against a live model". Those are different claims and only the first is made here.
 
 ## Capabilities
 
-| Capability                          | Status                                                                                                                                                                      |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Text turn input                     | Supported. `text` parts only; multiple parts are joined.                                                                                                                    |
-| Streaming assistant text            | Supported, via `item/agentMessage/delta`.                                                                                                                                   |
-| Token usage                         | Supported, streamed from `thread/tokenUsage/updated` (the per-turn `last` breakdown, not the cumulative thread total).                                                      |
-| Cooperative interrupt               | Supported, via `turn/interrupt`. The session survives it.                                                                                                                   |
-| Tool activity events                | **Not supported.** The item payloads are stable in the protocol but carry commands, cwd and executor-native paths that need a redaction contract this slice does not build. |
-| Approvals / questions / elicitation | **Not supported.** Every server-initiated request is declined with a JSON-RPC error, so a blocking request cannot stall a turn.                                             |
-| Recovery / resume / export          | **Not supported.**                                                                                                                                                          |
-| Images, audio, file references      | **Not supported.**                                                                                                                                                          |
-| Workspace                           | Required. One thread is bound to the acquired lease root for the whole session.                                                                                             |
-| Side-effect-free execution          | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                        |
+| Capability                     | Status                                                                                                                                                                                          |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Text turn input                | Supported. `text` parts only; multiple parts are joined.                                                                                                                                        |
+| Streaming assistant text       | Supported, via `item/agentMessage/delta`.                                                                                                                                                       |
+| Token usage                    | Supported, streamed from `thread/tokenUsage/updated` (the per-turn `last` breakdown, not the cumulative thread total).                                                                          |
+| Cooperative interrupt          | Supported, via `turn/interrupt`. The session survives it.                                                                                                                                       |
+| Tool activity events           | **Not supported.** The item payloads are stable in the protocol but carry commands, cwd and executor-native paths that need a redaction contract this slice does not build.                     |
+| Command approvals              | **Opt-in**, via `createCodexProvider({ approvals: 'bridge' })`. One `item/commandExecution/requestApproval` becomes one neutral approval, granted only by an explicit response. Off by default. |
+| Structured questions           | **Opt-in**, via `createCodexProvider({ questions: 'bridge' })`. One `item/tool/requestUserInput` becomes one neutral `question_set`, answered as a whole. Off by default. See below.            |
+| Elicitation / other approvals  | **Not supported.** Declined with a JSON-RPC error on their own request id, so a blocking request cannot stall a turn. See the mapping table below.                                              |
+| Recovery / resume / export     | **Not supported.**                                                                                                                                                                              |
+| Images, audio, file references | **Not supported.**                                                                                                                                                                              |
+| Workspace                      | Required. One thread is bound to the acquired lease root for the whole session.                                                                                                                 |
+| Side-effect-free execution     | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                                            |
 
 ## Usage
 
@@ -77,9 +91,121 @@ const codex = createCodexProvider({ transport: ({ cwd }) => myTransportFor(cwd) 
 
 Choosing `workspace-write` or `danger-full-access` alongside a `cwd` also causes the app-server to mark that project trusted in the user's `config.toml`, which is a host-config mutation outside the acquired workspace. That is why the conservative value is the default.
 
+### Approvals — the pinned mapping table
+
+Off by default. `createCodexProvider({ approvals: 'bridge' })` turns it on, which changes exactly three things: `thread/start` sends `approvalPolicy: 'on-request'` instead of `'never'`, the descriptor declares `interaction.approval = { supported: true, modes: ['once', 'session'], blocking: true }`, and one server-initiated method is answered by a host instead of declined.
+
+```ts
+const codex = createCodexProvider({ approvals: 'bridge', sandboxMode: 'workspace-write' });
+```
+
+The command then runs only after a `{ kind: 'approval', decision: 'approved', mode: 'once' | 'session' }` response reaches `respondToInteraction`. There is no auto-approve, no allow-on-timeout and no allow-on-error path anywhere in this package.
+
+Every `ServerRequest` method in the pinned 0.156.1 stable surface, and what this adapter does with it:
+
+| Method                                  | Bridged    | Why                                                                                                                                                                                                                                         |
+| --------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `item/commandExecution/requestApproval` | **Yes**    | Carries its own reviewable subject (`command`, `cwd`, `reason`), and `accept` / `acceptForSession` / `decline` map onto `once` / `session` / denied.                                                                                        |
+| `item/fileChange/requestApproval`       | No         | `FileChangeRequestApprovalParams` names no files — the change set lives in the `itemId` item, which this adapter does not surface (`streaming.toolActivity: false`). The approval would have no reviewable subject.                         |
+| `item/tool/requestUserInput`            | **Opt-in** | Bridged when `questions: 'bridge'` is set; declined with `-32601` otherwise. Its question _list_ with `isSecret` / `isOther` maps onto the neutral `question_set` added in wire 0.5 (ADR-0018). No capability opt-in is needed — see below. |
+| `item/permissions/requestApproval`      | No         | The response requires a `GrantedPermissionProfile` and a `PermissionGrantScope`, and has no decline variant at all.                                                                                                                         |
+| `mcpServer/elicitation/request`         | No         | An arbitrary multi-field form (`McpElicitationSchema`) with a _nullable_ `turnId`, so neither the one-question mapping nor run correlation holds.                                                                                           |
+| `item/tool/call`                        | No         | Asks the client to execute a tool. Not an interaction.                                                                                                                                                                                      |
+| `account/chatgptAuthTokens/refresh`     | No         | A credential operation; this adapter holds no credentials.                                                                                                                                                                                  |
+| `attestation/generate`                  | No         | Requires `requestAttestation`, which is never sent.                                                                                                                                                                                         |
+| `applyPatchApproval` (legacy)           | No         | Carries `conversationId` / `callId` and no `turnId`, so it cannot be bound to the active run.                                                                                                                                               |
+| `execCommandApproval` (legacy)          | No         | Same: no `turnId`.                                                                                                                                                                                                                          |
+
+A bridged command approval is **still refused**, on its own request id with `-32602`, when the request cannot be represented faithfully: `kind: 'writeStdin'` or any unknown kind, no reviewable `command`, or a proposed execpolicy / network-policy amendment or managed-network context — because the neutral response cannot carry the amendment the server is actually asking about, and answering it with a plain `accept` would discard the question. A well-formed approval that does not name the active `(threadId, turnId)`, arrives before the turn is bound, arrives after the run concluded or after interruption began, or exceeds the per-session bound, is refused with `-32600`. Nothing in either case raises an interaction.
+
+### Structured questions
+
+`createCodexProvider({ questions: 'bridge' })` turns one `item/tool/requestUserInput` into
+one neutral `question_set` interaction on the run that owns `(threadId, turnId)`. The turn
+**pauses at the native wait point** and resumes there once the host answers: the native
+request is replied to with the whole `{ answers: { [questionId]: { answers } } }` map. It
+is not a follow-up turn and not an approval.
+
+| Native form                          | Bridged            | Notes                                                                                                                                                                                                                                                                                             |
+| ------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| choice question (`options`)          | **yes**            | Single-select only — see below. The native answer is the option's `label`.                                                                                                                                                                                                                        |
+| free-text question (`options: null`) | **yes**            | Carried as a question with no choices; the answer is a one-element array holding the typed text.                                                                                                                                                                                                  |
+| `isOther: true`                      | **yes**            | Carried as `allowFreeText: true`: choices plus typed text. The user's text is sent verbatim.                                                                                                                                                                                                      |
+| `isSecret: true`                     | **yes**            | Carried as `sensitive: true` so a host can mask input. Advisory display guidance, not an enforced control.                                                                                                                                                                                        |
+| several questions in one request     | **yes**            | Raised as one ordered batch, answered as one unit. A partial answer is refused before any native reply is written.                                                                                                                                                                                |
+| multi-select                         | no — not offered   | `ToolRequestUserInputQuestion` has no field permitting several answers. The reply array can hold them; the request never says they are allowed, so none is offered rather than guessed at.                                                                                                        |
+| `isBlocking: false`                  | no — refused whole | A turn that does not wait cannot be resumed by an answer, so asking a host for one would be misleading.                                                                                                                                                                                           |
+| `autoResolutionMs` (deprecated)      | no — refused whole | It asks the client to answer _for_ the user after an interval. This adapter never fabricates an answer and imposes no settlement deadline.                                                                                                                                                        |
+| duplicate question `id`              | no — refused whole | The native answer map is keyed by it, so duplicates cannot both be answered.                                                                                                                                                                                                                      |
+| duplicate option `label`             | no — refused whole | The native answer _is_ the label, so duplicates are an ambiguous answer.                                                                                                                                                                                                                          |
+| cancellation / withdrawal            | **yes**            | `serverRequest/resolved` (`{ threadId, requestId }`) retires a request the server settled itself. The batch is withdrawn on the Runtime, the run leaves `awaiting_interaction`, and nothing is written on the native id. Turn completion, interrupt, disposal and EOF also retire it — see below. |
+
+A request whose translation is valid for the app-server but invalid as a neutral
+`question_set` — a prompt, header, option label or description past the neutral bound, or
+more options than a neutral choice list carries — is refused on the same terms
+(`neutral_bounds`). `ToolRequestUserInputParams` declares no lengths and no option limit,
+so the neutral schema is the only thing that can say, and the whole translated request is
+validated **before** any entry is retained or any interaction raised: a batch the Runtime
+would discard as malformed must never leave a blocking native request waiting for an
+answer no host was ever shown.
+
+A refused request is declined with `-32602` on its own native id and **raises no
+interaction**; one that does not name the active turn, has no run to own it, or exceeds the
+per-session bound is declined with `-32600`. The refusal diagnostic carries a bounded
+reason token and no prompt, option or answer text.
+
+**Withdrawal.** `serverRequest/resolved` is a notification carrying `{ threadId, requestId }`
+and no `turnId`, so it is correlated by the native request id this adapter retained. It
+confirms an answer already sent — harmless, nothing further is written — and it retires a
+request the server resolved by itself. In the second case the adapter writes nothing on
+that id, fences it against any later reply, and emits `interaction.withdrawn` to the
+Runtime, which settles the interaction `withdrawn`, clears its routing and lets the turn
+continue. Retiring only the adapter's own entry would leave the run parked in
+`awaiting_interaction` for the rest of its life and turn its eventual completion into a
+`provider_contract_violation`.
+
+**Each bridge is opted into separately.** `questions: 'bridge'` does not enable the
+approval bridge: with `approvals` unset, `item/commandExecution/requestApproval` is still
+declined with `-32601` and no approval interaction is raised, which is what the descriptor's
+`interaction.approval` and `extensions.bridgedServerRequests` say. Each enabled method is
+listed in `bridgedServerRequests`, and only the enabled ones.
+
+**No experimental capability is enabled.** `initialize.params.capabilities` stays `null`.
+The types were previously believed to be gated behind `InitializeCapabilities.experimentalApi`;
+the pinned generated artifacts say otherwise, and the generated schemas win:
+`typescript-stable/ServerRequest.ts` includes the `item/tool/requestUserInput` variant and
+`typescript-stable/v2/ToolRequestUserInput*.ts` are byte-identical to their `--experimental`
+counterparts, while genuinely experimental methods such as `thread/queue/*` appear only in
+the experimental dump. Opting in would additionally widen
+`CommandExecutionRequestApprovalParams` with `additionalPermissions` and
+`availableDecisions` — the server strips those only for non-opted-in connections — which
+the strict approval parser would refuse. So the opt-in would break a shipped feature to
+gain nothing. Enabling questions also leaves `approvalPolicy` untouched: a question is the
+model asking the user something, not permission to act.
+
+When a run ends with a batch outstanding, the native request is answered with an **empty**
+answer map. `ToolRequestUserInputResponse` has no decline variant, so that is the only
+honest reply: it answers no question, invents nothing, and releases the server's wait.
+
+Questions and answers are untrusted, possibly sensitive text, and a settled answer is
+committed to the durable event log. A host that must not retain a secret should refuse a
+request carrying `sensitive: true` rather than collect one. This adapter copies no prompt,
+option or answer text into a diagnostic, an `AgentError` message or a `providerCode`.
+
+Two limits worth stating plainly:
+
+- **A denial reason does not reach the model.** `CommandExecutionRequestApprovalResponse` carries `decision` and nothing else, so `response.reason` is not transmissible on this protocol. The descriptor says so: `extensions.approvalDenialReasonDelivered === false`.
+- **An approval is provider-declared intent, not a runtime guarantee.** The subject's `command`, `cwd`, `reason` and parsed command actions are untrusted, potentially sensitive host-visible data from another process, and the runtime neither runs the command nor can enforce that Codex runs exactly it (ADR-0009). Displaying, retaining and access-controlling that text is the host's responsibility.
+
+Settlement is **process-local and exactly-once**: one reference settles one native callback one time. An identical redelivery is a no-op, a conflicting answer is `interaction_already_settled`, an unknown or retired reference is `unknown_interaction`, and a mode the protocol cannot encode is `capability_unsupported` _before_ the settlement is consumed, so the approval stays answerable. This is not crash-safe exactly-once. Interrupt initiation synchronously declines outstanding approvals and retires their references before awaiting acknowledgement. A failed interrupt can be retried, but approvals remain fenced for that run. Completion, failure and disposal also retire approvals; EOF or transport failure retires references even when a reply can no longer be written. Late answers cannot settle or revive the run.
+
+The complete command-approval shape is validated against the pinned schema before admission. Missing required fields, malformed optional fields, unknown fields or command-action variants, non-null execution environments, stdin requests and policy/network context that the neutral response cannot represent are rejected. Only declared display fields of the four stable command-action variants (`read`, `listFiles`, `search`, `unknown`) are reconstructed in the subject. Native correlation and callback identifiers remain private. Mode-bearing denials and other invalid neutral responses are rejected before consuming the callback.
+
+Native request identities are retained for the connection lifetime, including after reply and across runs. Identical and conflicting reuse both produce a diagnostic with no second interaction or reply. Retention is bounded at **4096 unique server request IDs**, separate from the **256 approvals per run** registry bound. The next unique request and any outstanding callbacks receive an explicit error, then the client fences the connection and fails the active run; no identity is evicted to admit new traffic. The host must dispose the session (retrying failed disposal) and open a new one.
+
 ### Credentials
 
-This adapter neither reads, manages, nor forwards credentials. The child inherits the host process environment, and the app-server resolves its own auth from `CODEX_HOME`/`HOME`. Nothing from a credential, a prompt, a path or a raw upstream error string is copied into a durable event or `AgentError`: upstream failures are published only as an allowlisted classification.
+The host owns authentication; this adapter implements no credential-management RPCs. The child inherits the host process environment, and the app-server resolves its own auth from `CODEX_HOME`/`HOME`. Diagnostics and `AgentError` publish upstream failures only as allowlisted classifications, never raw upstream error strings. Approval subjects intentionally publish command, cwd, reason and parsed action content into host-visible events; that untrusted content can contain sensitive paths, prompt text or credentials. Hosts control its display, retention and access.
 
 ## Lifecycle
 

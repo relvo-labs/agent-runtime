@@ -174,7 +174,7 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-run.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/agent-run.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
@@ -347,5 +347,5 @@
   ],
   "title": "agent-run",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

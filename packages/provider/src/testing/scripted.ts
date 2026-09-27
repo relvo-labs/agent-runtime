@@ -15,6 +15,7 @@
  */
 
 import {
+  WIRE_VERSION,
   type InteractionRequest,
   type InteractionResponse,
   type JsonObject,
@@ -314,7 +315,9 @@ class ScriptedSession implements ProviderSession {
     return Promise.resolve({
       providerId: this.#options.providerId ?? 'scripted',
       providerVersion: '0.1.0',
-      wireVersion: '0.4',
+      // The line this double speaks; reading the constant keeps it from
+      // silently falling behind a wire bump.
+      wireVersion: WIRE_VERSION,
       // Deliberately opaque: a consumer must not read inside this.
       opaque: { sessionRef: this.sessionRef, runCount: this.runs.length },
     });
@@ -348,7 +351,17 @@ export function createScriptedProvider(options: ScriptedProviderOptions = {}): {
         modes: options.supportsApproval === false ? [] : ['once', 'session'],
         blocking: true,
       },
-      question: { supported: options.supportsQuestion ?? true, choices: true, multiSelect: true },
+      question: {
+        supported: options.supportsQuestion ?? true,
+        choices: true,
+        multiSelect: true,
+        // The double can script any request the protocol admits, including a
+        // batch, so it declares the batch capability alongside the single form.
+        batch: options.supportsQuestion ?? true,
+        maxQuestions: null,
+        freeText: true,
+        sensitive: true,
+      },
       settlementTimeoutMs: null,
     },
     workspace: { requires: 'directory', acceptsOwnership: ['borrowed', 'managed'], writes: false },

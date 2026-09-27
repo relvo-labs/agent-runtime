@@ -130,9 +130,9 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/command-result.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/command-result.json",
   "$ref": "#/$defs/command-result",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "command-result",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

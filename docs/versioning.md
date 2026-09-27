@@ -9,21 +9,26 @@ Line-bound documents that carry a `wireVersion` use a literal for that line in b
 and generated JSON Schema. Provider descriptors are negotiation inputs: their version is
 intentionally parsed as a bounded string, then compared explicitly before registration.
 
-Foundation v0.4 is the initial pre-1.0 line. All eight public packages have an immutable
-`0.2.0` release. The wire compatibility fixtures published by
-`@relvo-labs/agent-protocol@0.2.0` are therefore immutable.
+Foundation v0.4 was the initial pre-1.0 wire line, published in
+`@relvo-labs/agent-protocol@0.2.0`. Wire 0.5 was published in
+`@relvo-labs/agent-protocol@0.3.0`. Both published compatibility fixtures are immutable.
+All eight public packages have immutable `0.2.0` and `0.3.0` releases; a 2026-09-27
+registry observation found `latest=0.3.0` for each. Provider `0.4.0` is not published.
 
 A version file records intent, not a release: a version bump is made by a separate reviewed
 release PR running `changeset version`, and publication is a manual, explicitly scoped
 dispatch of [`.github/workflows/release.yml`](../.github/workflows/release.yml) that refuses
-to run while any changeset is still pending. The eight public package manifests are prepared
-at `0.2.0` with no changeset pending, but that does not authorize another publication.
+to run while any changeset is still pending. The eight public package manifests on `main`
+are at `0.3.0`, and provider compatibility intent is pending. A separate version-only
+branch is not a release or dispatch approval.
 
 A release runs only against a commit that is the exact current tip of `main`, with the
 canonical gate green on that commit and the `npm-release` environment approval given for
 that run. Carrying a version number is one of those conditions and the weakest of them — it
-makes a line reviewable, not releasable. No published `0.2.0` package may be named in a
-dispatch again; every future version and scope needs fresh human authority. See the
+makes a line reviewable, not releasable. No published `0.2.0` or `0.3.0` package may be
+named in a dispatch again; every future version and scope needs fresh human authority.
+Linked Changesets align only packages entering a plan, so a leaf-adapter release can
+contain just the Claude and Codex adapters. See the
 [release runbook](release.md) and the [release notes](release-notes.md).
 
 Because `.changeset/config.json` sets `changelog: false`, consuming a changeset does not leave a generated `CHANGELOG.md` behind. `docs/release-notes.md` carries that information forward per prepared version, including the `BREAKING:` notes that justify a pre-1.0 minor.

@@ -42,7 +42,57 @@
           "$ref": "#/$defs/question-response"
         },
         {
+          "$ref": "#/$defs/question-set-response"
+        },
+        {
           "$ref": "#/$defs/approval-response"
+        }
+      ]
+    },
+    "question-answer": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "maxLength": 16000,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "selection",
+              "type": "string"
+            },
+            "values": {
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "values"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -77,11 +127,37 @@
         "answer"
       ],
       "type": "object"
+    },
+    "question-set-response": {
+      "additionalProperties": false,
+      "properties": {
+        "answers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/question-answer"
+          },
+          "propertyNames": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "kind": {
+          "const": "question_set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answers"
+      ],
+      "type": "object"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/interaction-response.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/interaction-response.json",
   "$ref": "#/$defs/interaction-response",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "interaction-response",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

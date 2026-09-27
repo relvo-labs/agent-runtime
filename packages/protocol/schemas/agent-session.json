@@ -159,7 +159,7 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/agent-session.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/agent-session.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -190,7 +190,7 @@
       "type": "array"
     },
     "wireVersion": {
-      "const": "0.4",
+      "const": "0.5",
       "type": "string"
     },
     "workspace": {
@@ -208,5 +208,5 @@
   ],
   "title": "agent-session",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

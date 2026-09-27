@@ -172,7 +172,14 @@ describe('wire contract', () => {
       multiSelect: false,
     };
     expect(checkResponseAgainstRequest(request, { kind: 'question', answer: 'a' })).toBeUndefined();
-    expect(checkResponseAgainstRequest(request, { kind: 'question', answer: 'b' })).toContain('unknown choice');
+    const rejected = checkResponseAgainstRequest(request, {
+      kind: 'question',
+      answer: 'SYNTHETIC_SECRET_MARKER',
+    });
+    expect(rejected).toContain('does not offer');
+    // The reason is wrapped in an `AgentError` and recorded on a durable
+    // command receipt, so it states a count and never the rejected value.
+    expect(rejected).not.toContain('SYNTHETIC_SECRET_MARKER');
     expect(
       AgentInteractionSchema.safeParse({
         interactionId: 'int_0000000000000001',
@@ -187,7 +194,7 @@ describe('wire contract', () => {
   });
 
   it('keeps wire and package versions conceptually separate', () => {
-    expect(WIRE_VERSION).toBe('0.4');
+    expect(WIRE_VERSION).toBe('0.5');
   });
 
   it('rejects a version-only mismatch on line-bound session documents', () => {
@@ -196,7 +203,7 @@ describe('wire contract', () => {
         sessionId: 'ses_0000000000000001',
         state: 'ready',
         providerId: 'scripted',
-        wireVersion: '0.5',
+        wireVersion: '0.6',
         workspace: {
           leaseId: 'wsl_0000000000000001',
           ownership: 'borrowed',
@@ -244,7 +251,7 @@ describe('wire contract', () => {
       ProviderRecoveryRecordSchema.safeParse({
         providerId: 'scripted',
         providerVersion: '0.1.0',
-        wireVersion: '0.5',
+        wireVersion: '0.6',
         opaque: { resumable: true },
       }).success,
     ).toBe(false);

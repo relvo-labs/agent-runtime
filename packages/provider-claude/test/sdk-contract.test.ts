@@ -9,7 +9,7 @@
  *
  * What is maintained here instead is a *recorded* description of the exact
  * entry point this adapter uses, authored from the published contract of
- * `@anthropic-ai/claude-agent-sdk@0.3.259` — names and shapes required for
+ * `@anthropic-ai/claude-agent-sdk@0.3.260` — names and shapes required for
  * interoperability, no copied text. The assertions below are compile-time:
  * `pnpm --filter @relvo-labs/agent-provider-claude typecheck` (and the gate's
  * workspace typecheck, which includes `test/**`) fails if the seam stops
@@ -31,20 +31,24 @@ import { describe, expect, it } from 'vitest';
 
 import { CLAUDE_AGENT_SDK_VERSION } from '../src/index.ts';
 import type {
+  ClaudeAskUserQuestionInput,
+  ClaudeCanUseTool,
   ClaudeInterruptReceipt,
   ClaudeMessageUuid,
+  ClaudePermissionResult,
   ClaudePromptMessage,
   ClaudeQuery,
   ClaudeQueryHandle,
   ClaudeQueryMessage,
   ClaudeQueryOptions,
+  ClaudeToolPermissionRequest,
 } from '../src/seam.ts';
 
 /** The SDK release this recording was derived from. */
-const RECORDED_SDK_VERSION = '0.3.259';
+const RECORDED_SDK_VERSION = '0.3.260';
 
 // ---------------------------------------------------------------------------
-// Recorded SDK surface (0.3.259)
+// Recorded SDK surface (0.3.260)
 // ---------------------------------------------------------------------------
 
 type RecordedUuid = `${string}-${string}-${string}-${string}-${string}`;
@@ -60,6 +64,80 @@ type RecordedUserMessage = {
   session_id?: string;
 };
 
+/** `PermissionDecisionClassification` — how a decision was arrived at. */
+type RecordedDecisionClassification = 'user_temporary' | 'user_permanent' | 'user_reject';
+
+/**
+ * `PermissionResult` — what the host callback may answer with.
+ *
+ * `decisionClassification` is recorded on both branches because 0.3.260
+ * declares it on both. This adapter does not return it: the classification it
+ * could honestly report is already implied by a `once` grant or a denial, and
+ * emitting one would state a durability this bridge does not implement.
+ */
+type RecordedPermissionResult =
+  | {
+      behavior: 'allow';
+      updatedInput?: Record<string, unknown>;
+      updatedPermissions?: unknown[];
+      toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
+    }
+  | {
+      behavior: 'deny';
+      message: string;
+      interrupt?: boolean;
+      toolUseID?: string;
+      decisionClassification?: RecordedDecisionClassification;
+    };
+
+/**
+ * `AskUserQuestionInput` — the generated tool-input schema for the SDK's
+ * clarifying-question tool, as `canUseTool` receives it.
+ *
+ * Recorded because it is the *answer route*: `answers` is declared on the
+ * **input**, described as "User answers collected by the permission component",
+ * and a host supplies it by allowing the call with an `updatedInput`. The tuple
+ * bounds (1–4 questions, 2–4 options) are recorded as bounds rather than as
+ * tuples — the adapter enforces them at runtime, because a declared tuple says
+ * nothing about a value arriving from another process.
+ */
+type RecordedAskUserQuestionInput = {
+  questions: {
+    question: string;
+    header: string;
+    options: { label: string; description: string; preview?: string }[];
+    multiSelect: boolean;
+  }[];
+  answers?: Record<string, string>;
+  annotations?: Record<string, { preview?: string; notes?: string }>;
+  metadata?: { source?: string };
+};
+
+/**
+ * `CanUseTool` — the host permission callback, with the per-call context the
+ * SDK supplies. The adapter reads only `signal` and `toolUseID`; the rest is
+ * recorded so the contravariant direction is proven against the real shape
+ * rather than against the subset this adapter happens to want.
+ */
+type RecordedCanUseTool = (
+  toolName: string,
+  input: Record<string, unknown>,
+  options: {
+    signal: AbortSignal;
+    toolUseID: string;
+    requestId: string;
+    suggestions?: unknown[];
+    blockedPath?: string;
+    decisionReason?: string;
+    title?: string;
+    displayName?: string;
+    description?: string;
+    agentID?: string;
+    matchedAskRule?: { source: string; toolName: string; ruleContent?: string };
+  },
+) => Promise<RecordedPermissionResult | null>;
+
 /** `Options` — the fields this adapter sets, with their declared types. */
 type RecordedOptions = {
   abortController?: AbortController;
@@ -71,6 +149,7 @@ type RecordedOptions = {
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto';
   allowDangerouslySkipPermissions?: boolean;
   permissionPrompts?: 'host' | 'none';
+  canUseTool?: RecordedCanUseTool;
   includePartialMessages?: boolean;
   resume?: string;
 };
@@ -154,6 +233,25 @@ export type SdkAcceptsStampedPrompt = Assert<Assignable<ClaudePromptMessage, Rec
 export type SdkAcceptsClientUuid = Assert<Assignable<ClaudeMessageUuid, RecordedUuid>>;
 /** The options the adapter builds must be acceptable to the SDK's `Options`. */
 export type SdkAcceptsAdapterOptions = Assert<Assignable<ClaudeQueryOptions, RecordedOptions>>;
+/** The bridge's callback must be installable as the SDK's `canUseTool`. */
+export type SdkAcceptsPermissionCallback = Assert<Assignable<ClaudeCanUseTool, RecordedCanUseTool>>;
+/** Every decision the bridge returns must be a `PermissionResult` the SDK reads. */
+export type SdkAcceptsPermissionResult = Assert<Assignable<ClaudePermissionResult, RecordedPermissionResult>>;
+/** The recorded tool input must be readable through the seam's question shape. */
+export type SeamReadsAskUserQuestionInput = Assert<
+  Assignable<RecordedAskUserQuestionInput, ClaudeAskUserQuestionInput>
+>;
+/**
+ * The answer the bridge returns must be a `PermissionResult` the SDK reads —
+ * including its `updatedInput`, which is what carries the answers.
+ */
+export type SdkAcceptsAnsweredQuestion = Assert<
+  Assignable<{ behavior: 'allow'; updatedInput: Record<string, unknown> }, RecordedPermissionResult>
+>;
+/** The SDK's per-call context must satisfy the narrower one the bridge declares. */
+export type SeamAcceptsPermissionRequest = Assert<
+  Assignable<Parameters<RecordedCanUseTool>[2], ClaudeToolPermissionRequest>
+>;
 
 describe('pinned SDK contract', () => {
   it('records the SDK version the seam was derived from', () => {
@@ -166,6 +264,6 @@ describe('pinned SDK contract', () => {
     // Deliberate limitation, kept visible: this file proves seam ↔ recording,
     // never recording ↔ the SDK on disk, which policy keeps out of this
     // workspace. The header documents the out-of-repository step.
-    expect(RECORDED_SDK_VERSION).toBe('0.3.259');
+    expect(RECORDED_SDK_VERSION).toBe('0.3.260');
   });
 });

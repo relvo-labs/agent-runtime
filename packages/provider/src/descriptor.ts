@@ -70,6 +70,35 @@ export function canRaiseApproval(descriptor: ProviderDescriptor, mode: ApprovalM
   return ok;
 }
 
+/**
+ * Whether a provider may raise a batch of correlated questions.
+ *
+ * A host consults this before offering a batch surface. `count` is checked
+ * against the provider's own stated bound so an over-long batch fails here,
+ * with a readable reason, rather than as a malformed native request later.
+ */
+export function canAskQuestionSet(descriptor: ProviderDescriptor, count: number): CapabilityCheck {
+  const question = descriptor.interaction.question;
+  if (!question.supported || !question.batch) {
+    return deny(`provider \`${descriptor.providerId}\` does not raise multi-question interactions`, {
+      providerId: descriptor.providerId,
+      capability: 'interaction.question.batch',
+    });
+  }
+  if (question.maxQuestions !== null && count > question.maxQuestions) {
+    return deny(
+      `provider \`${descriptor.providerId}\` asks at most ${String(question.maxQuestions)} questions at once`,
+      {
+        providerId: descriptor.providerId,
+        capability: 'interaction.question.maxQuestions',
+        requested: count,
+        supported: question.maxQuestions,
+      },
+    );
+  }
+  return ok;
+}
+
 export function canAcceptWorkspace(descriptor: ProviderDescriptor, ownership: 'borrowed' | 'managed'): CapabilityCheck {
   if (descriptor.workspace.requires === 'none') return ok;
   if (!descriptor.workspace.acceptsOwnership.includes(ownership)) {

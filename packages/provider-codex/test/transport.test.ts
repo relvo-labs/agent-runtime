@@ -7,7 +7,7 @@
  *
  * The child is a small Node program passed with `-e`, so the suite stays
  * credential-free, network-free, and needs no Codex installation. It speaks the
- * pinned 0.153.4 frame shapes and always terminates.
+ * pinned 0.156.1 frame shapes and always terminates.
  *
  * Every test here runs inside `withFixture`, which bounds each wait and cleans
  * up the exact processes it created — see `fixture.ts`. Nothing in this file
@@ -143,7 +143,7 @@ process.stdin.on('end', () => { if (MODE !== 'ignore-term') process.exit(0); });
 function handle(message) {
   switch (message.method) {
     case 'initialize':
-      send({ id: message.id, result: { userAgent: 'fake', codexHome: '/tmp/codex', platformFamily: 'unix', platformOs: 'linux' } });
+      send({ id: message.id, result: { userAgent: (message.params?.clientInfo?.name ?? 'relvo_agent_runtime') + '/0.156.1 (test; x86_64)', codexHome: '/tmp/codex', platformFamily: 'unix', platformOs: 'linux' } });
       return;
     case 'initialized':
       return;
@@ -272,7 +272,7 @@ describe('argv and shell safety', () => {
         fixture.onCleanup(() => transport.close());
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: () => undefined,
         });
@@ -501,7 +501,7 @@ describe('process exit and teardown', () => {
         fixture.onCleanup(() => transport.close());
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: () => undefined,
         });
@@ -1075,7 +1075,7 @@ describe('stdout EOF while the process is still alive', () => {
         const ends: CodexClientEnd[] = [];
         const client = createCodexClient(transport, {
           onNotification: () => undefined,
-          onServerRequest: () => undefined,
+          onServerRequest: () => false,
           onDrop: () => undefined,
           onEnd: (end) => ends.push(end),
         });

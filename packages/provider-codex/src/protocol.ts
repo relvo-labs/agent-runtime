@@ -223,12 +223,12 @@ export function classifyServerMessage(value: unknown): CodexServerMessage | unde
 }
 
 // ---------------------------------------------------------------------------
-// Method names — pinned to the 0.153.4 stable surface
+// Method names — pinned to the 0.156.1 stable surface
 // ---------------------------------------------------------------------------
 
 /**
  * Every method this adapter sends or reads, verified present in
- * `typescript-stable/` for codex-cli 0.153.4. Nothing experimental appears here.
+ * `typescript-stable/` for codex-cli 0.156.1. Nothing experimental appears here.
  */
 export const CODEX_METHOD = {
   initialize: 'initialize',
@@ -246,17 +246,52 @@ export const CODEX_NOTIFICATION = {
   itemCompleted: 'item/completed',
   tokenUsage: 'thread/tokenUsage/updated',
   error: 'error',
+  /**
+   * The server has resolved one of its own outstanding requests.
+   *
+   * It confirms an answer this client already sent *and* retires a request the
+   * server settled by itself, which is the app-server's withdrawal signal for
+   * `item/tool/requestUserInput`. Its payload is `{ threadId, requestId }` —
+   * no `turnId` — so it is correlated by the native request id the client
+   * layer holds, never by turn.
+   */
+  serverRequestResolved: 'serverRequest/resolved',
 } as const;
 
 /**
- * Every server-initiated request in the pinned stable surface
- * (`typescript-stable/ServerRequest.ts`, codex-cli 0.153.4).
+ * Correlation carried by `serverRequest/resolved`.
  *
- * This adapter implements none of them and declines them all. The set exists so
- * a *recognised* method can be named in a diagnostic without republishing an
- * arbitrary server-controlled string: anything not listed here is reported by a
- * constant instead. A method name is metadata from another process, and a
- * durable event is the wrong place to discover what it can contain.
+ * Read positively and permissively: an unrecognised extra member must not turn
+ * withdrawal back off, because the failure mode of ignoring this notification
+ * is a permanently pending question. Only the two fields this adapter acts on
+ * are extracted, and `requestId` is validated as an echo-safe `RequestId`.
+ */
+export function asServerRequestResolved(
+  value: unknown,
+): { readonly threadId: string; readonly requestId: CodexRequestId } | undefined {
+  const record = asRecord(value);
+  if (record === undefined) return undefined;
+  const threadId = asId(record.threadId);
+  const requestId = asRequestId(record.requestId);
+  if (threadId === undefined || requestId === undefined) return undefined;
+  return { threadId, requestId };
+}
+
+/**
+ * Every server-initiated request in the pinned stable surface
+ * (`typescript-stable/ServerRequest.ts`, codex-cli 0.156.1).
+ *
+ * This adapter bridges exactly one of them —
+ * `item/commandExecution/requestApproval`, and only when
+ * `createCodexProvider({ approvals: 'bridge' })` asked for it — and declines
+ * every other one. `interaction.ts` carries the mapping table and the evidence
+ * for each refusal.
+ *
+ * The set exists so a *recognised* method can be named in a diagnostic without
+ * republishing an arbitrary server-controlled string: anything not listed here
+ * is reported by a constant instead. A method name is metadata from another
+ * process, and a durable event is the wrong place to discover what it can
+ * contain.
  */
 export const CODEX_SERVER_REQUEST: ReadonlySet<string> = new Set([
   'item/commandExecution/requestApproval',
@@ -272,11 +307,29 @@ export const CODEX_SERVER_REQUEST: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * JSON-RPC code used when declining a server-initiated request.
+ * JSON-RPC code used when declining a server-initiated request outright.
  *
- * -32601 (method not found) is the honest classification: this adapter
- * implements none of the stable `ServerRequest` methods. Declining explicitly
- * matters because `item/tool/requestUserInput` carries `isBlocking`, so silence
- * can stall a turn indefinitely (research, "Wire and initialization").
+ * -32601 (method not found) is the honest classification for a method this
+ * adapter does not implement. Declining explicitly matters because
+ * `item/tool/requestUserInput` carries `isBlocking`, so silence can stall a
+ * turn indefinitely (research, "Wire and initialization").
  */
 export const METHOD_NOT_SUPPORTED = -32601;
+
+/**
+ * A bridged method whose payload cannot be represented faithfully.
+ *
+ * -32602 (invalid params) separates "this adapter does not do that at all"
+ * from "this adapter does that, but not with these parameters" — the second is
+ * the one a server can act on by asking differently.
+ */
+export const INVALID_PARAMS = -32602;
+
+/**
+ * A well-formed request that is not admissible right now.
+ *
+ * -32600 (invalid request) covers an approval for a turn that is not the
+ * active one, one that arrives with no run to own it, and one that arrives
+ * after this adapter's per-session bound is already full.
+ */
+export const INVALID_REQUEST = -32600;

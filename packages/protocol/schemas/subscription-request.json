@@ -10,7 +10,7 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.relvo.dev/agent-runtime/0.4/subscription-request.json",
+  "$id": "https://schemas.relvo.dev/agent-runtime/0.5/subscription-request.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -47,5 +47,5 @@
   ],
   "title": "subscription-request",
   "type": "object",
-  "x-wire-version": "0.4"
+  "x-wire-version": "0.5"
 }

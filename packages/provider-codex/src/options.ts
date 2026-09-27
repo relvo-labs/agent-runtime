@@ -70,6 +70,55 @@ export type CodexProviderOptions = {
   /** Default execution policy, overridable per session. Defaults to `read-only`. */
   readonly sandboxMode?: CodexSandboxMode;
   /**
+   * Whether the app-server's command-approval requests are bridged to neutral
+   * approval interactions.
+   *
+   * Defaults to `'none'`, which keeps the current posture exactly: `thread/start`
+   * sends `approvalPolicy: 'never'`, the descriptor declares no approval
+   * capability, and every server-initiated request is declined. That is the
+   * honest reading of a host with no approval surface — a bridged approval
+   * nobody answers would park a run, because this adapter imposes no settlement
+   * deadline of its own.
+   *
+   * `'bridge'` sends `approvalPolicy: 'on-request'`, declares
+   * `approval = { supported: true, modes: ['once', 'session'], blocking: true }`
+   * and raises one `interaction.requested` per
+   * `item/commandExecution/requestApproval` on the run that owns the turn. The
+   * command only runs after an explicit `approved` response reaches
+   * `respondToInteraction`. Every other server request stays declined — see the
+   * mapping table in `interaction.ts`.
+   *
+   * This is provider-level, not a session override: a descriptor is one object
+   * for the whole provider, and a capability that varied per session would be a
+   * claim the descriptor cannot make truthfully.
+   */
+  readonly approvals?: 'none' | 'bridge';
+  /**
+   * Whether the app-server's `item/tool/requestUserInput` requests are bridged
+   * to neutral `question_set` interactions.
+   *
+   * Defaults to `'none'`, which keeps the current posture: the method is
+   * declined with `-32601` on its own request id, so a blocking request cannot
+   * stall a turn while nobody answers it.
+   *
+   * `'bridge'` raises one `interaction.requested` per request, on the run that
+   * owns `(threadId, turnId)`, and answers the native request with the whole
+   * `{ answers: { [questionId]: { answers } } }` map once the host settles it —
+   * so the same turn resumes where it paused.
+   *
+   * **No capability opt-in accompanies this.** `initialize.params.capabilities`
+   * stays `null`: `item/tool/requestUserInput` and its parameter types are in
+   * the pinned *stable* generated surface for 0.156.1, byte-identical to their
+   * `--experimental` counterparts, while genuinely experimental methods such as
+   * `thread/queue/*` are absent from that surface. Setting `experimentalApi`
+   * would additionally widen `CommandExecutionRequestApprovalParams`, which the
+   * approval bridge parses strictly — so opting in would break a shipped
+   * feature to gain nothing. See ADR-0018.
+   *
+   * Provider-level, not a session override, for the same reason `approvals` is.
+   */
+  readonly questions?: 'none' | 'bridge';
+  /**
    * Client identity sent in `initialize.params.clientInfo.name`. Upstream uses
    * it for compliance-log attribution, so a host with its own registered client
    * name should set it.
