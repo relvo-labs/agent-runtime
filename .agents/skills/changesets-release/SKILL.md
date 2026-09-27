@@ -85,9 +85,10 @@ Do not use this skill when:
    "BREAKING: `subscribe()` now returns `SubscriptionMessage` instead of `EventEnvelope`;
    narrow with `message.type === 'event'` before reading `message.event`."
 
-5. **Keep versions linked where the contract is shared.** `agent-protocol` and its direct
-   dependents move together via the `linked` config; do not hand-edit a `version` to
-   break that.
+5. **Keep versions linked where the contract is shared.** The `linked` config aligns
+   packages that enter a release plan; it does not force every linked package into every
+   plan. A leaf-adapter release can include only the Claude and Codex adapters. Do not
+   hand-edit a `version` to break the plan's alignment.
 
 6. **Never hand-run `changeset version` on a feature branch.** Version bumps and changelog
    generation belong to a dedicated release PR that does nothing else, so the diff a
