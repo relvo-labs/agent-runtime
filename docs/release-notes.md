@@ -9,14 +9,49 @@ Notes are written when a version is **prepared**. A version appearing here has n
 itself, been published: publication is a separate manual dispatch described in the
 [release runbook](release.md).
 
-## 0.3.0 — prepared, not published
+## 0.4.0 — prepared, not published
 
-All eight public packages move together from `0.2.0`; `linked` keeps them in step.
+Only `@relvo-labs/agent-provider-claude` and `@relvo-labs/agent-provider-codex`
+move from `0.3.0` to `0.4.0`; the other six public packages remain at their
+published `0.3.0` versions. This preparation consumed the sole pending changeset,
+`provider-upstream-compat`. It does not authorize a merge, release dispatch or
+publication.
+
+**BREAKING:** Consumers typed against `CLAUDE_AGENT_SDK_VERSION` or
+`CODEX_APP_SERVER_VERSION` as the previous string literals must accept `0.3.260` or
+`0.156.1`, respectively. The optional Claude Agent SDK peer now accepts the bounded,
+tested pre-latch window `>=0.3.259 <0.3.261` instead of requiring one exact version.
+Codex moves its stable app-server baseline from `0.153.4` to `0.156.1` without bundling
+the CLI; its separately verified compatible CLI window is documented and checked at
+initialization. Host-managed transports and test doubles must now return an
+`InitializeResponse.userAgent` beginning with `<clientInfo.name>/<supported-version> (`;
+missing, malformed and out-of-window values reject before `thread/start`. Claude
+`0.3.261+` is excluded: its ambiguous first-command queued-interrupt receipt needs a
+separately verified adapter design. Neither adapter claims authenticated model-run
+evidence. Neutral wire contracts are unchanged.
+
+The reviewed Codex stable CLI allowlist is `0.153.4`, `0.154.0`, `0.155.0`, `0.155.1`,
+`0.156.0` and `0.156.1`. It is a finite set, not a claim about unreviewed versions between
+those endpoints. Codex also exports `CODEX_APP_SERVER_MIN_VERSION` (`0.153.4`) and
+`CODEX_APP_SERVER_MAX_VERSION` (`0.156.1`); its
+`describe().extensions.supportedAppServerVersions` reports the exact six-version allowlist.
+The neutral wire version remains `0.5`.
+
+## 0.3.0 — published
+
+All eight public packages moved together from `0.2.0`. A public registry observation
+against `https://registry.npmjs.org` on `2026-09-27` found HTTP 200 for each of the eight
+package packuments. Each listed `0.2.0` and `0.3.0` and reported `latest = 0.3.0`. This
+establishes the version listings and dist-tags observed that day; it does not establish
+artifact integrity, shasums or tarball contents.
+
+The rest of this 0.3.0 section is its historical preparation record. At the time, all
+eight packages were prepared together and `linked` kept them in step.
 `@relvo-labs/reference-app` is private, stays at `0.0.0`, and is not part of this or any
 release. At the registry observation taken for this preparation, every one of the eight
-served only `0.2.0` with `latest = 0.2.0`; `0.3.0` was absent. Preparation is not merge,
-dispatch or publication authority, and this branch is **not dispatchable** — see the
-[release runbook](release.md).
+served only `0.2.0` with `latest = 0.2.0`; `0.3.0` was absent then. That preparation did
+not authorize merge, dispatch or publication, and its branch was **not dispatchable** —
+see the [release runbook](release.md).
 
 Prepared by consuming seven changesets: `structured-question-sets`,
 `claude-approval-bridge`, `claude-structured-questions`, `codex-approval-bridge`,
