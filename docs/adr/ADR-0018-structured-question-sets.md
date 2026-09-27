@@ -165,10 +165,12 @@ breaking. `SCHEMA_ID_BASE` moves with it, so every generated `$id` changes from
 `…/agent-runtime/0.4/…` to `…/agent-runtime/0.5/…`.
 
 The `interaction.withdrawn` provider payload in §6 is a member added to a closed union and
-is therefore breaking by the same table. It does **not** move the line again: `0.5` has
-never been published, and `runtime-contract-evolution` permits a release-blocker correction
-to refine a candidate line before its first publication. `0.5` is the line that carries the
-whole of ADR-0018, withdrawal included; nothing outside this repository encodes it.
+is therefore breaking by the same table. It did **not** move the line again: when this
+design was prepared, `0.5` was unpublished, so the retained-withdrawal release-blocker
+correction could be included in that candidate before its first publication. Wire `0.5`,
+including withdrawal, was subsequently published in `@relvo-labs/agent-protocol@0.3.0`.
+That published line is immutable; further incompatible corrections require a new wire
+minor and a separately reviewed package release.
 
 `docs/architecture/foundation-v0.4.md` keeps its filename: it documents the foundation
 milestone, not the wire minor, and renaming it would churn the skill ownership map for no
@@ -183,9 +185,10 @@ changeset body carries a `BREAKING:` line. Pre-1.0 this is a `minor` bump for
 `agent-protocol`, `agent-provider`, `agent-runtime`, `agent-provider-claude` and
 `agent-provider-codex`.
 
-**Nothing published is invalidated.** Only `@relvo-labs/agent-protocol@0.2.0` has ever been
-published, and it is a `0.3`-line artifact untouched by this change. No consumer is mid-flight
-on wire `0.4` outside this repository.
+**Published-line status.** `@relvo-labs/agent-protocol@0.2.0` carries wire `0.4`, and
+`@relvo-labs/agent-protocol@0.3.0` carries wire `0.5`; both are public and immutable as of
+2026-09-27. The earlier release remains available, but its readers reject wire `0.5`.
+External consumers may hold data or recovery records for either line.
 
 **Adapter negotiation is already exact.** `checkWireCompatibility` refuses a descriptor whose
 `wireVersion` differs from the runtime's. An out-of-tree adapter built against `0.4` therefore
@@ -194,17 +197,21 @@ immediate failure, not a corrupted interaction.
 
 **Consumer migration.**
 
-1. Rebuild against `agent-protocol` ≥ the version carrying wire `0.5`.
+1. Rebuild against `@relvo-labs/agent-protocol@0.3.0` or a later version that explicitly
+   supports wire `0.5`.
 2. Add a `case 'question_set':` to every `switch` on `request.kind` / `response.kind`. A
    consumer that renders only `'question'` keeps working for providers that raise only
    `'question'`; it must reject `'question_set'` rather than guess.
 3. Read `descriptor.interaction.question.batch` before offering a batch UI.
 4. Existing `kind: 'question'` code needs no change.
 
-**Rollback.** Revert the wire bump and the union member together; they are one commit and no
-persisted artifact outside this repository encodes `0.5`. An in-memory store holds no
-cross-version state, and `exportRecoveryRecord` stamps `wireVersion` as a literal, so a
-`0.5` record is refused by a reverted `0.4` build rather than silently misread.
+**Rollback.** Do not revert the published `0.3.0` contract in place or treat a return to a
+wire `0.4` build as a transparent rollback. `exportRecoveryRecord` stamps `wireVersion` as a
+literal, so a `0.5` record is refused by a `0.4` build rather than silently misread. A host
+returning to the published `0.2.0` line must account for that incompatibility and migrate
+or isolate its wire `0.5` records and consumers. Future contract changes need a new
+reviewed package version, and incompatible wire changes need a new wire minor with an
+explicit consumer and persisted-record migration path.
 
 ## Provider mappings (pinned, official)
 

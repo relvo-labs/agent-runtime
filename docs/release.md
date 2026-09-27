@@ -296,7 +296,7 @@ completed preparation and release, not a current approval or a dispatch plan.
    instead. That file, not a generated changelog, is what a reviewer reads to see what
    0.2.0 actually contains.
 
-   Preparing the versions did not authorize publication. Separate authorized runs have now
+   Preparing the versions did not authorize publication. Separate runs
    published all eight `0.2.0` packages. The eight `0.3.0` versions were subsequently
    published and are likewise immutable. A future release can only be dispatched against a
    commit that is the exact current tip of `main`, with the canonical gate green on that
