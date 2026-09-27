@@ -1,7 +1,7 @@
 ---
 name: npm-release
 description: Operate and change the manual, environment-gated npm publication path, where scope, order, integrity and registry facts are all proven before any credential exists.
-version: 1.6.0
+version: 1.6.1
 stability: stable
 tags: [npm, provenance, publish, registry, supply-chain]
 ---
@@ -261,7 +261,10 @@ local facts honestly: never supply `workflow_dispatch` or `refs/heads/main` to i
 a hosted dispatch. The 0.2.0 scope below deliberately names an already-published immutable
 version so registry preflight must reject it; never copy it into a real dispatch.
 A local run must refuse release eligibility.
-Packing still precedes diagnostic evaluation; issue #26 tracks that separate limitation.
+A scope the commit cannot pack (unknown or private package, or a version the commit does not
+carry) is refused before any pack work, with every artifact-free finding — context, pending
+intent and scope — reported together (issue #26). A packable scope is still packed, so a
+rehearsal exercises artifact and registry checks as well.
 
 ```bash
 export RELEASE_EVENT_NAME=local_nonpublishing_verification

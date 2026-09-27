@@ -116,7 +116,7 @@ function createLookupCache(registry: RegistryPort): (name: string) => Promise<Re
   };
 }
 
-function checkContext(input: PreflightInput, findings: Finding[]): void {
+function checkContext(input: PrePackInput, findings: Finding[]): void {
   const { context, git, request } = input;
   if (context.eventName !== 'workflow_dispatch') {
     findings.push({
@@ -153,7 +153,7 @@ function checkContext(input: PreflightInput, findings: Finding[]): void {
   }
 }
 
-function checkVersionIntent(input: PreflightInput, findings: Finding[]): void {
+function checkVersionIntent(input: PrePackInput, findings: Finding[]): void {
   for (const file of [...input.pendingChangesetFiles].sort()) {
     findings.push({
       code: 'pending_version_intent',
@@ -169,7 +169,7 @@ function checkVersionIntent(input: PreflightInput, findings: Finding[]): void {
   }
 }
 
-function checkScope(input: PreflightInput, findings: Finding[]): void {
+function checkScope(input: PrePackInput, findings: Finding[]): void {
   const byName = new Map(input.workspace.map((entry) => [entry.name, entry]));
   for (const target of input.request.targets) {
     const workspacePackage = byName.get(target.name);
@@ -375,13 +375,41 @@ async function checkRegistrySafety(
   }
 }
 
-export async function runPreflight(input: PreflightInput, registry: RegistryPort): Promise<PreflightOutcome> {
-  const findings: Finding[] = [];
-  const lookup = createLookupCache(registry);
+/** Everything preflight knows before any package has been packed. */
+export type PrePackInput = Omit<PreflightInput, 'artifacts' | 'registryUrl'>;
 
+function checkPrePack(input: PrePackInput): Finding[] {
+  const findings: Finding[] = [];
   checkContext(input, findings);
   checkVersionIntent(input, findings);
   checkScope(input, findings);
+  return findings;
+}
+
+/**
+ * Refusals that make packing pointless, decided without an artifact.
+ *
+ * When a named package is unknown, private, or not carried by the commit at
+ * the named version, `pnpm pack` cannot produce the requested artifact, and
+ * reading the tarball named after the requested version fails with ENOENT
+ * instead of the reason (issue #26). In that case this returns every finding
+ * that needs no artifact — context, pending version intent and scope — so the
+ * operator sees the whole picture before any pack work. Otherwise it returns
+ * nothing and packing proceeds; context and intent findings are then reported
+ * by `runPreflight` together with artifact and registry findings, which keeps
+ * a local non-publishing rehearsal exercising the full check set.
+ *
+ * An empty result is never permission: `runPreflight` repeats these checks.
+ */
+export function refusalsBeforePack(input: PrePackInput): readonly Finding[] {
+  const findings = checkPrePack(input);
+  return findings.some((finding) => finding.code.startsWith('scope_')) ? findings : [];
+}
+
+export async function runPreflight(input: PreflightInput, registry: RegistryPort): Promise<PreflightOutcome> {
+  const findings: Finding[] = [...checkPrePack(input)];
+  const lookup = createLookupCache(registry);
+
   const artifactsByName = checkArtifacts(input, findings);
   const order = await checkDependencyClosure(input, artifactsByName, lookup, findings);
   await checkRegistrySafety(input, lookup, findings);
