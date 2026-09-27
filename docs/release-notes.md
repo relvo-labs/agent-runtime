@@ -9,14 +9,33 @@ Notes are written when a version is **prepared**. A version appearing here has n
 itself, been published: publication is a separate manual dispatch described in the
 [release runbook](release.md).
 
-## 0.3.0 — prepared, not published
+## 0.3.0 — published and immutable
 
-All eight public packages move together from `0.2.0`; `linked` keeps them in step.
+All eight public packages entered this release plan and moved together from `0.2.0`.
+The `linked` configuration aligns packages entering a plan; it does not require every
+future plan to contain all eight. A leaf-adapter plan can contain just the two adapters.
 `@relvo-labs/reference-app` is private, stays at `0.0.0`, and is not part of this or any
-release. At the registry observation taken for this preparation, every one of the eight
-served only `0.2.0` with `latest = 0.2.0`; `0.3.0` was absent. Preparation is not merge,
-dispatch or publication authority, and this branch is **not dispatchable** — see the
-[release runbook](release.md).
+release. During preparation, a registry observation found only `0.2.0` with
+`latest=0.2.0`; that observation is historical. A fresh no-cache packument readback on
+2026-09-27 found both `0.2.0` and `0.3.0` public for all eight, with `latest=0.3.0`.
+Each version entry carries registry integrity metadata; this readback did not compare
+tarball bytes or integrity against reviewed artifacts. Neither published version may be
+republished or named in another dispatch. Provider `0.4.0` was absent in that readback
+and is not published. See the [release runbook](release.md).
+
+The eight exact 0.3.0 package versions are:
+
+- [`@relvo-labs/agent-protocol@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-protocol/v/0.3.0)
+- [`@relvo-labs/agent-executor@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-executor/v/0.3.0)
+- [`@relvo-labs/agent-provider@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider/v/0.3.0)
+- [`@relvo-labs/agent-provider-codex@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider-codex/v/0.3.0)
+- [`@relvo-labs/agent-provider-claude@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-provider-claude/v/0.3.0)
+- [`@relvo-labs/agent-runtime@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-runtime/v/0.3.0)
+- [`@relvo-labs/agent-workspace@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-workspace/v/0.3.0)
+- [`@relvo-labs/agent-workspace-git@0.3.0`](https://www.npmjs.com/package/@relvo-labs/agent-workspace-git/v/0.3.0)
+
+The preparation record below describes what entered 0.3.0. Preparation alone did not
+authorize its later dispatch or publication.
 
 Prepared by consuming seven changesets: `structured-question-sets`,
 `claude-approval-bridge`, `claude-structured-questions`, `codex-approval-bridge`,
@@ -168,8 +187,8 @@ signatures and wire 0.5 are unchanged by them.
 
 Version preparation moves versions. It produces no new provider evidence and upgrades none
 that the adapters already had. The
-[first-release evidence policy](release.md#first-release-evidence-policy) governs whether
-this line may be published at all.
+[release evidence policy](release.md#first-release-evidence-policy) governed whether
+this line could be published and remains the gate for future versions.
 
 | Claim                                                   | Evidence                                                                                                                                                                                          |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -199,14 +218,15 @@ and reported `latest = 0.2.0`. npm versions cannot be overwritten and unpublishi
 recovery plan, so each of these is public and immutable: never republish one, and never name
 one in a dispatch again.
 
-That observation establishes existence, the version list and the dist-tag, and nothing more.
-It recorded a hash of each packument response body only; it did not parse per-version
-integrity, shasum or tarball metadata. **Nothing here asserts that the artifacts the
-registry serves match the reviewed ones** — that is a separate check this preparation did
-not perform.
+That 2026-09-19 observation established existence, the version list and the dist-tag at
+that time. It recorded a hash of each packument response body only; it did not parse
+per-version integrity, shasum or tarball metadata. The 2026-09-27 readback found both
+published versions and integrity metadata, but did not compare the served artifacts with
+reviewed ones. The first protocol 0.2.0 upload has separate historical artifact evidence
+in the [release runbook](release.md#what-the-first-dispatch-established).
 
-The first line of Foundation v0.4. All eight public packages moved together from `0.1.0`;
-`linked` in the Changesets config kept them in step, and every internal dependency in the
+The first line of Foundation v0.4. All eight public packages entered that plan and moved
+together from `0.1.0`; `linked` aligned those entrants, and every internal dependency in the
 packed tarballs resolves to `^0.2.0`. `@relvo-labs/reference-app` is private and is not part
 of this or any release.
 

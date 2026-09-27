@@ -26,9 +26,10 @@ Do not use this skill when:
 - you are changing what a package ships — use `package-artifact-validation`
 - you are changing the canonical gate or the validation workflow — use `local-ci-parity`
 - you want to publish _now_: publication is a human decision with an environment approval,
-  not something an agent may initiate. Exactly one version is public —
-  `@relvo-labs/agent-protocol@0.2.0` — and it is immutable: it is never republished and
-  never named in a dispatch again.
+  not something an agent may initiate. All eight public packages have immutable `0.2.0`
+  and `0.3.0` versions; none is ever republished or named in a dispatch again. A
+  2026-09-27 registry observation found `latest` at `0.3.0` for all eight. Provider
+  `0.4.0` is not published.
 
 ## Owns
 
@@ -92,7 +93,8 @@ Do not use this skill when:
    a well-formed packument. A packument missing `dist-tags`, naming a tag that is not an
    exact version, or pointing a tag at a version it does not list is malformed: the
    dist-tag is the mutable half of a packument and reading it as "unset" is how a release
-   moves `latest` backwards while reporting success.
+   moves `latest` backwards while reporting success. For linked packages, only packages
+   entering a Changesets plan are aligned; an adapter-only plan can contain two packages.
 
 5. **An artifact has exactly one identity, or it is refused.** What this repository
    reads out of a tarball and what npm extracts from it must never be two different
@@ -256,9 +258,9 @@ with that `node` first on `PATH`.
 
 Rehearse preflight locally against real packed artifacts, without credentials. Report
 local facts honestly: never supply `workflow_dispatch` or `refs/heads/main` to impersonate
-a hosted dispatch. The 0.2.0 scope below is an example for the separately authorized
-version-preparation candidate; this repair retains the current manifests and intents.
-A local run must refuse release eligibility even after that candidate is versioned.
+a hosted dispatch. The 0.2.0 scope below deliberately names an already-published immutable
+version so registry preflight must reject it; never copy it into a real dispatch.
+A local run must refuse release eligibility.
 Packing still precedes diagnostic evaluation; issue #26 tracks that separate limitation.
 
 ```bash
@@ -271,8 +273,8 @@ export RELEASE_CONFIRM="publish 1 package(s) from $RELEASE_SOURCE_SHA to latest"
 node tools/release/preflight.ts --staging /tmp/release-staging
 ```
 
-This one-package example is a diagnostic rehearsal, not the full first-release scope.
-Read `docs/release.md` for the eight-package preparation and separate publication decision.
+This one-package example is a rejection-only diagnostic rehearsal, not a release scope.
+Read `docs/release.md` for publication policy and current registry status.
 The library release inventory does not assert feature coverage: the gate owns that proof.
 Raw pending-file checks remain required so empty or malformed intent cannot authorize
 publication through an empty release plan.
