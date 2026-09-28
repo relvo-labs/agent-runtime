@@ -4,14 +4,18 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  AgentRuntimeError,
   CommandIdSchema,
   SequenceSchema,
+  agentError,
   createCounterIdFactory,
   createFixedClock,
   type CommandId,
   type InteractionId,
   type InteractionRequest,
   type RunId,
+  RunIdSchema,
+  type SessionId,
 } from '@relvo-labs/agent-protocol';
 import {
   defineProviderDescriptor,
@@ -19,7 +23,7 @@ import {
   type ProviderEventSink,
   type ProviderRunTermination,
 } from '@relvo-labs/agent-provider';
-import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
+import { createLocalWorkspaceProvider, type WorkspaceProvider } from '@relvo-labs/agent-workspace';
 
 import { createAgentRuntime, type AgentRuntime } from '../src/runtime.ts';
 import { createInMemoryStore, type RuntimeStore } from '../src/store.ts';
@@ -44,9 +48,13 @@ async function fixture(
   options: {
     holdReadInteraction?: boolean;
     holdInterrupt?: boolean;
+    holdDispose?: boolean;
     rejectStart?: boolean;
     rejectResponse?: boolean;
     rejectInterrupt?: boolean;
+    holdReadEvents?: boolean;
+    holdReadAfterEvents?: boolean;
+    holdStart?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'relvo-persistence-window-'));
@@ -57,9 +65,25 @@ async function fixture(
   const idFactory = createCounterIdFactory();
   const base = createInMemoryStore({ clock, idFactory });
   let rejectNext: false | 'before' | 'after' = false;
+  let rejection: Error = new Error('injected transient commit failure');
   let skipCommits = 0;
   const interactionRead = deferred<undefined>();
   const interactionReadGate = deferred<undefined>();
+  const eventReadEntered = deferred<undefined>();
+  const eventReadGate = deferred<undefined>();
+  const finalReadEntered = deferred<undefined>();
+  const finalReadGate = deferred<undefined>();
+  const commitFailed = deferred<undefined>();
+  const textCommitted = deferred<undefined>();
+  const terminalCommitted = deferred<undefined>();
+  const secondTerminalCommitted = deferred<undefined>();
+  let terminalCommits = 0;
+  let successfulCommits = 0;
+  const commitWaiters: { after: number; resolve(): void }[] = [];
+  let heldEventRead = false;
+  let holdNextRead = false;
+  let eventPageReads = 0;
+  let onEventPage: ((sessionId: SessionId) => Promise<void>) | undefined;
   const store: RuntimeStore = {
     get revision() {
       return base.revision;
@@ -68,17 +92,53 @@ async function fixture(
       if (rejectNext && skipCommits-- <= 0) {
         const phase = rejectNext;
         rejectNext = false;
-        if (phase === 'after')
-          return base.commit((tx) => {
-            mutate(tx);
-            throw new Error('injected transient commit failure');
-          });
-        return Promise.reject(new Error('injected transient commit failure'));
+        const failing =
+          phase === 'after'
+            ? base.commit((tx) => {
+                mutate(tx);
+                throw rejection;
+              })
+            : Promise.reject(rejection);
+        return failing.finally(() => commitFailed.resolve(undefined));
       }
-      return base.commit(mutate);
+      return base.commit(mutate).then((result) => {
+        successfulCommits += 1;
+        for (const waiter of [...commitWaiters]) {
+          if (successfulCommits <= waiter.after) continue;
+          commitWaiters.splice(commitWaiters.indexOf(waiter), 1);
+          waiter.resolve();
+        }
+        if (result.events.some((event) => event.payload.type === 'run.message_delta')) {
+          textCommitted.resolve(undefined);
+        }
+        if (result.events.some((event) => event.payload.type === 'run.finished')) {
+          terminalCommits += 1;
+          if (terminalCommits === 1) terminalCommitted.resolve(undefined);
+          if (terminalCommits === 2) secondTerminalCommitted.resolve(undefined);
+        }
+        return result;
+      });
     },
-    read: (sessionId) => base.read(sessionId),
-    readEvents: (sessionId, from, limit) => base.readEvents(sessionId, from, limit),
+    read: async (sessionId) => {
+      if (holdNextRead) {
+        holdNextRead = false;
+        finalReadEntered.resolve(undefined);
+        await finalReadGate.promise;
+      }
+      return base.read(sessionId);
+    },
+    readEvents: async (sessionId, from, limit) => {
+      const page = await base.readEvents(sessionId, from, limit);
+      eventPageReads += 1;
+      if (options.holdReadAfterEvents) holdNextRead = true;
+      await onEventPage?.(sessionId);
+      if (options.holdReadEvents && !heldEventRead) {
+        heldEventRead = true;
+        eventReadEntered.resolve(undefined);
+        await eventReadGate.promise;
+      }
+      return page;
+    },
     readInteraction: async (sessionId, interactionId) => {
       const snapshot = await base.readInteraction(sessionId, interactionId);
       if (options.holdReadInteraction) {
@@ -91,13 +151,21 @@ async function fixture(
     listSessions: () => base.listSessions(),
   };
   const completion = deferred<ProviderRunTermination>();
+  const startEntered = deferred<undefined>();
+  const startGate = deferred<undefined>();
   const interruptGate = deferred<undefined>();
+  const interruptEntered = deferred<undefined>();
+  const disposeEntered = deferred<undefined>();
+  const disposeGate = deferred<undefined>();
   let sink: ProviderEventSink | undefined;
+  const runSinks: ProviderEventSink[] = [];
   let sessionSink: ProviderEventSink | undefined;
   let starts = 0;
   let responses = 0;
   let interrupts = 0;
   let disposes = 0;
+  let releases = 0;
+  const localWorkspaces = createLocalWorkspaceProvider({ baseDirectory: join(root, 'managed'), clock, idFactory });
   const descriptor = defineProviderDescriptor({
     providerId: 'fault-provider',
     providerVersion: '0.1.0',
@@ -112,33 +180,55 @@ async function fixture(
     createSession: (init) => {
       sessionSink = init.sink;
       return Promise.resolve({
-        startRun: (request) => {
+        startRun: async (request) => {
           starts += 1;
           sink = request.sink;
+          runSinks.push(request.sink);
+          startEntered.resolve(undefined);
+          if (options.holdStart) await startGate.promise;
           if (options.rejectStart) return Promise.reject(new Error('provider rejected start'));
-          return Promise.resolve({
-            completion: completion.promise,
+          const runCompletion = starts === 1 ? completion : deferred<ProviderRunTermination>();
+          return {
+            completion: runCompletion.promise,
             interrupt: async () => {
               interrupts += 1;
+              interruptEntered.resolve(undefined);
               if (options.rejectInterrupt) throw new Error('provider rejected interrupt');
               if (options.holdInterrupt) await interruptGate.promise;
             },
-          });
+          };
         },
         respondToInteraction: () => {
           responses += 1;
           if (options.rejectResponse) return Promise.reject(new Error('provider rejected response'));
           return Promise.resolve();
         },
-        dispose: () => {
+        dispose: async () => {
           disposes += 1;
-          return Promise.resolve();
+          disposeEntered.resolve(undefined);
+          if (options.holdDispose) await disposeGate.promise;
         },
       });
     },
   };
   const runtime = createAgentRuntime({
-    workspaces: createLocalWorkspaceProvider({ baseDirectory: join(root, 'managed'), clock, idFactory }),
+    workspaces: {
+      acquire: (async (spec) => {
+        const lease = await localWorkspaces.acquire(spec);
+        return {
+          leaseId: lease.leaseId,
+          ownership: lease.ownership,
+          root: lease.root,
+          acquiredAt: lease.acquiredAt,
+          describe: () => lease.describe(),
+          release: async () => {
+            releases += 1;
+            return lease.release();
+          },
+        };
+      }) as WorkspaceProvider['acquire'],
+      releaseAll: () => localWorkspaces.releaseAll(),
+    },
     providers: [provider],
     clock,
     idFactory,
@@ -154,20 +244,48 @@ async function fixture(
     workspace: { kind: 'existing', path: borrowed },
   });
   if (opened.result?.type !== 'session_opened') throw new Error('open failed');
+  const sessionId = opened.result.sessionId;
   return {
     runtime,
-    sessionId: opened.result.sessionId,
+    sessionId,
+    nextCommit: () =>
+      new Promise<void>((resolve) => {
+        commitWaiters.push({ after: successfulCommits, resolve });
+      }),
+    borrowed,
     next,
     now: () => clock.now(),
-    failNextCommit: (phase: 'before' | 'after' = 'before', skip = 0) => {
+    failNextCommit: (phase: 'before' | 'after' = 'before', skip = 0, cause?: Error) => {
       rejectNext = phase;
       skipCommits = skip;
+      rejection = cause ?? new Error('injected transient commit failure');
     },
-    counts: () => ({ starts, responses, interrupts, disposes }),
+    counts: () => ({ starts, responses, interrupts, disposes, releases, eventPageReads, terminalCommits }),
+    committedEvents: () => base.readEvents(sessionId, SequenceSchema.parse(0), 2048),
+    onEventPage: (callback: (sessionId: SessionId) => Promise<void>) => {
+      onEventPage = callback;
+    },
+    commitDiagnostic: (sessionId: SessionId) =>
+      base.commit((tx) => {
+        tx.emit({ sessionId, payload: { type: 'diagnostic', level: 'info', message: 'concurrent commit' } });
+      }),
     completion,
     interactionRead,
     interactionReadGate,
+    eventReadEntered,
+    eventReadGate,
+    finalReadEntered,
+    finalReadGate,
+    commitFailed,
+    textCommitted,
+    terminalCommitted,
+    secondTerminalCommitted,
+    startEntered,
+    startGate,
     interruptGate,
+    interruptEntered,
+    disposeEntered,
+    disposeGate,
     emitInteraction: (request: InteractionRequest = { kind: 'question', prompt: 'Continue?', multiSelect: false }) =>
       sink?.emit({
         payload: {
@@ -176,6 +294,11 @@ async function fixture(
           request,
         },
       }),
+    emitText: (text: string) => sink?.emit({ payload: { type: 'run.message_delta', text } }),
+    emitDiagnosticForRun: (index: number, message: string) =>
+      runSinks[index]?.emit({ payload: { type: 'diagnostic', level: 'info', message } }),
+    emitSessionDiagnostic: (message: string) =>
+      sessionSink?.emit({ payload: { type: 'diagnostic', level: 'info', message } }),
     /** A provider withdrawing a request it raised, on the run's own sink. */
     emitWithdrawal: (providerRef = 'question') =>
       sink?.emit({ payload: { type: 'interaction.withdrawn', providerRef } }),
@@ -197,14 +320,232 @@ async function start(value: Awaited<ReturnType<typeof fixture>>): Promise<RunId>
 }
 
 async function interaction(value: Awaited<ReturnType<typeof fixture>>): Promise<InteractionId> {
+  const ingested = value.nextCommit();
   value.emitInteraction();
-  for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+  await ingested;
   const id = (await value.runtime.getSession(value.sessionId))?.interactions[0]?.interactionId;
   if (!id) throw new Error('interaction missing');
   return id;
 }
 
-describe('provider side-effect persistence windows', () => {
+describe('provider ingestion visibility and history races', () => {
+  it('reads an unchanged session once while unrelated sessions keep committing', async () => {
+    const value = await fixture();
+    const other = await value.runtime.openSession({
+      commandId: value.next(),
+      type: 'open_session',
+      providerId: 'fault-provider',
+      workspace: { kind: 'existing', path: value.borrowed },
+    });
+    if (other.result?.type !== 'session_opened') throw new Error('other session missing');
+    const otherSessionId = other.result.sessionId;
+    let commits = 0;
+    value.onEventPage(async () => {
+      if (commits++ < 8) await value.commitDiagnostic(otherSessionId);
+    });
+    const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0));
+    expect(page.events).toHaveLength(1);
+    expect(value.counts().eventPageReads).toBe(1);
+  });
+
+  it('rejects retryably after a bounded number of changing-session history reads', async () => {
+    const value = await fixture();
+    let commits = 0;
+    value.onEventPage(async (sessionId) => {
+      if (commits++ < 8) await value.commitDiagnostic(sessionId);
+    });
+    await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: true },
+    });
+    expect(value.counts().eventPageReads).toBeLessThanOrEqual(3);
+  });
+
+  it('refuses a history page if provider ingestion fails while its store read is held', async () => {
+    const value = await fixture({ holdReadEvents: true });
+    await start(value);
+    const reading = value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0));
+    await value.eventReadEntered.promise;
+    value.failNextCommit();
+    value.emitText('must not be omitted');
+    await value.commitFailed.promise;
+    await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable' },
+    });
+    value.eventReadGate.resolve(undefined);
+    await expect(reading).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+  });
+
+  it('refuses a history page if ingestion fails during the final session read', async () => {
+    const value = await fixture({ holdReadAfterEvents: true });
+    await start(value);
+    const reading = value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0));
+    await value.finalReadEntered.promise;
+    value.failNextCommit();
+    value.emitText('lost during final read');
+    await value.commitFailed.promise;
+    value.finalReadGate.resolve(undefined);
+    await expect(reading).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+  });
+
+  it('rereads a held history page when a provider event commits during the read', async () => {
+    const value = await fixture({ holdReadEvents: true });
+    await start(value);
+    const reading = value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0));
+    await value.eventReadEntered.promise;
+    value.emitText('committed during read');
+    await value.textCommitted.promise;
+    value.eventReadGate.resolve(undefined);
+    const page = await reading;
+    expect(page.hasMore).toBe(false);
+    expect(page.events.some((event) => event.payload.type === 'run.message_delta')).toBe(true);
+  });
+
+  it('rejects unknown and cross-session runs but accepts a known terminal run as a no-op', async () => {
+    const value = await fixture();
+    const runId = await start(value);
+    const second = await value.runtime.openSession({
+      commandId: value.next(),
+      type: 'open_session',
+      providerId: 'fault-provider',
+      workspace: { kind: 'existing', path: value.borrowed },
+    });
+    if (second.result?.type !== 'session_opened') throw new Error('second open failed');
+    for (const [sessionId, targetRunId] of [
+      [value.sessionId, RunIdSchema.parse('run_AAAAAAAAAAAAAAAA')],
+      [second.result.sessionId, runId],
+    ] as const) {
+      await expect(
+        value.runtime.interruptRun({
+          commandId: value.next(),
+          type: 'interrupt_run',
+          sessionId,
+          runId: targetRunId,
+        }),
+      ).resolves.toMatchObject({ disposition: 'rejected', error: { code: 'unknown_run' } });
+    }
+    value.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    await expect(
+      value.runtime.interruptRun({
+        commandId: value.next(),
+        type: 'interrupt_run',
+        sessionId: value.sessionId,
+        runId,
+      }),
+    ).resolves.toMatchObject({ disposition: 'applied', result: { delivered: false } });
+    expect(value.counts().interrupts).toBe(0);
+  });
+
+  it('records a bounded visible fault after a provider event commit fails', async () => {
+    const value = await fixture();
+    await start(value);
+    value.failNextCommit();
+    value.emitText('lost event');
+    await value.commitFailed.promise;
+    expect(typeof value.runtime.getProviderIngestionFaults).toBe('function');
+    value.emitText('another event');
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      {
+        sessionId: value.sessionId,
+        stage: 'event',
+        failureCount: 1,
+      },
+    ]);
+    await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable' },
+    });
+    const replay = value.runtime.subscribe({ sessionId: value.sessionId, fromSequence: 0 })[Symbol.asyncIterator]();
+    await expect(replay.next()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    const close = await value.runtime.closeSession({
+      commandId: value.next(),
+      type: 'close_session',
+      sessionId: value.sessionId,
+      ifRunActive: 'interrupt',
+    });
+    expect(close).toMatchObject({ disposition: 'applied', result: { type: 'session_closed' } });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    expect(value.runtime.getProviderIngestionFaults()).toHaveLength(1);
+    await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable' },
+    });
+  });
+
+  it.each([
+    ['long message', new Error('x'.repeat(3000)), 'store_unavailable'],
+    [
+      'large details',
+      new AgentRuntimeError(
+        agentError('provider_unavailable', 'commit failed', {
+          details: { payload: 'x'.repeat(100_000) },
+        }),
+      ),
+      'provider_unavailable',
+    ],
+  ] as const)('records a bounded ingestion fault for %s without rejecting supervision', async (_name, cause, code) => {
+    const value = await fixture();
+    await start(value);
+    value.failNextCommit('before', 0, cause);
+    value.emitText('lost event');
+    await value.commitFailed.promise;
+    value.completion.resolve({ outcome: 'succeeded' });
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code } });
+    const [fault] = value.runtime.getProviderIngestionFaults();
+    expect(fault).toMatchObject({ sessionId: value.sessionId, stage: 'event', failureCount: 1 });
+    expect(fault?.error.code).toBe(code);
+    expect(fault?.error.message.length).toBeLessThanOrEqual(2000);
+    expect(JSON.stringify(fault).length).toBeLessThan(2500);
+  });
+
+  it('records a lost terminal commit without inventing a terminal projection', async () => {
+    const value = await fixture();
+    const runId = await start(value);
+    value.failNextCommit();
+    value.completion.resolve({ outcome: 'succeeded' });
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      {
+        sessionId: value.sessionId,
+        runId,
+        stage: 'completion',
+        failureCount: 1,
+      },
+    ]);
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.termination).toBeUndefined();
+    await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable' },
+    });
+  });
+
+  it('reports a failed interaction request without installing a provider route', async () => {
+    const value = await fixture();
+    await start(value);
+    value.failNextCommit();
+    value.emitInteraction();
+    await value.commitFailed.promise;
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      {
+        sessionId: value.sessionId,
+        stage: 'event',
+        failureCount: 1,
+      },
+    ]);
+    expect((await value.runtime.getSession(value.sessionId))?.interactions).toEqual([]);
+  });
+
+  it('counts repeated ingestion failures in one per-session fault record', async () => {
+    const value = await fixture();
+    await start(value);
+    value.failNextCommit();
+    value.emitText('first lost event');
+    value.failNextCommit();
+    value.emitText('second lost event');
+    await value.runtime.shutdown();
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId: value.sessionId, stage: 'event', failureCount: 2 },
+    ]);
+  });
   it('retries submit_turn persistence with the same identities and no second provider start', async () => {
     const value = await fixture();
     const commandId = value.next();
@@ -389,9 +730,10 @@ describe('provider side-effect persistence windows', () => {
       sessionId: value.sessionId,
       runId,
     });
-    for (let pass = 0; pass < 4; pass += 1) await Promise.resolve();
+    await value.interruptEntered.promise;
+    const ingested = value.nextCommit();
     value.emitInteraction();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await ingested;
     expect((await value.runtime.getSession(value.sessionId))?.interactions).toEqual([]);
     value.interruptGate.resolve(undefined);
     await interrupting;
@@ -508,8 +850,9 @@ describe('provider interaction withdrawal', () => {
     const interactionId = await interaction(value);
     expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('awaiting_interaction');
 
+    const ingested = value.nextCommit();
     value.emitWithdrawal();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await ingested;
 
     const snapshot = await value.runtime.getSession(value.sessionId);
     expect(snapshot?.interactions[0]).toMatchObject({
@@ -538,8 +881,9 @@ describe('provider interaction withdrawal', () => {
     await start(value);
     await interaction(value);
 
+    const ingested = value.nextCommit();
     value.emitWithdrawal('some-other-reference');
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await ingested;
 
     const snapshot = await value.runtime.getSession(value.sessionId);
     // Untouched: a provider must not be able to settle by guessing a token.
@@ -564,8 +908,9 @@ describe('provider interaction withdrawal', () => {
     await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
     expect(value.counts().responses).toBe(1);
 
+    const ingested = value.nextCommit();
     value.emitWithdrawal();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await ingested;
     const duringRetention = await value.runtime.getSession(value.sessionId);
     expect(duringRetention?.interactions[0]?.status).toBe('pending');
 
@@ -585,8 +930,9 @@ describe('provider interaction withdrawal', () => {
     await start(value);
     await interaction(value);
 
+    const ingested = value.nextCommit();
     value.emitSessionWithdrawal();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await ingested;
 
     const snapshot = await value.runtime.getSession(value.sessionId);
     expect(snapshot?.interactions[0]?.status).toBe('pending');
@@ -596,64 +942,13 @@ describe('provider interaction withdrawal', () => {
   });
 });
 
-describe('retained withdrawal persistence', () => {
-  for (const phase of ['before', 'after'] as const) {
-    for (const finish of ['redelivery', 'completion', 'cleanup'] as const) {
-      it(`${phase}-mutation failure: fences answers and materializes on ${finish}`, async () => {
-        const value = await fixture();
-        await start(value);
-        const interactionId = await interaction(value);
-        value.failNextCommit(phase);
-        value.emitWithdrawal();
-        for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
-        expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
-        const afterFailure = value.now();
-        const command = {
-          commandId: value.next(),
-          type: 'respond_to_interaction' as const,
-          sessionId: value.sessionId,
-          interactionId,
-          response: { kind: 'question' as const, answer: 'too late' },
-        };
-        const rejected = await value.runtime.respondToInteraction(command);
-        expect(rejected).toMatchObject({ disposition: 'rejected', error: { code: 'interaction_already_settled' } });
-        expect(await value.runtime.respondToInteraction(command)).toEqual(rejected);
-        expect(value.counts().responses).toBe(0);
-        if (finish === 'redelivery') {
-          value.failNextCommit(phase);
-          value.emitWithdrawal();
-          for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
-          expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
-          value.emitWithdrawal();
-          value.emitWithdrawal();
-          for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
-          expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('running');
-        }
-        if (finish === 'cleanup') await value.runtime.shutdown();
-        value.completion.resolve({ outcome: 'succeeded' });
-        await value.runtime.quiesce();
-        const snapshot = await value.runtime.getSession(value.sessionId);
-        expect(snapshot?.interactions[0]).toMatchObject({ status: 'settled', settlement: { outcome: 'withdrawn' } });
-        expect(snapshot?.runs[0]?.state).toBe(finish === 'cleanup' ? 'interrupted' : 'succeeded');
-        expect(Date.parse(snapshot!.interactions[0]!.settlement!.settledAt)).toBeLessThan(Date.parse(afterFailure));
-        value.emitWithdrawal();
-        await value.runtime.quiesce();
-        const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0), 1000);
-        expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
-        expect(JSON.stringify(page)).not.toContain('provider_contract_violation');
-        await value.runtime.shutdown();
-        expect((await value.runtime.getSession(value.sessionId))?.session.state).toBe('closed');
-      });
-    }
-  }
-});
-
 describe('prototype-named answers through Runtime', () => {
   it.each([['constructor'], ['toString'], ['ordinary', 'constructor', 'toString']])(
     'returns a replayable invalid_request for missing %j and applies present answers',
     async (...keys) => {
       const value = await fixture();
       await start(value);
+      const ingested = value.nextCommit();
       value.emitInteraction({
         kind: 'question_set',
         questions: keys.map((key) => ({
@@ -665,7 +960,7 @@ describe('prototype-named answers through Runtime', () => {
           sensitive: false,
         })),
       });
-      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+      await ingested;
       const interactionId = (await value.runtime.getSession(value.sessionId))!.interactions[0]!.interactionId;
       const command = {
         commandId: value.next(),
@@ -702,79 +997,12 @@ describe('prototype-named answers through Runtime', () => {
   );
 });
 
-describe('retained withdrawals survive cleanup rollback', () => {
-  it.each(['before', 'after'] as const)(
-    '%s-mutation cleanup failure retries the exact close truthfully',
-    async (phase) => {
-      const value = await fixture();
-      await start(value);
-      await interaction(value);
-      value.failNextCommit(phase);
-      value.emitWithdrawal();
-      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
-      const close = {
-        commandId: value.next(),
-        type: 'close_session' as const,
-        sessionId: value.sessionId,
-        ifRunActive: 'interrupt' as const,
-      };
-      // Closing-state commit succeeds; terminal fallback rolls back.
-      value.failNextCommit(phase, 1);
-      await expect(value.runtime.closeSession(close)).rejects.toThrow('injected transient');
-      expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
-      expect(await value.runtime.closeSession(close)).toMatchObject({ disposition: 'applied' });
-      value.completion.resolve({ outcome: 'succeeded' });
-      value.emitWithdrawal();
-      await value.runtime.quiesce();
-      const snapshot = await value.runtime.getSession(value.sessionId);
-      expect(snapshot?.session.state).toBe('closed');
-      expect(snapshot?.interactions[0]?.settlement?.outcome).toBe('withdrawn');
-      expect(snapshot?.runs[0]?.state).toBe('interrupted');
-      const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0), 1000);
-      expect(page.events.filter((event) => event.payload.type === 'interaction.settled')).toHaveLength(1);
-      expect(JSON.stringify(page)).not.toContain('provider_contract_violation');
-    },
-  );
-});
-
-describe('withdrawal races an answer store read', () => {
-  it.each(['before', 'after'] as const)(
-    '%s-mutation failure fences an answer that already passed its first guard',
-    async (phase) => {
-      const value = await fixture({ holdReadInteraction: true });
-      await start(value);
-      const interactionId = await interaction(value);
-      const answering = value.runtime.respondToInteraction({
-        commandId: value.next(),
-        type: 'respond_to_interaction',
-        sessionId: value.sessionId,
-        interactionId,
-        response: { kind: 'question', answer: 'late' },
-      });
-      await value.interactionRead.promise;
-      value.failNextCommit(phase);
-      value.emitWithdrawal();
-      for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
-      value.interactionReadGate.resolve(undefined);
-      expect(await answering).toMatchObject({
-        disposition: 'rejected',
-        error: { code: 'interaction_already_settled' },
-      });
-      expect(value.counts().responses).toBe(0);
-      value.completion.resolve({ outcome: 'succeeded' });
-      await value.runtime.quiesce();
-      const snapshot = await value.runtime.getSession(value.sessionId);
-      expect(snapshot?.interactions[0]?.settlement?.outcome).toBe('withdrawn');
-      expect(snapshot?.runs[0]?.state).toBe('succeeded');
-    },
-  );
-});
-
 describe('maximum-size missing question answers', () => {
   it('returns a replayable bounded rejection before any provider effect and keeps the same run answerable', async () => {
     const value = await fixture();
     const runId = await start(value);
     const keys = Array.from({ length: 32 }, (_, index) => `q${String(index).padStart(2, '0')}`.padEnd(64, 'x'));
+    const ingested = value.nextCommit();
     value.emitInteraction({
       kind: 'question_set',
       questions: keys.map((key) => ({
@@ -785,7 +1013,7 @@ describe('maximum-size missing question answers', () => {
         sensitive: false,
       })),
     });
-    for (let pass = 0; pass < 24; pass += 1) await Promise.resolve();
+    await ingested;
     const interactionId = (await value.runtime.getSession(value.sessionId))!.interactions[0]!.interactionId;
     const command = {
       commandId: value.next(),

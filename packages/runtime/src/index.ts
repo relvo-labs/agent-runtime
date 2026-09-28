@@ -5,7 +5,12 @@
  * adapter; `pnpm dag:check` fails the build if that ever changes.
  */
 
-export { createAgentRuntime, type AgentRuntime, type AgentRuntimeOptions } from './runtime.ts';
+export {
+  createAgentRuntime,
+  type AgentRuntime,
+  type AgentRuntimeOptions,
+  type ProviderIngestionFault,
+} from './runtime.ts';
 
 export {
   createInMemoryStore,

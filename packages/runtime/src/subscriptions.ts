@@ -35,9 +35,11 @@ import type { RuntimeStore } from './store.ts';
 type Subscriber = {
   readonly sessionId: SessionId;
   readonly bufferSize: number;
+  readonly matches: (event: EventEnvelope) => boolean;
   buffer: EventEnvelope[];
+  delivering: EventEnvelope | undefined;
   /** Set once the bound is crossed; counts everything not buffered since. */
-  overflow: { from: Sequence; count: number } | undefined;
+  overflow: { from: Sequence; through: Sequence; count: number } | undefined;
   /** Pending/replay retain only a high-water sequence; live uses the buffer. */
   phase: 'pending' | 'replaying' | 'live';
   highestPublishedSequence: number;
@@ -59,6 +61,8 @@ export type SubscriptionHubOptions = {
   readonly store: RuntimeStore;
   readonly clock: Clock;
   readonly replayPageSize?: number;
+  /** Runtime guard for a process-local provider ingestion fault. */
+  readonly checkReplayReady?: (sessionId: SessionId) => Promise<void> | void;
 };
 
 const subscriberSets = new WeakMap<SubscriptionHub, ReadonlySet<Subscriber>>();
@@ -68,7 +72,8 @@ export function bufferedEventCountForTesting(hub: SubscriptionHub): number {
   const subscribers = subscriberSets.get(hub);
   if (subscribers === undefined) throw new Error('subscription hub was not created by createSubscriptionHub');
   let count = 0;
-  for (const subscriber of subscribers) count += subscriber.buffer.length;
+  for (const subscriber of subscribers)
+    count += subscriber.buffer.length + (subscriber.delivering === undefined ? 0 : 1);
   return count;
 }
 
@@ -92,13 +97,15 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
     // mark. Retaining the event object here would let a subscription that is
     // never iterated consume memory without bound.
     if (subscriber.phase !== 'live') return;
+    if (!subscriber.matches(event)) return;
 
     if (subscriber.overflow) {
       subscriber.overflow.count += 1;
+      subscriber.overflow.through = event.sequence;
       return;
     }
-    if (subscriber.buffer.length >= subscriber.bufferSize) {
-      subscriber.overflow = { from: event.sequence, count: 1 };
+    if (subscriber.buffer.length + (subscriber.delivering === undefined ? 0 : 1) >= subscriber.bufferSize) {
+      subscriber.overflow = { from: event.sequence, through: event.sequence, count: 1 };
       return;
     }
     subscriber.buffer.push(event);
@@ -123,11 +130,15 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
     },
 
     subscribe(request: SubscriptionRequest): EventSubscription {
+      const wanted = request.types === undefined ? undefined : new Set(request.types);
+      const matches = (event: EventEnvelope): boolean => wanted === undefined || wanted.has(event.payload.type);
       // ---- step 1: attach live BEFORE any await -----------------------------
       const subscriber: Subscriber = {
         sessionId: request.sessionId,
         bufferSize: request.bufferSize,
+        matches,
         buffer: [],
+        delivering: undefined,
         overflow: undefined,
         phase: 'pending',
         highestPublishedSequence: request.fromSequence,
@@ -136,9 +147,6 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
         wake: undefined,
       };
       subscribers.add(subscriber);
-
-      const wanted = request.types === undefined ? undefined : new Set(request.types);
-      const matches = (event: EventEnvelope): boolean => wanted === undefined || wanted.has(event.payload.type);
 
       let lastEmitted: number = request.fromSequence;
 
@@ -161,7 +169,13 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
 
           // ---- step 2: durable history -------------------------------------
           for (;;) {
-            const page = await options.store.readEvents(request.sessionId, lastEmitted as Sequence, replayPageSize);
+            await options.checkReplayReady?.(request.sessionId);
+            const page = await options.store.readEvents(
+              request.sessionId,
+              lastEmitted as Sequence,
+              Math.min(replayPageSize, subscriber.bufferSize),
+            );
+            await options.checkReplayReady?.(request.sessionId);
             if (isClosed()) return;
             for (const event of page.events) {
               if (event.sequence <= lastEmitted) continue; // step 3
@@ -185,6 +199,9 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             // either included by another durable read or enters the live
             // buffer after the transition — never neither and never both.
             if (subscriber.highestPublishedSequence > lastEmitted) continue;
+            const readiness = options.checkReplayReady?.(request.sessionId);
+            if (readiness !== undefined) await readiness;
+            if (subscriber.highestPublishedSequence > lastEmitted) continue;
             subscriber.phase = 'live';
             break;
           }
@@ -203,25 +220,23 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
           // only now can overflow be a real loss of delivery.
           // ---- live --------------------------------------------------------
           while (!isClosed()) {
-            const buffered = subscriber.buffer;
-            if (buffered.length > 0) {
-              subscriber.buffer = [];
-              for (const event of buffered) {
-                if (event.sequence <= lastEmitted) continue; // step 3
-                lastEmitted = event.sequence;
-                if (!matches(event)) continue;
-                yield {
-                  type: 'event',
-                  event,
-                  cursor: cursorFromSequence(event.sequence),
-                  replay: false,
-                };
-              }
+            const event = subscriber.buffer.shift();
+            if (event !== undefined) {
+              if (event.sequence <= lastEmitted) continue; // step 3
+              lastEmitted = event.sequence;
+              subscriber.delivering = event;
+              yield {
+                type: 'event',
+                event,
+                cursor: cursorFromSequence(event.sequence),
+                replay: false,
+              };
+              subscriber.delivering = undefined;
               continue;
             }
 
             if (subscriber.overflow) {
-              const { from, count } = subscriber.overflow;
+              const { from, through, count } = subscriber.overflow;
               subscriber.overflow = undefined;
               yield {
                 type: 'overflow',
@@ -235,9 +250,13 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
               };
               if (request.overflowPolicy === 'signal_and_close') return;
               // `signal_and_skip`: continue from wherever the log now is.
-              lastEmitted = Math.max(lastEmitted, from + count - 1);
+              lastEmitted = Math.max(lastEmitted, through);
               continue;
             }
+
+            // Filtered events still belong to the observed durable prefix.
+            // Advance only after all earlier matching bodies have drained.
+            lastEmitted = Math.max(lastEmitted, subscriber.highestPublishedSequence);
 
             if (subscriber.terminal !== undefined) {
               const reason = subscriber.terminal;

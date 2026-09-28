@@ -143,6 +143,14 @@ export type InMemoryStoreOptions = {
   readonly defaultPageSize?: number;
 };
 
+const historyReadObservers = new WeakMap<RuntimeStore, () => void>();
+
+/** @internal Count indexed history access without patching global Array methods. */
+export function observeHistoryReadsForTesting(store: RuntimeStore, observer: () => void): () => void {
+  historyReadObservers.set(store, observer);
+  return () => historyReadObservers.delete(store);
+}
+
 export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore {
   const defaultPageSize = options.defaultPageSize ?? 1000;
 
@@ -162,7 +170,7 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
     return result;
   }
 
-  return {
+  const store: RuntimeStore = {
     get revision(): number {
       return state.revision;
     },
@@ -279,17 +287,35 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
           }),
         );
       }
+      const observer = historyReadObservers.get(store);
+      const events =
+        observer === undefined
+          ? record.events
+          : new Proxy(record.events, {
+              get(target, property, receiver) {
+                if (typeof property === 'string' && /^(0|[1-9]\d*)$/.test(property)) observer();
+                const value: unknown = Reflect.get(target, property, receiver);
+                return value;
+              },
+            });
       // `fromSequence` is a POSITION, not an index: it means "everything after
       // this point". `0` therefore means "from the beginning".
-      const matching = record.events.filter((event) => event.sequence > fromSequence);
-      const page = matching.slice(0, pageSize);
+      let low = 0;
+      let high = events.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        const candidate = events[middle];
+        if (candidate !== undefined && candidate.sequence <= fromSequence) low = middle + 1;
+        else high = middle;
+      }
+      const page = events.slice(low, low + pageSize);
       const last = page.at(-1);
       return Promise.resolve(
         isolated({
           events: page,
           nextSequence: last?.sequence ?? fromSequence,
           revision: state.revision,
-          hasMore: matching.length > page.length,
+          hasMore: low + page.length < events.length,
         }),
       );
     },
@@ -308,6 +334,7 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
       return Promise.resolve([...state.sessions.keys()]);
     },
   };
+  return store;
 }
 
 /** Cursor for "resume after this sequence". */

@@ -5,6 +5,7 @@ import {
   SessionIdSchema,
   SubscriptionRequestSchema,
   WIRE_VERSION,
+  cursorFromSequence,
   createCounterIdFactory,
   createFixedClock,
   type EventEnvelope,
@@ -82,6 +83,150 @@ function terminalEvent(
 }
 
 describe('subscription hub buffering', () => {
+  it('switches to live without yielding after the final synchronous fault check', async () => {
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const sessionId = SessionIdSchema.parse(idFactory.next('session'));
+    let releaseQueuedFault!: () => void;
+    const queuedFault = new Promise<void>((resolve) => {
+      releaseQueuedFault = resolve;
+    });
+    let checks = 0;
+    let faulted = false;
+    let retainedAtFault = -1;
+    const hub = createSubscriptionHub({
+      store: readableStore([]),
+      clock,
+      checkReplayReady: () => {
+        if (faulted) throw new Error('ingestion fault');
+        if (++checks === 3) {
+          void Promise.resolve().then(() => {
+            faulted = true;
+            hub.publish(sessionId, [event(idFactory, clock, sessionId, 1)]);
+            retainedAtFault = bufferedEventCountForTesting(hub);
+            releaseQueuedFault();
+          });
+        }
+      },
+    });
+    const iterator = hub
+      .subscribe(SubscriptionRequestSchema.parse({ sessionId, fromSequence: 0 }))
+      [Symbol.asyncIterator]();
+    const next = iterator.next();
+    void next.catch(() => undefined);
+    await queuedFault;
+    expect(retainedAtFault).toBe(1);
+    await expect(next).resolves.toMatchObject({ value: { type: 'caught_up' } });
+    await iterator.return?.();
+  });
+
+  it('keeps each replay page within the subscriber retention capacity', async () => {
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const sessionId = SessionIdSchema.parse(idFactory.next('session'));
+    const events = Array.from({ length: 20 }, (_, index) => event(idFactory, clock, sessionId, index + 1));
+    const base = readableStore(events);
+    const limits: (number | undefined)[] = [];
+    const store: RuntimeStore = {
+      ...base,
+      readEvents: (id, from, limit) => {
+        limits.push(limit);
+        return base.readEvents(id, from, limit);
+      },
+    };
+    const hub = createSubscriptionHub({ store, clock, replayPageSize: 500 });
+    const iterator = hub
+      .subscribe(
+        SubscriptionRequestSchema.parse({
+          sessionId,
+          fromSequence: 0,
+          bufferSize: 8,
+        }),
+      )
+      [Symbol.asyncIterator]();
+    await iterator.next();
+    expect(limits).toEqual([8]);
+    await iterator.return?.();
+  });
+
+  it('ignores unrelated live traffic without overflowing and advances the observed cursor', async () => {
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const sessionId = SessionIdSchema.parse(idFactory.next('session'));
+    const hub = createSubscriptionHub({ store: readableStore([]), clock });
+    const iterator = hub
+      .subscribe(
+        SubscriptionRequestSchema.parse({
+          sessionId,
+          fromSequence: 0,
+          bufferSize: 8,
+          types: ['run.message_delta'],
+        }),
+      )
+      [Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'caught_up' } });
+    hub.publish(
+      sessionId,
+      Array.from({ length: 20 }, (_, index) => event(idFactory, clock, sessionId, index + 1)),
+    );
+    expect(bufferedEventCountForTesting(hub)).toBe(0);
+    const matching = EventEnvelopeSchema.parse({
+      eventId: idFactory.next('event'),
+      sessionId,
+      sequence: 21,
+      occurredAt: clock.now(),
+      wireVersion: WIRE_VERSION,
+      payload: { type: 'run.message_delta', text: 'hello' },
+    });
+    hub.publish(sessionId, [matching]);
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'event', event: { sequence: 21 } } });
+    expect(bufferedEventCountForTesting(hub)).toBeLessThanOrEqual(8);
+    hub.publish(sessionId, [
+      EventEnvelopeSchema.parse({
+        ...terminalEvent(idFactory, clock, sessionId, 'requested'),
+        sequence: 22,
+      }),
+    ]);
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: 'closed', cursor: cursorFromSequence(22) },
+    });
+    await iterator.return?.();
+  });
+
+  it('counts the paused delivery event and pending events against one capacity', async () => {
+    const clock = createFixedClock();
+    const idFactory = createCounterIdFactory();
+    const sessionId = SessionIdSchema.parse(idFactory.next('session'));
+    const hub = createSubscriptionHub({ store: readableStore([]), clock });
+    const iterator = hub
+      .subscribe(
+        SubscriptionRequestSchema.parse({
+          sessionId,
+          fromSequence: 0,
+          bufferSize: 8,
+        }),
+      )
+      [Symbol.asyncIterator]();
+    await iterator.next(); // caught up
+    hub.publish(
+      sessionId,
+      Array.from({ length: 8 }, (_, index) => event(idFactory, clock, sessionId, index + 1)),
+    );
+    await iterator.next(); // paused while delivering event 1
+    expect(bufferedEventCountForTesting(hub)).toBe(8);
+    hub.publish(
+      sessionId,
+      [9, 10].map((n) => event(idFactory, clock, sessionId, n)),
+    );
+    expect(bufferedEventCountForTesting(hub)).toBeLessThanOrEqual(8);
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'event', event: { sequence: 2 } } });
+    for (let sequence = 3; sequence <= 8; sequence += 1) {
+      await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'event', event: { sequence } } });
+    }
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'overflow', droppedFromSequence: 9 } });
+    await iterator.return?.();
+  });
+
   it('does not retain live notifications before the iterator is first consumed', async () => {
     const clock = createFixedClock();
     const idFactory = createCounterIdFactory();

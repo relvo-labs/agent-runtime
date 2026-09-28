@@ -81,7 +81,7 @@ import {
   type CodexTransportParams,
   type CodexWireError,
 } from '@relvo-labs/agent-provider-codex';
-import { createAgentRuntime } from '@relvo-labs/agent-runtime';
+import { createAgentRuntime, type AgentRuntime, type ProviderIngestionFault } from '@relvo-labs/agent-runtime';
 import { createLocalWorkspaceProvider, validateWorkspaceLease, type WorkspaceLease } from '@relvo-labs/agent-workspace';
 import { READ_ONLY_GIT_COMMANDS, assertReadOnly, type GitRunner } from '@relvo-labs/agent-workspace-git';
 
@@ -89,6 +89,15 @@ const clock = createFixedClock();
 const idFactory = createCounterIdFactory();
 const workspaces = createLocalWorkspaceProvider({ baseDirectory: '/tmp/relvo-consumer-smoke', clock, idFactory });
 const runtime: AgentExecutor = createAgentRuntime({ workspaces });
+function inspectProviderIngress(value: AgentRuntime): readonly ProviderIngestionFault[] {
+  const faults = value.getProviderIngestionFaults();
+  if (faults[0]?.stage === 'completion') {
+    const runId: string | undefined = faults[0].runId;
+    void runId;
+  }
+  return faults;
+}
+void inspectProviderIngress;
 const descriptor = defineProviderDescriptor({
   providerId: 'consumer-fixture',
   providerVersion: '0.1.0',

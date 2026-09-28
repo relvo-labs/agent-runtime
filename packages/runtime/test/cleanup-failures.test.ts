@@ -30,7 +30,12 @@ import type {
   WorkspaceProvider,
 } from '@relvo-labs/agent-workspace';
 
-import { coordinationEntryCountForTesting, createAgentRuntime, type AgentRuntime } from '../src/runtime.ts';
+import {
+  coordinationEntryCountForTesting,
+  createAgentRuntime,
+  retainedCloseCountForTesting,
+  type AgentRuntime,
+} from '../src/runtime.ts';
 import { createInMemoryStore, type RuntimeStore, type StoreTransaction } from '../src/store.ts';
 
 type CleanupControl = {
@@ -379,6 +384,30 @@ describe('open rollback cleanup failures', () => {
 });
 
 describe('close cleanup failures', () => {
+  it('preserves the first close interruption when another command completes cleanup', async () => {
+    const value = await cleanupFixture(1, 0);
+    const sessionId = await openAndStart(value);
+    const first = {
+      commandId: value.next(),
+      type: 'close_session' as const,
+      sessionId,
+      ifRunActive: 'interrupt' as const,
+    };
+    const second = { ...first, commandId: value.next() };
+    await expect(value.runtime.closeSession(first)).rejects.toMatchObject({ error: { code: 'provider_unavailable' } });
+    expect(retainedCloseCountForTesting(value.runtime)).toBe(1);
+    expect(await value.runtime.closeSession(second)).toMatchObject({
+      disposition: 'applied',
+      result: { interruptedActiveRun: false },
+    });
+    const recovered = await value.runtime.closeSession(first);
+    expect(recovered).toMatchObject({ disposition: 'applied', result: { interruptedActiveRun: true } });
+    expect(retainedCloseCountForTesting(value.runtime)).toBe(0);
+    expect(await value.runtime.closeSession(first)).toMatchObject({
+      disposition: 'duplicate',
+      result: { interruptedActiveRun: true },
+    });
+  });
   it.each([
     ['dispose-only', 1, 0, 'provider_unavailable', ['provider_dispose']],
     ['release-only', 0, 1, 'workspace_unavailable', ['workspace_release']],
@@ -416,11 +445,15 @@ describe('close cleanup failures', () => {
       expect(afterFailure.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(0);
 
       const retried = await value.runtime.closeSession(command);
-      expect(retried).toMatchObject({ disposition: 'applied', result: { type: 'session_closed' } });
+      expect(retried).toMatchObject({
+        disposition: 'applied',
+        result: { type: 'session_closed', interruptedActiveRun: true },
+      });
       expect(value.control.disposeAttempts).toBe(2);
       expect(value.control.releaseAttempts).toBe(2);
       const duplicate = await value.runtime.closeSession(command);
       expect(duplicate.disposition).toBe('duplicate');
+      expect(duplicate.result).toMatchObject({ type: 'session_closed', interruptedActiveRun: true });
       expect(value.control.disposeAttempts).toBe(2);
       expect(value.control.releaseAttempts).toBe(2);
 
@@ -429,7 +462,14 @@ describe('close cleanup failures', () => {
       expect(events.events.filter((event) => event.payload.type === 'turn.settled')).toHaveLength(1);
       expect(events.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(1);
       expect(value.control.interruptAttempts).toBe(1);
-      expect(coordinationEntryCountForTesting(value.runtime)).toEqual({ commands: 0, sessions: 0 });
+      expect(coordinationEntryCountForTesting(value.runtime)).toEqual({
+        commands: 0,
+        sessions: 0,
+        pendingSubmits: 0,
+        commandAttempts: 0,
+        interactionRoutes: 0,
+        withdrawals: 0,
+      });
     },
   );
 
@@ -517,13 +557,9 @@ describe('shutdown cleanup failures', () => {
     expect(value.control.disposeAttempts).toBe(1);
     expect(value.control.releaseAttempts).toBe(1);
 
-    let subscriptionSettled = false;
-    const terminalEvent = iterator.next().then((result) => {
-      subscriptionSettled = true;
-      return result;
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const settledBeforeRetry = subscriptionSettled;
+    const terminalEvent = iterator.next();
+    const beforeRetry = await value.runtime.readEvents(sessionId, 0 as never);
+    expect(beforeRetry.events.some((event) => event.payload.type === 'session.closed')).toBe(false);
     const rejectedAdmission = await value.runtime
       .openSession({
         commandId: value.next(),
@@ -539,13 +575,19 @@ describe('shutdown cleanup failures', () => {
     const retry = value.runtime.shutdown();
     const isNewAttempt = retry !== first;
     await retry;
-    expect(settledBeforeRetry).toBe(false);
     expect(rejectedAdmission).toMatchObject({ error: { code: 'session_closed' } });
     expect(isNewAttempt).toBe(true);
     expect(value.control.disposeAttempts).toBe(2);
     expect(value.control.releaseAttempts).toBe(2);
     await expect(terminalEvent).resolves.toMatchObject({ value: { type: 'event', event: { sequence: 8 } } });
     await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'closed', reason: 'unsubscribed' } });
-    expect(coordinationEntryCountForTesting(value.runtime)).toEqual({ commands: 0, sessions: 0 });
+    expect(coordinationEntryCountForTesting(value.runtime)).toEqual({
+      commands: 0,
+      sessions: 0,
+      pendingSubmits: 0,
+      commandAttempts: 0,
+      interactionRoutes: 0,
+      withdrawals: 0,
+    });
   });
 });

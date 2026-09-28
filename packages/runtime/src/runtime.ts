@@ -30,6 +30,7 @@ import {
   type AgentCommand,
   type AgentCommandInput,
   type AgentError,
+  AgentErrorSchema,
   type AgentSession,
   type Clock,
   type CloseSessionCommandInput,
@@ -89,6 +90,16 @@ export type AgentRuntimeOptions = {
 export type AgentRuntime = AgentExecutor & {
   registerProvider(provider: AgentProvider): void;
   quiesce(): Promise<void>;
+  /** Process-local faults that prevent complete provider-event replay. */
+  getProviderIngestionFaults(): readonly ProviderIngestionFault[];
+};
+
+export type ProviderIngestionFault = {
+  readonly sessionId: SessionId;
+  readonly runId?: RunId;
+  readonly stage: 'event' | 'completion';
+  readonly error: AgentError;
+  readonly failureCount: number;
 };
 
 const coordinationStates = new WeakMap<
@@ -96,6 +107,10 @@ const coordinationStates = new WeakMap<
   {
     readonly commandQueues: ReadonlyMap<string, Promise<void>>;
     readonly sessionQueues: ReadonlyMap<string, Promise<void>>;
+    readonly closeInterrupted: ReadonlyMap<CommandId, boolean>;
+    readonly pendingSubmits: ReadonlyMap<CommandId, PendingSubmit>;
+    readonly commandAttempts: ReadonlyMap<CommandId, CommandAttempt>;
+    readonly live: ReadonlyMap<SessionId, LiveSession>;
   }
 >();
 
@@ -103,10 +118,28 @@ const coordinationStates = new WeakMap<
 export function coordinationEntryCountForTesting(runtime: AgentRuntime): {
   readonly commands: number;
   readonly sessions: number;
+  readonly pendingSubmits: number;
+  readonly commandAttempts: number;
+  readonly interactionRoutes: number;
+  readonly withdrawals: number;
 } {
   const state = coordinationStates.get(runtime);
   if (state === undefined) throw new Error('runtime was not created by createAgentRuntime');
-  return { commands: state.commandQueues.size, sessions: state.sessionQueues.size };
+  return {
+    commands: state.commandQueues.size,
+    sessions: state.sessionQueues.size,
+    pendingSubmits: state.pendingSubmits.size,
+    commandAttempts: state.commandAttempts.size,
+    interactionRoutes: [...state.live.values()].reduce((count, session) => count + session.interactionRuns.size, 0),
+    withdrawals: [...state.live.values()].reduce((count, session) => count + session.withdrawals.size, 0),
+  };
+}
+
+/** @internal Retained logical close facts awaiting their own receipt. */
+export function retainedCloseCountForTesting(runtime: AgentRuntime): number {
+  const state = coordinationStates.get(runtime);
+  if (state === undefined) throw new Error('runtime was not created by createAgentRuntime');
+  return state.closeInterrupted.size;
 }
 
 /** Live, non-serialisable state. Deliberately never touches the store. */
@@ -133,6 +166,8 @@ type LiveSession = {
   closing: boolean;
   /** Synchronous fence set before awaiting a provider interrupt. */
   readonly interruptingRuns: Set<RunId>;
+  /** Provider completion observed; late ingress cannot revive the run. */
+  readonly terminalizingRuns: Set<RunId>;
 };
 
 type CommandAttempt = {
@@ -190,7 +225,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const idFactory = options.idFactory ?? createCounterIdFactory();
   const store: RuntimeStore = options.store ?? createInMemoryStore({ clock, idFactory });
   const registry: ProviderRegistry = createProviderRegistry(options.providers ?? []);
-  const hub: SubscriptionHub = createSubscriptionHub({ store, clock });
+  const hub: SubscriptionHub = createSubscriptionHub({ store, clock, checkReplayReady: ensureReplayReady });
 
   const live = new Map<SessionId, LiveSession>();
   /** In-flight internal work, awaited by `quiesce`. */
@@ -204,6 +239,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   const pendingResponses = new Map<CommandId, PendingResponse>();
   const pendingResponsesByInteraction = new Map<InteractionId, PendingResponse>();
   const pendingRejections = new Map<CommandId, PendingRejection>();
+  /** Facts from a logical close survive cleanup attempts until its receipt commits. */
+  const closeInterrupted = new Map<CommandId, boolean>();
+  const ingestionFaultsBySession = new Map<SessionId, ProviderIngestionFault>();
+  let notifyIngestionFault!: () => void;
+  const ingestionFaultSignal = new Promise<void>((resolve) => {
+    notifyIngestionFault = resolve;
+  });
   let lifecycle: 'accepting' | 'shutting_down' | 'shut_down' = 'accepting';
   let shutdownPromise: Promise<void> | undefined;
 
@@ -243,9 +285,59 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   }
 
   async function quiesce(): Promise<void> {
+    throwIfIngestionFaulted();
     for (let pass = 0; pass < 100 && pending.size > 0; pass += 1) {
-      await Promise.allSettled([...pending]);
+      await Promise.race([Promise.allSettled([...pending]), ingestionFaultSignal]);
+      throwIfIngestionFaulted();
     }
+    throwIfIngestionFaulted();
+  }
+
+  function recordIngestionFault(
+    sessionId: SessionId,
+    runId: RunId | undefined,
+    stage: 'event' | 'completion',
+    cause: unknown,
+  ): void {
+    const first = ingestionFaultsBySession.get(sessionId);
+    if (first !== undefined) {
+      ingestionFaultsBySession.set(sessionId, { ...first, failureCount: first.failureCount + 1 });
+      return;
+    }
+    let error: AgentError;
+    try {
+      const converted = toAgentError(cause, 'store_unavailable');
+      error = AgentErrorSchema.parse({
+        code: converted.code,
+        message: converted.message.slice(0, 2000),
+        retryable: converted.retryable,
+        ...(converted.providerCode === undefined ? {} : { providerCode: converted.providerCode }),
+      });
+    } catch {
+      error = { code: 'store_unavailable', message: 'provider ingestion failed', retryable: true };
+    }
+    ingestionFaultsBySession.set(sessionId, {
+      sessionId,
+      ...(runId === undefined ? {} : { runId }),
+      stage,
+      error,
+      failureCount: 1,
+    });
+    notifyIngestionFault();
+  }
+
+  function ingestionFaults(): readonly ProviderIngestionFault[] {
+    return [...ingestionFaultsBySession.values()].map((fault) => ({ ...fault, error: structuredClone(fault.error) }));
+  }
+
+  function throwIfIngestionFaulted(): void {
+    const first = ingestionFaultsBySession.values().next().value;
+    if (first !== undefined) throw new AgentRuntimeError(first.error);
+  }
+
+  function ensureReplayReady(sessionId: SessionId): void {
+    const fault = ingestionFaultsBySession.get(sessionId);
+    if (fault !== undefined) throw new AgentRuntimeError(fault.error);
   }
 
   // -------------------------------------------------------------------------
@@ -638,13 +730,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     sessionId: SessionId,
     runId: RunId | undefined,
     captured: CapturedProviderEvent,
+    afterCompletion: boolean,
   ): Promise<void> {
     // Reserve before even entering the store: a rejection may precede its callback.
     // This also fences a response already waiting on asynchronous store reads.
     let withdrawalId = retainWithdrawal(sessionId, runId, captured);
+    let requested: { interactionId: InteractionId; providerRef: string } | undefined;
     // A provider must never be able to break the runtime by emitting
     // something malformed; the worst outcome is a recorded diagnostic.
-    await commitAndPublish((tx) => {
+    const { events } = await store.commit((tx) => {
       if (!tx.hasSession(sessionId)) return;
       const state = tx.session(sessionId).session.state;
       if (state === 'closed' || state === 'failed') return;
@@ -697,14 +791,16 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         const session = live.get(sessionId);
         const run = tx.session(sessionId).runs.get(runId);
         if (!session || !run) return;
-        if (session.interruptingRuns.has(runId)) {
+        if (session.interruptingRuns.has(runId) || afterCompletion) {
           tx.emit({
             sessionId,
             runId,
             payload: {
               type: 'diagnostic',
               level: 'warning',
-              message: 'provider contract violation: emitted `interaction.requested` after interruption was requested',
+              message: afterCompletion
+                ? 'provider contract violation: emitted `interaction.requested` after completion was observed'
+                : 'provider contract violation: emitted `interaction.requested` after interruption was requested',
               detail: { code: 'provider_contract_violation' },
             },
           });
@@ -734,9 +830,6 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           });
           return;
         }
-        session.interactionRefs.set(interactionId, providerRef);
-        session.refToInteraction.set(providerRef, interactionId);
-        session.interactionRuns.set(interactionId, runId);
         tx.emit({
           sessionId,
           runId,
@@ -747,6 +840,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             request: payload.request,
           },
         });
+        requested = { interactionId, providerRef };
         return;
       }
 
@@ -755,14 +849,29 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         ...(runId === undefined ? {} : { runId }),
         payload,
       });
-    })
-      .then(() => {
-        if (runId !== undefined && withdrawalId !== undefined) clearWithdrawals(sessionId, runId, withdrawalId);
-      })
-      .catch(() => {
-        // Withdrawals remain retained for redelivery, completion or cleanup.
-        // Losing one provider event must not take down the session.
-      });
+    });
+    if (requested !== undefined && runId !== undefined) {
+      const session = live.get(sessionId);
+      session?.interactionRefs.set(requested.interactionId, requested.providerRef);
+      session?.refToInteraction.set(requested.providerRef, requested.interactionId);
+      session?.interactionRuns.set(requested.interactionId, runId);
+    }
+    if (runId !== undefined && withdrawalId !== undefined) clearWithdrawals(sessionId, runId, withdrawalId);
+    const first = events[0];
+    if (first !== undefined) hub.publish(first.sessionId, events);
+  }
+
+  function queueProviderEvent(
+    sessionId: SessionId,
+    runId: RunId | undefined,
+    captured: CapturedProviderEvent,
+  ): Promise<void> {
+    const afterCompletion = runId !== undefined && live.get(sessionId)?.terminalizingRuns.has(runId) === true;
+    const work = ingestProviderEvent(sessionId, runId, captured, afterCompletion).catch((cause: unknown) => {
+      recordIngestionFault(sessionId, runId, 'event', cause);
+    });
+    track(work);
+    return work;
   }
 
   function stagedSinkFor(sessionId: SessionId, runId: RunId | undefined, owner: 'session' | 'run') {
@@ -777,7 +886,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
           if (phase === 'discarded') return;
           const captured = captureProviderEvent(input);
           if (phase === 'active') {
-            track(ingestProviderEvent(sessionId, runId, captured));
+            void queueProviderEvent(sessionId, runId, captured);
             return;
           }
           if (accepted >= PRE_ACTIVATION_EVENT_LIMIT) {
@@ -794,11 +903,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         while (staged.length > 0) {
           const batch = staged;
           staged = [];
-          for (const captured of batch) await ingestProviderEvent(sessionId, runId, captured);
+          for (const captured of batch) await queueProviderEvent(sessionId, runId, captured);
         }
         phase = 'active';
         if (dropped > 0) {
-          await ingestProviderEvent(
+          await queueProviderEvent(
             sessionId,
             runId,
             captureProviderEvent({
@@ -959,6 +1068,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         } finally {
           const session = live.get(sessionId);
           if (session && committed) {
+            session.terminalizingRuns.delete(runId);
             clearWithdrawals(sessionId, runId);
             session.runs.delete(runId);
             session.interruptingRuns.delete(runId);
@@ -973,9 +1083,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         }
       });
     };
+    const onCompletion = (result: unknown, rejected: boolean): Promise<void> => {
+      live.get(sessionId)?.terminalizingRuns.add(runId);
+      return settle(result, rejected).catch((cause: unknown) => {
+        recordIngestionFault(sessionId, runId, 'completion', cause);
+      });
+    };
     const completion = providerRun.completion.then(
-      (completion) => settle(completion, false),
-      (error: unknown) => settle(error, true),
+      (result) => onCompletion(result, false),
+      (error: unknown) => onCompletion(error, true),
     );
     track(
       Promise.race([completion, stopped]).finally(() => {
@@ -1052,6 +1168,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         startingRun: false,
         closing: false,
         interruptingRuns: new Set(),
+        terminalizingRuns: new Set(),
       });
 
       const result: CommandResult = { type: 'session_opened', sessionId };
@@ -1160,7 +1277,6 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const snapshot = await store.read(command.sessionId);
     const guard = guardCommand(command, snapshot, 'submit_turn', acceptedAt);
     if (guard) return await rejectAndRecord(command, guard);
-
     const session = requireOpenSession(command.sessionId);
     const activeRun = snapshot?.runs.find(
       (run) => run.state !== 'succeeded' && run.state !== 'failed' && run.state !== 'interrupted',
@@ -1312,6 +1428,27 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const guard = guardCommand(command, snapshot, 'interrupt_run', acceptedAt);
     if (guard) return await rejectAndRecord(command, guard);
 
+    const knownRun = snapshot?.runs.find((run) => run.runId === command.runId);
+    if (knownRun === undefined) {
+      return await rejectAndRecord(
+        command,
+        receipt(
+          command,
+          'rejected',
+          {
+            error: agentError('unknown_run', `unknown run \`${command.runId}\` in session \`${command.sessionId}\``),
+          },
+          acceptedAt,
+        ),
+      );
+    }
+    if (knownRun.termination !== undefined) {
+      reserveCommandAttempt(command, acceptedAt);
+      const retained = { command, acceptedAt, delivered: false } satisfies PendingInterrupt;
+      pendingInterrupts.set(command.commandId, retained);
+      return await finishPendingInterrupt(retained);
+    }
+
     const session = requireOpenSession(command.sessionId);
     const capability = canInterruptRun(session.descriptor);
     if (!capability.ok) {
@@ -1319,29 +1456,36 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     }
 
     const providerRun = session.runs.get(command.runId);
-    // An already-terminal run is not an error: the caller's intent ("this run
-    // must not continue") is satisfied. `delivered` reports what happened.
-    let delivered = false;
-    reserveCommandAttempt(command, acceptedAt);
-    if (providerRun) {
-      session.interruptingRuns.add(command.runId);
-      try {
-        await providerRun.interrupt(command.reason);
-        delivered = true;
-      } catch (error) {
-        session.interruptingRuns.delete(command.runId);
-        const rejected = receipt(
+    if (providerRun === undefined) {
+      return await rejectAndRecord(
+        command,
+        receipt(
           command,
           'rejected',
-          { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
+          {
+            error: agentError('provider_contract_violation', `live run \`${command.runId}\` has no provider handle`),
+          },
           acceptedAt,
-        );
-        const retained = { command, receipt: rejected } satisfies PendingRejection;
-        pendingRejections.set(command.commandId, retained);
-        return await finishPendingRejection(retained);
-      }
+        ),
+      );
     }
-    const retained = { command, acceptedAt, delivered } satisfies PendingInterrupt;
+    reserveCommandAttempt(command, acceptedAt);
+    session.interruptingRuns.add(command.runId);
+    try {
+      await providerRun.interrupt(command.reason);
+    } catch (error) {
+      session.interruptingRuns.delete(command.runId);
+      const rejected = receipt(
+        command,
+        'rejected',
+        { error: isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected') },
+        acceptedAt,
+      );
+      const retained = { command, receipt: rejected } satisfies PendingRejection;
+      pendingRejections.set(command.commandId, retained);
+      return await finishPendingRejection(retained);
+    }
+    const retained = { command, acceptedAt, delivered: true } satisfies PendingInterrupt;
     pendingInterrupts.set(command.commandId, retained);
     return await finishPendingInterrupt(retained);
   }
@@ -1392,6 +1536,27 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     }
 
     if (interaction.status === 'settled') {
+      return await rejectAndRecord(
+        command,
+        receipt(
+          command,
+          'rejected',
+          {
+            error: agentError(
+              'interaction_already_settled',
+              `interaction \`${command.interactionId}\` is already settled`,
+            ),
+          },
+          acceptedAt,
+        ),
+      );
+    }
+
+    // The first read may have been held while provider ingress committed a
+    // withdrawal. Refresh before using process-local routing, which is
+    // removed as soon as that settlement commits.
+    const currentInteraction = await store.readInteraction(command.sessionId, command.interactionId);
+    if (currentInteraction?.status === 'settled') {
       return await rejectAndRecord(
         command,
         receipt(
@@ -1539,10 +1704,15 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       );
     }
     if (snapshot.session.state === 'closed' || snapshot.session.state === 'failed') {
-      const result = { type: 'session_closed' as const, sessionId: command.sessionId, interruptedActiveRun: false };
-      return internal
-        ? receipt(command, 'applied', { result }, acceptedAt)
-        : await recordApplied(command, result, acceptedAt);
+      const result = {
+        type: 'session_closed' as const,
+        sessionId: command.sessionId,
+        interruptedActiveRun: closeInterrupted.get(command.commandId) ?? false,
+      };
+      if (internal) return receipt(command, 'applied', { result }, acceptedAt);
+      const recorded = await recordApplied(command, result, acceptedAt);
+      closeInterrupted.delete(command.commandId);
+      return recorded;
     }
 
     const session = requireOpenSession(command.sessionId);
@@ -1581,7 +1751,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     // Interrupt, THEN dispose. Interrupting is what ends the run; disposing is
     // what releases the provider. Using dispose to cancel would lose the run's
     // terminal event.
-    let interruptedActiveRun = false;
+    let interruptedActiveRun = closeInterrupted.get(command.commandId) ?? false;
     const interruptFailures: CleanupFailure[] = [];
     for (const [runId, providerRun] of activeRuns) {
       if (session.interruptingRuns.has(runId)) {
@@ -1630,6 +1800,8 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
     const providerRunsEnded = providerDisposed || interruptFailures.length === 0;
     if (!providerRunsEnded) cleanupFailures.unshift(...interruptFailures);
+    if (providerRunsEnded && activeRuns.length > 0) interruptedActiveRun = true;
+    if (!internal && interruptedActiveRun) closeInterrupted.set(command.commandId, true);
 
     // Closing the session is the terminal fallback when interrupt or successful
     // disposal proves the provider-side run has ended. A late provider
@@ -1677,6 +1849,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       });
       for (const { runId } of session.withdrawals.values()) clearWithdrawals(command.sessionId, runId);
       session.runs.clear();
+      session.terminalizingRuns.clear();
       for (const stop of session.stopSupervision.values()) stop();
       session.stopSupervision.clear();
       session.interactionRefs.clear();
@@ -1714,10 +1887,12 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       for (const [commandId, attempt] of commandAttempts) {
         if (attempt.command && 'sessionId' in attempt.command && attempt.command.sessionId === command.sessionId) {
           commandAttempts.delete(commandId);
+          closeInterrupted.delete(commandId);
         }
       }
     } else {
       commandAttempts.delete(command.commandId);
+      closeInterrupted.delete(command.commandId);
     }
     return produced;
   }
@@ -1826,6 +2001,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       registry.register(provider);
     },
     quiesce,
+    getProviderIngestionFaults: ingestionFaults,
 
     openSession: (command) => coordinateMutation(command, () => openSession(command)),
     submitTurn: (command) => coordinateMutation(command, () => submitTurn(command)),
@@ -1857,8 +2033,25 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
 
     getSession: (sessionId) => store.read(sessionId),
 
-    readEvents(sessionId: SessionId, fromSequence: Sequence, limit?: number): Promise<EventPage> {
-      return store.readEvents(sessionId, fromSequence, limit);
+    async readEvents(sessionId: SessionId, fromSequence: Sequence, limit?: number): Promise<EventPage> {
+      // Compare only this session's monotonic event sequence. Receipt commits
+      // and other sessions cannot make its page stale.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        ensureReplayReady(sessionId);
+        const sequenceBeforeRead = (await store.read(sessionId))?.session.sequence;
+        ensureReplayReady(sessionId);
+        const page = await store.readEvents(sessionId, fromSequence, limit);
+        ensureReplayReady(sessionId);
+        const sequenceAfterRead = (await store.read(sessionId))?.session.sequence;
+        ensureReplayReady(sessionId);
+        if (sequenceBeforeRead === sequenceAfterRead) return page;
+      }
+      throw new AgentRuntimeError(
+        agentError(
+          'store_unavailable',
+          `session \`${sessionId}\` changed during three history reads; retry the same cursor`,
+        ),
+      );
     },
 
     listProviders: () => registry.descriptors(),
@@ -1907,7 +2100,9 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
             ),
           );
         }
-        await quiesce();
+        for (let pass = 0; pass < 100 && pending.size > 0; pass += 1) {
+          await Promise.allSettled([...pending]);
+        }
         // Runtime releases only leases it independently validated and tracked;
         // a provider-wide sweep could invoke a suspect mismatched lease.
         hub.closeAll();
@@ -1923,6 +2118,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     },
   };
 
-  coordinationStates.set(runtime, { commandQueues, sessionQueues });
+  coordinationStates.set(runtime, {
+    commandQueues,
+    sessionQueues,
+    closeInterrupted,
+    pendingSubmits,
+    commandAttempts,
+    live,
+  });
   return runtime;
 }

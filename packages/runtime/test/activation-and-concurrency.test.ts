@@ -24,6 +24,7 @@ import { createScriptedProvider, type ScriptedController } from '@relvo-labs/age
 import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
 
 import { coordinationEntryCountForTesting, createAgentRuntime, type AgentRuntime } from '../src/runtime.ts';
+import { createInMemoryStore, type RuntimeStore, type StoreTransaction } from '../src/store.ts';
 
 type Deferred<T> = { readonly promise: Promise<T>; resolve(value: T): void };
 
@@ -39,6 +40,7 @@ type RuntimeFixture = {
   readonly runtime: AgentRuntime;
   readonly borrowedWorkspacePath: string;
   nextCommandId(): CommandId;
+  waitForEvent(type: string, count?: number): Promise<void>;
 };
 
 const roots: string[] = [];
@@ -57,13 +59,45 @@ async function runtimeFixture(provider: AgentProvider): Promise<RuntimeFixture> 
   const clock = createFixedClock();
   const idFactory = createCounterIdFactory();
   const workspaces = createLocalWorkspaceProvider({ baseDirectory: join(root, 'managed'), clock, idFactory });
-  const runtime = createAgentRuntime({ workspaces, providers: [provider], clock, idFactory });
+  const baseStore = createInMemoryStore({ clock, idFactory });
+  const eventCounts = new Map<string, number>();
+  const waiters: { type: string; count: number; resolve(): void }[] = [];
+  const store: RuntimeStore = {
+    get revision() {
+      return baseStore.revision;
+    },
+    commit: async <T>(mutate: (tx: StoreTransaction) => T) => {
+      const result = await baseStore.commit(mutate);
+      for (const event of result.events) {
+        const type = event.payload.type;
+        eventCounts.set(type, (eventCounts.get(type) ?? 0) + 1);
+      }
+      for (const waiter of [...waiters]) {
+        if ((eventCounts.get(waiter.type) ?? 0) < waiter.count) continue;
+        waiters.splice(waiters.indexOf(waiter), 1);
+        waiter.resolve();
+      }
+      return result;
+    },
+    read: (sessionId) => baseStore.read(sessionId),
+    readEvents: (sessionId, from, limit) => baseStore.readEvents(sessionId, from, limit),
+    readInteraction: (sessionId, interactionId) => baseStore.readInteraction(sessionId, interactionId),
+    findReceipt: (commandId) => baseStore.findReceipt(commandId),
+    listSessions: () => baseStore.listSessions(),
+  };
+  const runtime = createAgentRuntime({ workspaces, providers: [provider], clock, idFactory, store });
   runtimes.push(runtime);
   let command = 0;
   return {
     runtime,
     borrowedWorkspacePath,
     nextCommandId: () => CommandIdSchema.parse(`activation-${String(++command).padStart(8, '0')}`),
+    waitForEvent: (type, count = 1) =>
+      (eventCounts.get(type) ?? 0) >= count
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            waiters.push({ type, count, resolve });
+          }),
   };
 }
 
@@ -83,7 +117,13 @@ function synchronousProvider(options: {
   readonly runEvents?: readonly ProviderEventInput[];
   readonly holdFirstRun?: Deferred<undefined>;
   readonly onInteractionResponse?: () => void;
-}): { readonly provider: AgentProvider; readonly controller: ScriptedController; readonly startCount: () => number } {
+}): {
+  readonly provider: AgentProvider;
+  readonly controller: ScriptedController;
+  readonly startCount: () => number;
+  readonly firstStarted: Promise<void>;
+  readonly secondStarted: Promise<void>;
+} {
   const scripted = createScriptedProvider({
     supportsRecovery: false,
     defaultScript: [
@@ -92,6 +132,8 @@ function synchronousProvider(options: {
     ],
   });
   let starts = 0;
+  const firstStarted = deferred<undefined>();
+  const secondStarted = deferred<undefined>();
 
   const provider: AgentProvider = {
     describe: () => scripted.provider.describe(),
@@ -101,6 +143,8 @@ function synchronousProvider(options: {
       return {
         async startRun(request: ProviderRunRequest): Promise<ProviderRun> {
           starts += 1;
+          if (starts === 1) firstStarted.resolve(undefined);
+          if (starts === 2) secondStarted.resolve(undefined);
           for (const event of options.runEvents ?? []) request.sink.emit(event);
           const run = await session.startRun(request);
           if (starts === 1 && options.holdFirstRun !== undefined) await options.holdFirstRun.promise;
@@ -115,7 +159,13 @@ function synchronousProvider(options: {
     },
   };
 
-  return { provider, controller: scripted.controller, startCount: () => starts };
+  return {
+    provider,
+    controller: scripted.controller,
+    startCount: () => starts,
+    firstStarted: firstStarted.promise,
+    secondStarted: secondStarted.promise,
+  };
 }
 
 describe('provider event activation', () => {
@@ -357,7 +407,7 @@ describe('provider event activation', () => {
     reused.payload.text = 'active second';
     runSink?.emit(reused);
     reused.payload.text = 'mutated after both calls';
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await value.waitForEvent('run.message_delta', 2);
 
     const page = await value.runtime.readEvents(sessionId, 0 as never);
     expect(
@@ -405,7 +455,7 @@ describe('provider event activation', () => {
         request: { kind: 'question', prompt: 'Too late?', multiSelect: false },
       },
     });
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await value.waitForEvent('diagnostic');
 
     const snapshot = await value.runtime.getSession(sessionId);
     const page = await value.runtime.readEvents(sessionId, 0 as never);
@@ -430,7 +480,7 @@ describe('provider event activation', () => {
         request: { kind: 'question', prompt: 'Even later?', multiSelect: false },
       },
     });
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await value.waitForEvent('diagnostic', 2);
     const terminalSnapshot = await value.runtime.getSession(sessionId);
     const terminalPage = await value.runtime.readEvents(sessionId, 0 as never);
     expect(terminalSnapshot?.runs[0]?.state).toBe('succeeded');
@@ -504,7 +554,7 @@ describe('scoped command coordination', () => {
       input: { parts: [{ type: 'text', text: 'ask' }] },
     });
     await controller.drain();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await value.waitForEvent('interaction.requested');
     const interactionId = (await value.runtime.getSession(sessionId))?.interactions[0]?.interactionId;
     if (interactionId === undefined) throw new Error('interaction was not projected');
 
@@ -532,7 +582,9 @@ describe('scoped command coordination', () => {
 
   it('does not serialize commands for unrelated sessions', async () => {
     const releaseFirstRun = deferred<undefined>();
-    const { provider, startCount } = synchronousProvider({ holdFirstRun: releaseFirstRun });
+    const { provider, startCount, firstStarted, secondStarted } = synchronousProvider({
+      holdFirstRun: releaseFirstRun,
+    });
     const value = await runtimeFixture(provider);
     const firstSessionId = await open(value);
     const secondSessionId = await open(value);
@@ -543,19 +595,19 @@ describe('scoped command coordination', () => {
       sessionId: firstSessionId,
       input: { parts: [{ type: 'text', text: 'held session' }] },
     });
-    for (let pass = 0; pass < 4; pass += 1) await Promise.resolve();
+    await firstStarted;
     const second = value.runtime.submitTurn({
       commandId: value.nextCommandId(),
       type: 'submit_turn',
       sessionId: secondSessionId,
       input: { parts: [{ type: 'text', text: 'independent session' }] },
     });
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    await secondStarted;
 
     const observedBeforeRelease = startCount();
     releaseFirstRun.resolve(undefined);
     await Promise.all([first, second]);
     expect(observedBeforeRelease).toBe(2);
-    expect(coordinationEntryCountForTesting(value.runtime)).toEqual({ commands: 0, sessions: 0 });
+    expect(coordinationEntryCountForTesting(value.runtime)).toMatchObject({ commands: 0, sessions: 0 });
   });
 });
