@@ -138,7 +138,7 @@ const withdrawn = (providerRef: string): ProviderEventInput => ({
 const yes: InteractionResponse = { kind: 'question', answer: 'yes' };
 /** Upstream prose a bare provider `Error` may carry: a credential and a native identifier. */
 const UPSTREAM_SECRET = 'api_key=sk-live-7f3a9c2e0b1d native_thread=thr_0123456789';
-const UNTYPED_PROVIDER_FAILURE = 'provider rejected the operation without a typed reason';
+const UNKNOWN_OUTCOME = 'the provider outcome of this command is unknown; retry the same command to deliver it again';
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -210,14 +210,17 @@ function fakeRun(): FakeRun {
 }
 
 type FixtureOptions = {
-  readonly contract?: IngressStoreContract;
-  readonly classify?: (error: unknown) => 'rejected' | 'unknown';
+  /** `default`: pass no store contract, so the driver chooses one for the adapter. */
+  readonly contract?: IngressStoreContract | 'default';
+  /** Hand the driver the built-in in-memory store itself, its `commit` replaced in place by the controllable one. */
+  readonly builtInStore?: boolean;
 };
 
 function fixture(options: FixtureOptions = {}) {
   const clock = createFixedClock();
   const idFactory = createCounterIdFactory();
   const base = createInMemoryStore({ clock, idFactory });
+  const baseCommit = base.commit.bind(base);
 
   /** Sessions whose emits throw inside the transaction: a definite pre-apply rejection. */
   const failing = new Set<SessionId>();
@@ -278,7 +281,7 @@ function fixture(options: FixtureOptions = {}) {
     },
     commit<T>(mutate: (tx: StoreTransaction) => T): Promise<{ value: T } & CommitResult> {
       commitCalls += 1;
-      const run = () => base.commit((tx) => mutate(guarded(tx)));
+      const run = () => baseCommit((tx) => mutate(guarded(tx)));
       if (applyThenRejectNext) {
         applyThenRejectNext = false;
         return run().then((): never => {
@@ -337,13 +340,14 @@ function fixture(options: FixtureOptions = {}) {
     publish(sessionId, events);
   };
 
+  if (options.builtInStore === true) base.commit = (mutate) => store.commit(mutate);
+  const contract = options.contract ?? 'linearizable';
   const driver = createIngressDriver({
-    store,
+    store: options.builtInStore === true ? base : store,
     hub,
-    storeContract: options.contract ?? 'linearizable',
+    ...(contract === 'default' ? {} : { storeContract: contract }),
     clock,
     idFactory,
-    ...(options.classify === undefined ? {} : { classifyEffectFailure: options.classify }),
   });
 
   // ---- sessions ----------------------------------------------------------------------
@@ -638,6 +642,31 @@ async function rejection(promise: Promise<unknown>): Promise<AgentRuntimeError> 
     throw error;
   }
   throw new Error('expected an AgentRuntimeError rejection');
+}
+
+/** The queued slot of a command, if it is still in the FIFO. */
+function slotOf(value: Fixture, sessionId: SessionId, commandId: CommandId): Operation<IngressPayload> | undefined {
+  return value.driver
+    .inspect(sessionId)
+    ?.queue.find((op) => op.kind === 'effect' && op.identity.commandId === commandId);
+}
+
+/**
+ * The command's slot once its admission has reserved it. Admission awaits a store
+ * lookup that `settled()` does not track, so yield microtasks (never timers) a
+ * bounded number of times until the reservation exists.
+ */
+async function reservedSlot(
+  value: Fixture,
+  sessionId: SessionId,
+  commandId: CommandId,
+): Promise<Operation<IngressPayload>> {
+  for (let turn = 0; turn < 100; turn += 1) {
+    const op = slotOf(value, sessionId, commandId);
+    if (op !== undefined) return op;
+    await Promise.resolve();
+  }
+  throw new Error(`command ${commandId} was never reserved`);
 }
 
 function receiptOf(outcome: IngressCommandOutcome) {
@@ -1154,8 +1183,8 @@ describe('S3-A3 response reservation and settlement', () => {
     ).toHaveLength(1);
   });
 
-  it('an ambiguous provider outcome stays unresolved and retryable; an exact retry re-delivers into the same slot', async () => {
-    const value = fixture({ classify: (error) => (error instanceof ProviderRejection ? 'rejected' : 'unknown') });
+  it('a bare provider Error is an unknown outcome: unresolved and retryable; only an exact retry re-delivers into the same slot', async () => {
+    const value = fixture();
     const { sessionId } = await value.open();
     const turn = await value.started(sessionId);
     const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
@@ -1166,11 +1195,21 @@ describe('S3-A3 response reservation and settlement', () => {
 
     await reply.provider.reject(0, new Error('connection reset'));
     const unknown = await rejection(reply.outcome);
-    expect(unknown.error).toMatchObject({ code: 'provider_unavailable', retryable: true });
+    expect(unknown.error).toMatchObject({ code: 'provider_unavailable', retryable: true, message: UNKNOWN_OUTCOME });
     const state = value.driver.inspect(sessionId);
     expect(state?.queue.find((op) => op.ordinal === ordinal)).toMatchObject({ kind: 'effect', state: 'unknown' });
     // Unresolved: the terminal still waits behind it, and nothing is certified.
     expect(state?.run?.terminal).toMatchObject({ state: 'intent' });
+    expect(await value.base.findReceipt(reply.command.commandId)).toBeUndefined();
+
+    // A changed payload under the same id conflicts and never reaches the provider.
+    const changed = value.respond(sessionId, { ...reply.command, response: { kind: 'question', answer: 'no' } });
+    expect(receiptOf(await changed.outcome)).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(changed.provider.calls).toHaveLength(0);
+    expect(reply.provider.calls).toHaveLength(1);
 
     const retried = reply.retry();
     await reply.provider.entered(2);
@@ -1201,27 +1240,53 @@ describe('S3-A3 response reservation and settlement', () => {
     const interactionId = await value.requested(sessionId, started.sink(), 'q-1');
     const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
     await reply.provider.entered();
-    await reply.provider.reject(0, new Error('x'.repeat(3000)));
+    await reply.provider.reject(
+      0,
+      new ProviderRejection({ code: 'provider_rejected', message: 'x'.repeat(3000), retryable: false }),
+    );
     expect(receiptOf(await reply.outcome)).toMatchObject({
       disposition: 'rejected',
-      error: { code: 'provider_rejected' },
+      error: { code: 'provider_rejected', message: 'provider rejected the operation with a malformed error' },
     });
     expect(value.driver.bookkeeping(sessionId)).toMatchObject({ waiters: 0, invocations: 0 });
   });
 
-  it('without a classifier every provider rejection is definite, as the SPI documents', async () => {
+  it('only a ProviderRejection is definite: every untyped failure shape is unknown and persists nothing', async () => {
     const value = fixture();
-    const { sessionId } = await value.open();
-    const turn = await value.started(sessionId);
-    const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
-    const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
-    await reply.provider.entered();
-    await reply.provider.reject(0, new Error('connection reset'));
-    // Definite, but a bare `Error` carries no typed reason: its prose is not persisted.
-    expect(receiptOf(await reply.outcome)).toMatchObject({
-      disposition: 'rejected',
-      error: { code: 'provider_rejected', message: UNTYPED_PROVIDER_FAILURE },
-    });
+    const failures: readonly (readonly [string, () => Promise<undefined>])[] = [
+      [
+        'AgentRuntimeError',
+        () => Promise.reject(new AgentRuntimeError(agentError('provider_unavailable', UPSTREAM_SECRET))),
+      ],
+      // Deliberately not `Error` instances: untyped provider failures of any shape.
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+      ['AgentError-shaped object', () => Promise.reject(agentError('provider_rejected', UPSTREAM_SECRET))],
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+      ['string', () => Promise.reject(UPSTREAM_SECRET)],
+      [
+        'synchronous throw',
+        () => {
+          throw new Error(UPSTREAM_SECRET);
+        },
+      ],
+    ];
+    for (const [label, deliver] of failures) {
+      const { sessionId } = await value.open();
+      const turn = await value.started(sessionId);
+      const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
+      const command = value.respondCommand(sessionId, interactionId);
+      const outcome = value.driver.respondToInteraction(sessionId, { command, acceptedAt: value.clock.now(), deliver });
+      const error = await rejection(outcome);
+      expect(error.error, label).toMatchObject({
+        code: 'provider_unavailable',
+        retryable: true,
+        message: UNKNOWN_OUTCOME,
+      });
+      expect(JSON.stringify(error.error), label).not.toContain('sk-live');
+      expect(value.driver.inspect(sessionId)?.queue[0], label).toMatchObject({ effect: 'response', state: 'unknown' });
+      expect(await value.base.findReceipt(command.commandId), label).toBeUndefined();
+    }
+    expect(JSON.stringify(value.published)).not.toContain('sk-live');
   });
 });
 
@@ -1277,17 +1342,24 @@ describe('S3 interrupt_run reservation', () => {
     expect(types(await value.history(sessionId))).not.toContain('run.state_changed');
   });
 
-  it('a second interrupt while one is in flight never reaches the provider again', async () => {
+  it('a second interrupt while one is in flight waits for the shared interrupt and mirrors its delivery, without reaching the provider', async () => {
     const value = fixture();
     const { sessionId } = await value.open();
     const turn = await value.started(sessionId);
     turn.run.interruptMode = 'hold';
     const first = value.interrupt(sessionId, value.interruptCommand(sessionId, turn.runId));
     await turn.run.interruptEntered();
-    const second = value.interrupt(sessionId, value.interruptCommand(sessionId, turn.runId, 'again'));
+    const againCommand = value.interruptCommand(sessionId, turn.runId, 'again');
+    const second = value.interrupt(sessionId, againCommand);
+    await value.driver.settled();
+    // The second command waits: its slot stays unresolved while the shared interrupt is in flight.
+    expect(await reservedSlot(value, sessionId, againCommand.commandId)).toMatchObject({
+      effect: 'interrupt',
+      state: 'pending',
+    });
     turn.run.heldInterrupts[0]?.resolve(undefined);
     expect(receiptOf(await first)).toMatchObject({ result: { delivered: true } });
-    expect(receiptOf(await second)).toMatchObject({ disposition: 'applied', result: { delivered: false } });
+    expect(receiptOf(await second)).toMatchObject({ disposition: 'applied', result: { delivered: true } });
     expect(turn.run.interrupts).toEqual(['stop']);
     expect((await value.history(sessionId)).filter((event) => event.payload.type === 'run.state_changed')).toHaveLength(
       1,
@@ -1824,64 +1896,338 @@ describe('S3R1 settlement ownership and route retirement', () => {
 });
 
 describe('S3R1 untyped provider failures', () => {
-  it('a bare provider Error persists a fixed message: no upstream prose in receipts, events or returned outcomes', async () => {
+  it('a bare provider Error never persists or returns its prose: start, response and interrupt are unknown with a fixed message', async () => {
     const value = fixture();
-    const { sessionId } = await value.open();
+    const errors: AgentRuntimeError[] = [];
     const commandIds: CommandId[] = [];
 
-    const rejectedTurn = value.submit(sessionId);
-    commandIds.push(rejectedTurn.command.commandId);
-    await rejectedTurn.provider.entered();
-    await rejectedTurn.provider.reject(0, new Error(`startRun failed: ${UPSTREAM_SECRET}`));
-    const startOutcome = await rejectedTurn.outcome;
+    const startSession = await value.open();
+    const unknownStart = value.submit(startSession.sessionId);
+    commandIds.push(unknownStart.command.commandId);
+    await unknownStart.provider.entered();
+    await unknownStart.provider.reject(0, new Error(`startRun failed: ${UPSTREAM_SECRET}`));
+    errors.push(await rejection(unknownStart.outcome));
 
-    const turn = await value.started(sessionId);
-    commandIds.push(turn.command.commandId);
-    const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
-    const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    const responseSession = await value.open();
+    const turn = await value.started(responseSession.sessionId);
+    const interactionId = await value.requested(responseSession.sessionId, turn.sink(), 'q-1');
+    const reply = value.respond(
+      responseSession.sessionId,
+      value.respondCommand(responseSession.sessionId, interactionId),
+    );
     commandIds.push(reply.command.commandId);
     await reply.provider.entered();
     await reply.provider.reject(0, new Error(UPSTREAM_SECRET));
-    const responseOutcome = await reply.outcome;
+    errors.push(await rejection(reply.outcome));
 
-    const runtimeTyped = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
-    commandIds.push(runtimeTyped.command.commandId);
-    await runtimeTyped.provider.entered();
-    await runtimeTyped.provider.reject(0, new AgentRuntimeError(agentError('provider_unavailable', UPSTREAM_SECRET)));
-    const runtimeTypedOutcome = await runtimeTyped.outcome;
-
-    turn.run.interruptMode = 'secret';
-    const interruptCommand = value.interruptCommand(sessionId, turn.runId);
+    const interruptSession = await value.open();
+    const interrupted = await value.started(interruptSession.sessionId);
+    interrupted.run.interruptMode = 'secret';
+    const interruptCommand = value.interruptCommand(interruptSession.sessionId, interrupted.runId);
     commandIds.push(interruptCommand.commandId);
-    const interruptOutcome = await value.interrupt(sessionId, interruptCommand);
+    errors.push(await rejection(value.interrupt(interruptSession.sessionId, interruptCommand)));
 
-    for (const outcome of [startOutcome, responseOutcome, runtimeTypedOutcome, interruptOutcome]) {
-      expect(receiptOf(outcome)).toMatchObject({
-        disposition: 'rejected',
-        error: { code: 'provider_rejected', message: UNTYPED_PROVIDER_FAILURE },
-      });
+    for (const error of errors) {
+      expect(error.error).toMatchObject({ code: 'provider_unavailable', retryable: true, message: UNKNOWN_OUTCOME });
     }
 
-    // A typed ProviderRejection keeps its deliberately normalized message.
-    turn.run.interruptMode = 'reject';
-    const typed = value.interruptCommand(sessionId, turn.runId);
+    // A typed ProviderRejection stays definite and keeps its deliberately normalized message.
+    const typedSession = await value.open();
+    const typedRun = await value.started(typedSession.sessionId);
+    typedRun.run.interruptMode = 'reject';
+    const typed = value.interruptCommand(typedSession.sessionId, typedRun.runId);
     commandIds.push(typed.commandId);
-    expect(receiptOf(await value.interrupt(sessionId, typed))).toMatchObject({
+    expect(receiptOf(await value.interrupt(typedSession.sessionId, typed))).toMatchObject({
       disposition: 'rejected',
       error: { code: 'provider_rejected', message: 'interrupt refused' },
     });
 
     await value.driver.settled();
+    const sessions = [startSession, responseSession, interruptSession, typedSession];
     const persisted = JSON.stringify({
-      outcomes: [startOutcome, responseOutcome, runtimeTypedOutcome, interruptOutcome],
+      errors: errors.map((error) => error.error),
       receipts: await Promise.all(commandIds.map((id) => value.base.findReceipt(id))),
-      events: await value.history(sessionId),
+      events: await Promise.all(sessions.map(({ sessionId }) => value.history(sessionId))),
       published: value.published,
     });
-    expect(persisted).toContain(UNTYPED_PROVIDER_FAILURE);
     expect(persisted).not.toContain('sk-live');
     expect(persisted).not.toContain('thr_0123456789');
+  });
+});
+
+describe('S3R2 unknown provider start', () => {
+  it('an unknown start owns no started run: its staging waits behind the unresolved slot and only an exact retry calls startRun again', async () => {
+    const value = fixture();
+    const { sessionId, sink: sessionSink } = await value.open();
+    const turn = value.submit(sessionId);
+    await turn.provider.entered();
+    const ordinal = turn.reservedAtCall()?.ordinal;
+    turn.sink().emit(delta('first attempt'));
+    sessionSink.emit(note('session output'));
+
+    await turn.provider.reject(0, new Error(`spawn failed: ${UPSTREAM_SECRET}`));
+    const unknown = await rejection(turn.outcome);
+    expect(unknown.error).toMatchObject({ code: 'provider_unavailable', retryable: true, message: UNKNOWN_OUTCOME });
+    await value.driver.settled();
+    const state = value.driver.inspect(sessionId);
+    if (state === undefined) throw new Error('no ingestion state');
+    // The start slot is unresolved at its ordinal; the run record is still only starting (S).
+    expect(state.queue[0]).toMatchObject({ kind: 'effect', effect: 'start', ordinal, state: 'unknown' });
+    expect(state.run).toMatchObject({ runId: turn.runId, start: 'pending', staged: 1 });
+    expect(runPhase(state)).toBe('S');
+    // Nothing was accepted as started: no start bundle, and the run and session output wait behind the slot.
+    expect(types(await value.history(sessionId))).toEqual(['session.opened']);
+    expect(await value.base.findReceipt(turn.command.commandId)).toBeUndefined();
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ run: true, claims: 1, invocations: 0 });
+
+    // The session's one run is still starting, so another command cannot start a run.
+    const other = value.submit(sessionId);
+    expect(await other.outcome).toEqual({ kind: 'refused', reason: 'run-active' });
+    expect(other.provider.calls).toHaveLength(0);
+    // A changed payload under the same id conflicts without calling the provider.
+    const changedProvider = controllable<[ProviderRunRequest], ProviderRun>(() => undefined);
+    const changed = await value.driver.submitTurn(sessionId, {
+      command: { ...turn.command, input: { parts: [{ type: 'text', text: 'changed' }] } },
+      acceptedAt: value.clock.now(),
+      turnId: turn.turnId,
+      runId: turn.runId,
+      attempt: 1,
+      startRun: changedProvider.fn,
+    });
+    expect(receiptOf(changed)).toMatchObject({ disposition: 'rejected', error: { code: 'command_id_conflict' } });
+    expect(changedProvider.calls).toHaveLength(0);
+    expect(turn.provider.calls).toHaveLength(1);
+
+    // The exact retry calls startRun again for the same run: same runRef, same ordered sink.
+    const retried = turn.retry();
+    await turn.provider.entered(2);
+    const first = turn.provider.calls[0]?.args[0];
+    const second = turn.provider.calls[1]?.args[0];
+    expect(second?.runRef).toBe(turn.runId);
+    expect(second?.sink).toBe(first?.sink);
+    expect(second?.input).toEqual(turn.command.input);
+    turn.sink().emit(delta('second attempt'));
+    await turn.provider.resolve(1, fakeRun().handle);
+    const receipt = receiptOf(await retried);
+    expect(receipt).toMatchObject({ disposition: 'applied', sequence: 3 });
+    await value.driver.settled();
+    expect(types(await value.history(sessionId))).toEqual([
+      'session.opened',
+      'turn.started',
+      'run.started',
+      'run.message_delta',
+      'diagnostic',
+      'run.message_delta',
+    ]);
+    expect(turn.provider.calls).toHaveLength(2);
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ run: true, claims: 0, invocations: 0 });
+  });
+
+  it('an exact retry of an unknown start that is then definitely rejected discards the run staging and records the rejected receipt', async () => {
+    const value = fixture();
+    const { sessionId, sink: sessionSink } = await value.open();
+    const turn = value.submit(sessionId);
+    await turn.provider.entered();
+    turn.sink().emit(delta('maybe started'));
+    sessionSink.emit(note('session output'));
+    await turn.provider.reject(0, new Error('transport reset'));
+    await rejection(turn.outcome);
+
+    const retried = turn.retry();
+    await turn.provider.entered(2);
+    await turn.provider.reject(1, new ProviderRejection(agentError('provider_rejected', 'quota exhausted')));
+    expect(receiptOf(await retried)).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'provider_rejected', message: 'quota exhausted' },
+    });
+    await value.driver.settled();
+    expect(types(await value.history(sessionId))).toEqual(['session.opened', 'diagnostic']);
+    expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
     expect(value.driver.fault(sessionId)).toBeUndefined();
+    const next = await value.started(sessionId);
+    expect(receiptOf(next.receipt).disposition).toBe('applied');
+  });
+});
+
+describe('S3R2 unknown interrupt and the shared interrupt outcome', () => {
+  it('an unknown interrupt keeps its fence and slot; only its exact retry interrupts the provider again', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    turn.run.interruptMode = 'unknown';
+    const command = value.interruptCommand(sessionId, turn.runId);
+    const unknown = await rejection(value.interrupt(sessionId, command));
+    expect(unknown.error).toMatchObject({ code: 'provider_unavailable', retryable: true, message: UNKNOWN_OUTCOME });
+    const state = value.driver.inspect(sessionId);
+    expect(slotOf(value, sessionId, command.commandId)).toMatchObject({ effect: 'interrupt', state: 'unknown' });
+    expect(state === undefined ? undefined : runFenced(state)).toBe(true);
+
+    expect(receiptOf(await value.interrupt(sessionId, { ...command, reason: 'changed' }))).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(turn.run.interrupts).toEqual(['stop']);
+
+    turn.run.interruptMode = 'resolve';
+    expect(receiptOf(await value.interrupt(sessionId, command))).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    expect(turn.run.interrupts).toEqual(['stop', 'stop']);
+  });
+
+  it('an unknown interrupt holds the run terminal behind it; a fresh interrupt mirrors the observed unknown outcome at once', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    turn.run.interruptMode = 'unknown';
+    const command = value.interruptCommand(sessionId, turn.runId);
+    expect((await rejection(value.interrupt(sessionId, command))).error).toMatchObject({
+      code: 'provider_unavailable',
+      message: UNKNOWN_OUTCOME,
+    });
+
+    // The unknown outcome is already observed: a fresh command mirrors it at once and never calls the provider.
+    const freshCommand = value.interruptCommand(sessionId, turn.runId, 'again');
+    expect((await rejection(value.interrupt(sessionId, freshCommand))).error).toMatchObject({
+      code: 'provider_unavailable',
+      retryable: true,
+      message: UNKNOWN_OUTCOME,
+    });
+    expect(slotOf(value, sessionId, freshCommand.commandId)).toMatchObject({ effect: 'interrupt', state: 'unknown' });
+    expect(turn.run.interrupts).toEqual(['stop']);
+
+    // The provider ends the run while the interrupt outcome is unknown: the terminal is chosen but not placed.
+    await turn.run.complete({ outcome: 'interrupted', reason: 'stop' });
+    await value.driver.settled();
+    expect(value.driver.inspect(sessionId)?.run?.terminal).toMatchObject({ state: 'intent' });
+    expect(types(await value.history(sessionId))).toEqual(['session.opened', 'turn.started', 'run.started']);
+
+    // Only the owner's exact retry interrupts the provider again; then both slots and the terminal commit in order.
+    turn.run.interruptMode = 'resolve';
+    expect(receiptOf(await value.interrupt(sessionId, command))).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    await value.driver.settled();
+    expect(turn.run.interrupts).toEqual(['stop', 'stop']);
+    expect(types(await value.history(sessionId)).slice(3)).toEqual([
+      'run.state_changed',
+      'run.finished',
+      'turn.settled',
+    ]);
+    expect(receiptOf(await value.interrupt(sessionId, freshCommand))).toMatchObject({
+      disposition: 'duplicate',
+      result: { delivered: true },
+    });
+    expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
+    expect(value.driver.fault(sessionId)).toBeUndefined();
+  });
+
+  it('a waiting interrupt mirrors a definite rejection of the shared interrupt with the same error', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    turn.run.interruptMode = 'hold';
+    const first = value.interrupt(sessionId, value.interruptCommand(sessionId, turn.runId));
+    await turn.run.interruptEntered();
+    const againCommand = value.interruptCommand(sessionId, turn.runId, 'again');
+    const second = value.interrupt(sessionId, againCommand);
+    await value.driver.settled();
+    expect(await reservedSlot(value, sessionId, againCommand.commandId)).toMatchObject({ state: 'pending' });
+
+    turn.run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'cannot interrupt now')));
+    for (const outcome of [await first, await second]) {
+      expect(receiptOf(outcome)).toMatchObject({
+        disposition: 'rejected',
+        error: { code: 'provider_rejected', message: 'cannot interrupt now' },
+      });
+    }
+    expect(turn.run.interrupts).toEqual(['stop']);
+    const state = value.driver.inspect(sessionId);
+    expect(state === undefined ? undefined : runFenced(state)).toBe(false);
+  });
+
+  it('a waiting interrupt mirrors an unknown shared outcome and is filled when the owning command’s exact retry resolves it', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    turn.run.interruptMode = 'hold';
+    const ownerCommand = value.interruptCommand(sessionId, turn.runId);
+    const owner = value.interrupt(sessionId, ownerCommand);
+    await turn.run.interruptEntered();
+    const againCommand = value.interruptCommand(sessionId, turn.runId, 'again');
+    const follower = value.interrupt(sessionId, againCommand);
+
+    turn.run.heldInterrupts[0]?.reject(new Error('interrupt transport reset'));
+    for (const outcome of [owner, follower]) {
+      expect((await rejection(outcome)).error).toMatchObject({
+        code: 'provider_unavailable',
+        retryable: true,
+        message: UNKNOWN_OUTCOME,
+      });
+    }
+    expect(slotOf(value, sessionId, againCommand.commandId)).toMatchObject({ state: 'unknown' });
+    // The waiting command's own exact retry never interrupts the provider; it mirrors the still-unknown outcome.
+    expect((await rejection(value.interrupt(sessionId, againCommand))).error).toMatchObject({
+      code: 'provider_unavailable',
+    });
+    expect(turn.run.interrupts).toEqual(['stop']);
+
+    // The owner's exact retry interrupts again; while that call is in flight, the waiting
+    // command's exact retry waits for it instead of reporting the stale unknown outcome.
+    const ownerRetry = value.interrupt(sessionId, ownerCommand);
+    await turn.run.interruptEntered(2);
+    const followerRetry = value.interrupt(sessionId, againCommand);
+    turn.run.heldInterrupts[1]?.resolve(undefined);
+    expect(receiptOf(await ownerRetry)).toMatchObject({ disposition: 'applied', result: { delivered: true } });
+    expect(receiptOf(await followerRetry)).toMatchObject({ disposition: 'applied', result: { delivered: true } });
+    expect(turn.run.interrupts).toEqual(['stop', 'stop']);
+    await value.driver.settled();
+    expect(receiptOf(await value.interrupt(sessionId, againCommand))).toMatchObject({
+      disposition: 'duplicate',
+      result: { delivered: true },
+    });
+    expect((await value.history(sessionId)).filter((event) => event.payload.type === 'run.state_changed')).toHaveLength(
+      1,
+    );
+  });
+
+  it('an interrupt after the shared interrupt was observed mirrors it at once: delivered, no provider call', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    expect(receiptOf(await value.interrupt(sessionId, value.interruptCommand(sessionId, turn.runId)))).toMatchObject({
+      result: { delivered: true },
+    });
+    await value.driver.settled();
+    expect(
+      receiptOf(await value.interrupt(sessionId, value.interruptCommand(sessionId, turn.runId, 'again'))),
+    ).toMatchObject({ disposition: 'applied', result: { delivered: true } });
+    expect(turn.run.interrupts).toEqual(['stop']);
+  });
+});
+
+describe('S3R2 store contract default', () => {
+  it('a store that is not the built-in in-memory store defaults to unverified: an apply-then-reject is permanent A', async () => {
+    const value = fixture({ contract: 'default' });
+    const { sessionId, sink } = await value.open();
+    value.applyThenRejectNext();
+    sink.emit(note('applied, then rejected'));
+    await value.driver.settled();
+    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'ambiguous', permanent: true });
+    expect(value.published.filter((entry) => entry.type === 'diagnostic')).toHaveLength(0);
+  });
+
+  it('the built-in in-memory store defaults to the strong contract: an apply-then-reject is reconciled as applied', async () => {
+    const value = fixture({ contract: 'default', builtInStore: true });
+    const { sessionId, sink } = await value.open();
+    value.applyThenRejectNext();
+    sink.emit(note('applied, then rejected'));
+    await value.driver.settled();
+    expect(value.driver.fault(sessionId)).toBeUndefined();
+    expect(value.published.filter((entry) => entry.type === 'diagnostic')).toHaveLength(1);
+    expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
   });
 });
 

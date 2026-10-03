@@ -151,6 +151,19 @@ export function observeHistoryReadsForTesting(store: RuntimeStore, observer: () 
   return () => historyReadObservers.delete(store);
 }
 
+/**
+ * Stores created by `createInMemoryStore`. Provider ingestion recognizes them as
+ * meeting the strong store contract: a settled commit rejection never applies
+ * later, and a read after it is linearizable. Every other `RuntimeStore` is
+ * treated as unverified until surface 4 adds a public declaration (issue #43).
+ */
+const builtInStores = new WeakSet<RuntimeStore>();
+
+/** @internal Whether `store` is a built-in in-memory store. Not exported from the package entry point. */
+export function isBuiltInStore(store: RuntimeStore): boolean {
+  return builtInStores.has(store);
+}
+
 export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore {
   const defaultPageSize = options.defaultPageSize ?? 1000;
 
@@ -334,6 +347,7 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
       return Promise.resolve([...state.sessions.keys()]);
     },
   };
+  builtInStores.add(store);
   return store;
 }
 
