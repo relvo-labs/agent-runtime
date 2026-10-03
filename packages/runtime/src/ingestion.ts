@@ -147,12 +147,16 @@ export type RunLifecycle<T> = {
   start: 'pending' | 'applied' | 'committed';
   /** Run-sink bodies accepted before the start committed. */
   staged: number;
-  /** No fresh effects; interaction requests are demoted. */
-  fenced: boolean;
   terminal: RunTerminal<T> | undefined;
   /** This run's effect reservations not yet filled. */
   unresolved: number;
+  /**
+   * The one provider interrupt for this run, shared by `interrupt_run`, overflow and
+   * close. In flight or succeeded, it fences new interactions (ADR-0005).
+   */
   interrupt: PhaseState;
+  /** Who settles an in-flight interrupt: cleanup, or the `interrupt_run` reservation's ordinal. */
+  interruptOwner: 'cleanup' | number | undefined;
 };
 
 export type CloseState = {
@@ -226,13 +230,17 @@ export type CleanupStep =
 /** An exact retry shares the reservation; a changed payload under the same ID conflicts. */
 export type IdentityMatch<T> = Refusal | Readonly<{ kind: 'existing'; op: EffectOperation<T> }>;
 
-export type ReserveResult<T> = IdentityMatch<T> | Readonly<{ kind: 'reserved'; ordinal: number }>;
+/**
+ * `deliver: false` means the shared run interrupt is already in flight or observed
+ * successful: fill the slot without invoking the provider again.
+ */
+export type ReserveResult<T> = IdentityMatch<T> | Readonly<{ kind: 'reserved'; ordinal: number; deliver: boolean }>;
 
 export type StartResult<T> = IdentityMatch<T> | Readonly<{ kind: 'reserved'; ordinal: number; fence: RunSinkFence }>;
 
 export type AcceptResult =
   | Readonly<{ kind: 'accepted'; ordinal: number; demoted: boolean }>
-  | Readonly<{ kind: 'discarded'; reason: 'stale-sink' | 'post-terminal' | 'session-ended' }>
+  | Readonly<{ kind: 'discarded'; reason: 'stale-sink' | 'post-terminal' | 'fenced' | 'session-ended' }>
   | Readonly<{ kind: 'refused'; reason: 'overflow' | 'activation-overflow' | 'overflowed'; interrupt?: RunId }>;
 
 /** `next`, when present, is the cleanup call an admitted close may make now. */
@@ -266,8 +274,24 @@ function isCounted<T>(op: Operation<T>): boolean {
   return op.kind === 'body' || op.kind === 'effect';
 }
 
+/** Values this module has already frozen all the way down. */
+const deeplyFrozen = new WeakSet<object>();
+
+/**
+ * Freeze an owned value and everything reachable from it, so an accepted or
+ * submitted bundle cannot be rewritten through any alias. Payloads are plain
+ * captured data (ADR-0016); binary views cannot be frozen and are left as is.
+ */
+function deepFreeze<V>(value: V): V {
+  if (value === null || typeof value !== 'object' || deeplyFrozen.has(value)) return value;
+  deeplyFrozen.add(value);
+  if (ArrayBuffer.isView(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
 function enqueue<T>(s: SessionIngestion<T>, build: (ordinal: number) => Operation<T>): Operation<T> {
-  const op = Object.freeze(build(s.nextOrdinal));
+  const op = deepFreeze(build(s.nextOrdinal));
   s.nextOrdinal += 1;
   s.queue.push(op);
   if (isCounted(op)) s.counted += 1;
@@ -280,7 +304,7 @@ function indexOf<T>(s: SessionIngestion<T>, ordinal: number): number {
 
 /** Replace an unsubmitted entry with a new frozen entry at the same ordinal. */
 function replace<T>(s: SessionIngestion<T>, index: number, op: Operation<T>): Operation<T> {
-  const frozen = Object.freeze(op);
+  const frozen = deepFreeze(op);
   s.queue[index] = frozen;
   return frozen;
 }
@@ -311,6 +335,26 @@ function hasPlacedTerminal<T>(run: RunLifecycle<T>): boolean {
   return run.terminal !== undefined && run.terminal.state !== 'intent';
 }
 
+/**
+ * The run is ending: a terminal was chosen, a close was admitted, or history
+ * overflowed. Each source is an independent fact; none is a stored flag that
+ * another source could clear.
+ */
+function endingFence<T>(s: SessionIngestion<T>, run: RunLifecycle<T>): boolean {
+  return run.terminal !== undefined || s.close !== undefined || s.faults.overflow !== undefined;
+}
+
+/** A provider interrupt is in flight or observed: new interactions cannot reverse it. */
+function interruptFence<T>(run: RunLifecycle<T>): boolean {
+  return run.interrupt === 'in-flight' || run.interrupt === 'succeeded';
+}
+
+/** Take the shared interrupt for cleanup (close or overflow). */
+function claimInterrupt<T>(run: RunLifecycle<T>): void {
+  run.interrupt = 'in-flight';
+  run.interruptOwner = 'cleanup';
+}
+
 /** Record an overflow. Only a pending start's own sink can make it provisional. */
 function noteOverflow<T>(s: SessionIngestion<T>, source: 'session' | RunLifecycle<T>): void {
   const provisional = source !== 'session' && source.start === 'pending' ? source.runId : undefined;
@@ -335,18 +379,18 @@ function refuseOverflow<T>(
   noteOverflow(s, source);
   const run = s.run;
   if (run === undefined) return { kind: 'refused', reason };
-  run.fenced = true;
   const terminal = run.terminal;
   if (terminal?.state === 'intent') {
-    run.terminal = { state: 'intent', intent: overflowIntent(terminal.intent) };
+    run.terminal = { state: 'intent', intent: deepFreeze(overflowIntent(terminal.intent)) };
   } else if (terminal?.state === 'placed') {
     const index = indexOf(s, terminal.ordinal);
     const op = s.queue[index];
     if (op?.kind === 'terminal') replace(s, index, { ...op, intent: overflowIntent(op.intent) });
   }
   // Interrupt once, and only a run whose provider handle exists and has not completed.
+  // An interrupt already owned by `interrupt_run` or close is not requested twice.
   if (terminal === undefined && run.start !== 'pending' && run.interrupt === 'idle') {
-    run.interrupt = 'in-flight';
+    claimInterrupt(run);
     return { kind: 'refused', reason, interrupt: run.runId };
   }
   return { kind: 'refused', reason };
@@ -369,11 +413,11 @@ function placeTerminal<T>(s: SessionIngestion<T>): void {
 }
 
 function selectTerminal<T>(s: SessionIngestion<T>, run: RunLifecycle<T>, intent: TerminalIntent<T>): void {
+  // The run owns its intent and captured detail from here on; nothing may rewrite them.
   run.terminal = {
     state: 'intent',
-    intent: s.faults.overflow === undefined ? intent : overflowIntent(intent),
+    intent: deepFreeze(s.faults.overflow === undefined ? intent : overflowIntent(intent)),
   };
-  run.fenced = true;
   placeTerminal(s);
 }
 
@@ -448,7 +492,7 @@ function nextCleanup<T>(s: SessionIngestion<T>, close: CloseState, after?: Clean
     if (phase === 'interrupt') {
       const run = interruptNeeded(s, close);
       if (run?.interrupt !== 'idle') continue;
-      run.interrupt = 'in-flight';
+      claimInterrupt(run);
       return { kind: 'attempt', phase };
     }
     if (phase === 'dispose') {
@@ -484,12 +528,29 @@ function stopped<T>(
   return pending === undefined ? { kind: 'stopped', failed } : { kind: 'stopped', pending, failed };
 }
 
-/** Continue an admitted close after an effect it was waiting on settled. */
+/**
+ * After an effect settled: continue an admitted close, or perform an overflow's
+ * deferred interrupt once the run has a handle and nobody else owns the interrupt.
+ * Only never-attempted (`idle`) calls are returned.
+ */
 function continueCleanup<T>(s: SessionIngestion<T>): CleanupStep | undefined {
   const close = s.close;
-  if (close === undefined) return undefined;
-  const step = nextCleanup(s, close);
-  return step.kind === 'attempt' ? step : undefined;
+  if (close !== undefined) {
+    const step = nextCleanup(s, close);
+    return step.kind === 'attempt' ? step : undefined;
+  }
+  const run = s.run;
+  if (
+    run === undefined ||
+    s.faults.overflow === undefined ||
+    run.terminal !== undefined ||
+    run.start === 'pending' ||
+    run.interrupt !== 'idle'
+  ) {
+    return undefined;
+  }
+  claimInterrupt(run);
+  return { kind: 'attempt', phase: 'interrupt' };
 }
 
 /** Delete the run record. Its sinks keep only their immutable fence. */
@@ -530,14 +591,24 @@ export function createSessionIngestion<T>(sessionId: SessionId, open: CommandIde
   return s;
 }
 
-/** S until the start bundle commits, then T once a terminal is placed, E while fenced, else R. */
+/**
+ * S until the start bundle commits, then T once a terminal is placed, E while
+ * ending (terminal chosen, close admitted or overflow), else R. An interrupt in
+ * flight alone keeps R: the provider may still emit output before completing.
+ */
 export function runPhase<T>(s: SessionIngestion<T>): RunPhase {
   const run = s.run;
   if (run === undefined) return 'X';
   if (run.start !== 'committed') return 'S';
   if (hasPlacedTerminal(run)) return 'T';
-  if (run.fenced || run.terminal !== undefined) return 'E';
+  if (endingFence(s, run)) return 'E';
   return 'R';
+}
+
+/** Whether the current run refuses new effects and demotes new interaction requests. */
+export function runFenced<T>(s: SessionIngestion<T>): boolean {
+  const run = s.run;
+  return run !== undefined && (endingFence(s, run) || interruptFence(run));
 }
 
 /** One entry per session with precedence A > O > F. Only F alone is retryable. */
@@ -603,10 +674,10 @@ export function reserveStart<T>(
     startOrdinal: reserved.ordinal,
     start: 'pending',
     staged: 0,
-    fenced: false,
     terminal: undefined,
     unresolved: 0,
     interrupt: 'idle',
+    interruptOwner: undefined,
   };
   const fence: RunSinkFence = Object.freeze({ runId: input.runId, epoch: s.epoch });
   return { kind: 'reserved', ordinal: reserved.ordinal, fence };
@@ -615,6 +686,9 @@ export function reserveStart<T>(
 /**
  * Accept one captured provider emission. A stale or post-terminal run sink is
  * discarded before counting; excess is refused before acceptance and marks O.
+ * In E only settlements of earlier interactions (withdrawals) and demoted
+ * interaction requests are accepted; fresh run output is discarded as `fenced`.
+ * A pending start (S) still stages its captured output.
  */
 export function acceptEvent<T>(
   s: SessionIngestion<T>,
@@ -633,13 +707,16 @@ export function acceptEvent<T>(
   }
   const origin = run ?? 'session';
   if (s.faults.overflow !== undefined) return refuseOverflow(s, origin, 'overflowed');
+  const role = options.role ?? 'none';
+  if (run?.start === 'committed' && endingFence(s, run) && role === 'none') {
+    return { kind: 'discarded', reason: 'fenced' };
+  }
   const preActivation = run === undefined ? s.state === 'opening' : run.start !== 'committed';
   const staged = run === undefined ? s.staged : run.staged;
   if (preActivation && staged >= PRE_ACTIVATION_LIMIT) return refuseOverflow(s, origin, 'activation-overflow');
   if (s.counted >= SESSION_OPERATION_LIMIT) return refuseOverflow(s, origin, 'overflow');
 
-  const role = options.role ?? 'none';
-  const demoted = role === 'request' && run !== undefined && (run.fenced || run.terminal !== undefined);
+  const demoted = role === 'request' && run !== undefined && (endingFence(s, run) || interruptFence(run));
   const subject = options.subject;
   const op = enqueue(s, (ordinal) => ({
     kind: 'body',
@@ -676,7 +753,7 @@ export function reserveEffect<T>(
   if (run?.runId !== input.runId || run.start !== 'committed' || hasPlacedTerminal(run)) {
     return { kind: 'refused', reason: 'run-not-active' };
   }
-  if (input.effect === 'response' && (run.fenced || run.terminal !== undefined)) {
+  if (input.effect === 'response' && (endingFence(s, run) || interruptFence(run))) {
     return { kind: 'refused', reason: 'run-not-active' };
   }
   const subject = input.subject;
@@ -701,7 +778,14 @@ export function reserveEffect<T>(
     state: 'pending',
   }));
   run.unresolved += 1;
-  return { kind: 'reserved', ordinal: reserved.ordinal };
+  if (input.effect === 'interrupt') {
+    // Install the interrupt fence synchronously, before the provider is called
+    // (ADR-0005). An interrupt already in flight or observed is not issued again.
+    if (interruptFence(run)) return { kind: 'reserved', ordinal: reserved.ordinal, deliver: false };
+    run.interrupt = 'in-flight';
+    run.interruptOwner = reserved.ordinal;
+  }
+  return { kind: 'reserved', ordinal: reserved.ordinal, deliver: true };
 }
 
 export type EffectOutcome<T> =
@@ -764,20 +848,26 @@ export function settleEffect<T>(
     }
     replace(s, index, { ...op, state, result: outcome.result });
     run.start = 'applied';
-    if (s.close !== undefined) return withNext({ kind: 'filled' }, continueCleanup(s));
-    if (run.fenced && run.terminal === undefined && run.interrupt === 'idle') {
-      // An overflow fenced this start before a handle existed: interrupt it now, once.
-      run.interrupt = 'in-flight';
-      return { kind: 'filled', next: { kind: 'attempt', phase: 'interrupt' } };
-    }
-    return { kind: 'filled' };
+    // A completion recorded while the start was pending can be placed now.
+    placeTerminal(s);
+    // A close continues; an overflow that fenced the start before a handle existed interrupts now, once.
+    return withNext({ kind: 'filled' }, continueCleanup(s));
   }
 
   replace(s, index, { ...op, state, result: outcome.result });
   if (run !== undefined && run.runId === op.runId) {
     run.unresolved -= 1;
-    // A delivered interrupt_run must never be redelivered by close.
-    if (op.effect === 'interrupt' && state === 'applied') run.interrupt = 'succeeded';
+    if (op.effect === 'interrupt' && run.interruptOwner === op.ordinal) {
+      run.interruptOwner = undefined;
+      if (state === 'applied') {
+        // Observed success: never redelivered, and a truthful close fallback.
+        run.interrupt = 'succeeded';
+        closeFallback(s);
+      } else {
+        // Definite rejection rolls back only this fence; close/overflow/completion fences are independent.
+        run.interrupt = 'idle';
+      }
+    }
     placeTerminal(s);
   }
   return withNext({ kind: 'filled' }, continueCleanup(s));
@@ -791,8 +881,10 @@ function settleCleanup<T>(s: SessionIngestion<T>, phase: CleanupPhase, outcome: 
   const close = s.close;
   if (phase === 'interrupt') {
     const run = s.run;
-    if (run?.interrupt !== 'in-flight') return { kind: 'ignored' };
+    // An interrupt owned by an `interrupt_run` reservation is settled through that slot only.
+    if (run?.interrupt !== 'in-flight' || run.interruptOwner !== 'cleanup') return { kind: 'ignored' };
     run.interrupt = outcome;
+    run.interruptOwner = undefined;
     if (outcome === 'succeeded') closeFallback(s);
   } else {
     if (close?.[phase] !== 'in-flight') return { kind: 'ignored' };
@@ -946,8 +1038,8 @@ export function beginCleanup<T>(
       release: 'idle',
       interruptedActiveRun: false,
     };
+    // Admission is the fence: `s.close` now makes the run end (E) without any per-run flag.
     s.close = close;
-    if (s.run !== undefined) s.run.fenced = true;
     queueClosing(s, close);
   }
   // Each explicit attempt re-arms only the calls that failed; successes stay observed

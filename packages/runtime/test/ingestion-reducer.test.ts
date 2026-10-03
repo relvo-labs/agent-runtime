@@ -23,6 +23,7 @@ import {
   reserveEffect,
   reserveStart,
   retire,
+  runFenced,
   runPhase,
   settleEffect,
   type CleanupStep,
@@ -30,6 +31,7 @@ import {
   type Operation,
   type RunSinkFence,
   type SessionIngestion,
+  type TerminalOperation,
 } from '../src/ingestion.ts';
 
 type Body = string;
@@ -453,7 +455,7 @@ describe('S1-02 shared sink ordering and capacity', () => {
 
     expect(acceptEvent(s, 'session', 'session:excess')).toEqual({ kind: 'refused', reason: 'overflow' });
     expect(s.run?.runId).toBe(two.runId);
-    expect(s.run?.fenced).toBe(true);
+    expect(runFenced(s)).toBe(true);
     const resolved = settleEffect(s, { ordinal: two.ordinal, outcome: { kind: 'applied', result: 'start-2' } });
     expect(resolved.next).toEqual({ kind: 'attempt', phase: 'interrupt' });
     expect(s.run?.interrupt).toBe('in-flight');
@@ -765,7 +767,7 @@ describe('S1-04 faults and reachable transitions', () => {
       case 'S':
         // Fence now; no handle exists, so the interrupt is deferred to start resolution.
         expect(refused).toEqual({ kind: 'refused', reason: 'overflow' });
-        expect(s.run?.fenced).toBe(true);
+        expect(runFenced(s)).toBe(true);
         expect(
           settleEffect(s, { ordinal: started!.ordinal, outcome: { kind: 'applied', result: 'start-1' } }).next,
         ).toEqual({ kind: 'attempt', phase: 'interrupt' });
@@ -1103,7 +1105,7 @@ describe('S1-05 cleanup', () => {
       runId: started.runId,
     });
     expect(s.close).toBeUndefined();
-    expect(s.run?.fenced).toBe(false);
+    expect(runFenced(s)).toBe(false);
     expect(acceptEvent(s, started.fence, 'run-1:still-live').kind).toBe('accepted');
   });
 });
@@ -1200,5 +1202,293 @@ describe('S1-06 retirement', () => {
     expect(s.state).toBe('discarded');
     expect(s.queue).toHaveLength(0);
     expect(retire(s)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repair round 1 (independent review of b0057cf)
+// ---------------------------------------------------------------------------
+
+describe('R1-1 completion recorded while the start is pending', () => {
+  it('places the terminal once the start resolves and commits it after the start', () => {
+    const s = opened();
+    const started = reserve(s, 1);
+    expect(chooseTerminal(s, { runId: started.runId, outcome: 'succeeded', cause: 'completion' })).toEqual({
+      kind: 'chosen',
+      placed: false,
+    });
+    settleEffect(s, { ordinal: started.ordinal, outcome: { kind: 'applied', result: 'start-1' } });
+    expect(drain(s)).toEqual(['start:applied:start-1', 'terminal:succeeded']);
+    expect(runPhase(s)).toBe('X');
+  });
+
+  it('with a close admitted during the pending start, history completes and the close bundle is queued', () => {
+    const s = opened();
+    const started = reserve(s, 1);
+    acceptEvent(s, started.fence, 'run-1:early');
+    chooseTerminal(s, { runId: started.runId, outcome: 'succeeded', cause: 'completion' });
+    expect(beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' })).toEqual({
+      kind: 'cleanup',
+      step: { kind: 'stopped', pending: 'start', failed: [] },
+    });
+    const resolved = settleEffect(s, { ordinal: started.ordinal, outcome: { kind: 'applied', result: 'start-1' } });
+    // The provider run already completed: no interrupt, straight to disposal.
+    expect(resolved.next).toEqual({ kind: 'attempt', phase: 'dispose' });
+    expect(completeCleanup(s, resolved.next!)).toEqual({ kind: 'complete', closed: 'queued' });
+    expect(drain(s)).toEqual(['start:applied:start-1', 'run-1:early', 'closing', 'terminal:succeeded', 'closed']);
+    expect(s.state).toBe('closed');
+  });
+
+  it('survives a failed start commit and an explicit retry', () => {
+    const s = opened();
+    const started = reserve(s, 1);
+    chooseTerminal(s, { runId: started.runId, outcome: 'succeeded', cause: 'completion' });
+    settleEffect(s, { ordinal: started.ordinal, outcome: { kind: 'applied', result: 'start-1' } });
+    const head = fail(s, 'absent');
+    expect(head).toMatchObject({ effect: 'start' });
+    expect(advanceHead(s, { kind: 'submit' })).toEqual({ kind: 'blocked', reason: 'faulted' });
+    expect(advanceHead(s, { kind: 'submit', retry: true })).toEqual({ kind: 'submit', op: head });
+    advanceHead(s, { kind: 'committed', ordinal: head.ordinal });
+    expect(drain(s)).toEqual(['terminal:succeeded']);
+    expect(ingestionFault(s)).toBeUndefined();
+  });
+});
+
+type Payload = { readonly text: string; readonly nested: { readonly values: number[] } };
+
+describe('R1-2 submitted bundles are deeply immutable', () => {
+  it('a submitted terminal intent and its captured detail cannot be mutated, and a retry resubmits the identical value', () => {
+    const s = createSessionIngestion<Payload>(SESSION, identity('open'));
+    settleEffect(s, { ordinal: 0, outcome: { kind: 'applied', result: { text: 'opened', nested: { values: [] } } } });
+    advanceHead(s, {
+      kind: 'committed',
+      ordinal: (advanceHead(s, { kind: 'submit' }) as { op: Operation<Payload> }).op.ordinal,
+    });
+    const ids = runIds(1);
+    const reserved = reserveStart(s, { ...ids, attempt: 1, identity: identity('submit-1') });
+    if (reserved.kind !== 'reserved') throw new Error('start refused');
+    settleEffect(s, {
+      ordinal: reserved.ordinal,
+      outcome: { kind: 'applied', result: { text: 'start', nested: { values: [1] } } },
+    });
+    advanceHead(s, {
+      kind: 'committed',
+      ordinal: (advanceHead(s, { kind: 'submit' }) as { op: Operation<Payload> }).op.ordinal,
+    });
+
+    const detail = { text: 'completion', nested: { values: [1, 2, 3] } };
+    chooseTerminal(s, { runId: ids.runId, outcome: 'succeeded', cause: 'completion', detail });
+    const submitted = advanceHead(s, { kind: 'submit' });
+    if (submitted.kind !== 'submit' || submitted.op.kind !== 'terminal') throw new Error('terminal not submitted');
+    // Bind the narrowed operation: property narrowing does not survive into the closures below.
+    const terminal: TerminalOperation<Payload> = submitted.op;
+    const captured: Payload | undefined = terminal.intent.detail;
+    if (captured === undefined) throw new Error('terminal detail not captured');
+    const snapshot = structuredClone(terminal);
+
+    expect(() => {
+      // Deliberately write through a mutable view: the runtime freeze, not the type, must stop it.
+      (terminal.intent as { outcome: TerminalOperation<Payload>['intent']['outcome'] }).outcome = 'failed';
+    }).toThrow(TypeError);
+    expect(() => {
+      captured.nested.values.push(4);
+    }).toThrow(TypeError);
+    // The caller's own reference cannot rewrite the captured detail either.
+    expect(() => {
+      detail.nested.values.push(4);
+    }).toThrow(TypeError);
+
+    advanceHead(s, { kind: 'rejected', ordinal: terminal.ordinal });
+    advanceHead(s, { kind: 'reconciled', ordinal: terminal.ordinal, verdict: 'absent' });
+    const retried = advanceHead(s, { kind: 'submit', retry: true });
+    expect(retried).toEqual({ kind: 'submit', op: terminal });
+    expect(retried.kind === 'submit' && retried.op).toBe(terminal);
+    expect(structuredClone(terminal)).toEqual(snapshot);
+  });
+
+  it('accepted bodies and filled reservation results are deeply immutable', () => {
+    const s = createSessionIngestion<Payload>(SESSION, identity('open'));
+    const body = { text: 'early', nested: { values: [1] } };
+    acceptEvent(s, 'session', body);
+    const result = { text: 'opened', nested: { values: [2] } };
+    settleEffect(s, { ordinal: 0, outcome: { kind: 'applied', result } });
+    expect(() => {
+      body.nested.values.push(9);
+    }).toThrow(TypeError);
+    expect(() => {
+      result.nested.values.push(9);
+    }).toThrow(TypeError);
+    expect(s.queue.map((op) => (op.kind === 'body' ? op.body : op.kind === 'effect' ? op.result : undefined))).toEqual([
+      { text: 'opened', nested: { values: [2] } },
+      { text: 'early', nested: { values: [1] } },
+    ]);
+  });
+});
+
+describe('R1-3 interrupt_run reservation installs the synchronous fence', () => {
+  function reserveInterrupt(s: Session, started: Started, n = 1): number {
+    const reserved = reserveEffect(s, {
+      effect: 'interrupt',
+      identity: identity(`interrupt-${String(n)}`),
+      runId: started.runId,
+    });
+    if (reserved.kind !== 'reserved') throw new Error(`interrupt refused: ${JSON.stringify(reserved)}`);
+    return reserved.ordinal;
+  }
+
+  it('demotes later interaction requests, refuses responses and keeps close from requesting a second interrupt', () => {
+    const s = opened();
+    const started = running(s, 1);
+    reserveInterrupt(s, started);
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-9' })).toMatchObject(
+      { kind: 'accepted', demoted: true },
+    );
+    expect(
+      reserveEffect(s, {
+        effect: 'response',
+        identity: identity('respond-1'),
+        runId: started.runId,
+        subject: 'interaction-1',
+      }),
+    ).toEqual({ kind: 'refused', reason: 'run-not-active' });
+    // The interrupt is already in flight: close goes on to disposal instead of interrupting again.
+    expect(beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' })).toEqual({
+      kind: 'cleanup',
+      step: { kind: 'attempt', phase: 'dispose' },
+    });
+  });
+
+  it('a cleanup report cannot settle an interrupt owned by the interrupt_run reservation', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const ordinal = reserveInterrupt(s, started);
+    beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' });
+    expect(settleEffect(s, { cleanup: 'interrupt', outcome: 'succeeded' })).toEqual({ kind: 'ignored' });
+    expect(s.queue.some((op) => op.kind === 'terminal')).toBe(false);
+    // Only the owning slot settles it, and its observed success supplies the close fallback.
+    settleEffect(s, { ordinal, outcome: { kind: 'applied', result: 'delivered' } });
+    expect(s.run?.interrupt).toBe('succeeded');
+    expect(s.queue.at(-1)).toMatchObject({ kind: 'terminal', intent: { outcome: 'interrupted', cause: 'close' } });
+  });
+
+  it('an overflow during the reserved interrupt does not request a second provider interrupt', () => {
+    const s = opened();
+    const started = running(s, 1);
+    reserveInterrupt(s, started);
+    fillToCap(s);
+    expect(acceptEvent(s, started.fence, 'run-1:excess')).toEqual({ kind: 'refused', reason: 'overflow' });
+  });
+
+  it('a delivered interrupt is observed once: a later interrupt_run does not redeliver it', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const first = reserveInterrupt(s, started, 1);
+    settleEffect(s, { ordinal: first, outcome: { kind: 'applied', result: 'delivered' } });
+    expect(
+      reserveEffect(s, { effect: 'interrupt', identity: identity('interrupt-2'), runId: started.runId }),
+    ).toMatchObject({ kind: 'reserved', deliver: false });
+  });
+
+  it('definite rejection rolls back only its own fence', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const ordinal = reserveInterrupt(s, started);
+    settleEffect(s, { ordinal, outcome: { kind: 'rejected', result: 'receipt:interrupt-rejected' } });
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-9' })).toMatchObject(
+      { kind: 'accepted', demoted: false },
+    );
+    expect(
+      reserveEffect(s, {
+        effect: 'response',
+        identity: identity('respond-1'),
+        runId: started.runId,
+        subject: 'interaction-9',
+      }).kind,
+    ).toBe('reserved');
+  });
+
+  it('definite rejection with a concurrent close keeps the close fence and hands the interrupt to close', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const ordinal = reserveInterrupt(s, started);
+    beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' });
+    const rejected = settleEffect(s, { ordinal, outcome: { kind: 'rejected', result: 'receipt:interrupt-rejected' } });
+    expect(rejected.next).toEqual({ kind: 'attempt', phase: 'interrupt' });
+    expect(runPhase(s)).toBe('E');
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-9' })).toMatchObject(
+      { kind: 'accepted', demoted: true },
+    );
+  });
+
+  it('definite rejection under an overflow fence keeps O and performs the overflow interrupt once', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const ordinal = reserveInterrupt(s, started);
+    fillToCap(s);
+    acceptEvent(s, 'session', 'excess');
+    const rejected = settleEffect(s, { ordinal, outcome: { kind: 'rejected', result: 'receipt:interrupt-rejected' } });
+    expect(rejected.next).toEqual({ kind: 'attempt', phase: 'interrupt' });
+    expect(ingestionFault(s)).toMatchObject({ kind: 'overflow', permanent: true });
+    settleEffect(s, { cleanup: 'interrupt', outcome: 'failed' });
+    expect(acceptEvent(s, 'session', 'again')).toEqual({ kind: 'refused', reason: 'overflowed' });
+  });
+});
+
+describe('R1-4 post-fence run ingress in E', () => {
+  it('after completion: fresh bodies are refused, new requests become diagnostics, earlier settlements proceed', () => {
+    const s = opened();
+    const started = running(s, 1);
+    const response = reserveEffect(s, {
+      effect: 'response',
+      identity: identity('respond-1'),
+      runId: started.runId,
+      subject: 'interaction-1',
+    });
+    if (response.kind !== 'reserved') throw new Error('response refused');
+    chooseTerminal(s, { runId: started.runId, outcome: 'succeeded', cause: 'completion' });
+    expect(runPhase(s)).toBe('E');
+    const counted = s.counted;
+    expect(acceptEvent(s, started.fence, 'run-1:fresh')).toEqual({ kind: 'discarded', reason: 'fenced' });
+    expect(s.counted).toBe(counted);
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-2' })).toMatchObject(
+      { kind: 'accepted', demoted: true },
+    );
+    expect(
+      acceptEvent(s, started.fence, 'run-1:withdrawn', { role: 'withdrawal', subject: 'interaction-3' }),
+    ).toMatchObject({ kind: 'accepted', demoted: false });
+    settleEffect(s, { ordinal: response.ordinal, outcome: { kind: 'applied', result: 'settled' } });
+    expect(drain(s)).toEqual([
+      'response:applied:settled',
+      'run-1:request(demoted)',
+      'run-1:withdrawn',
+      'terminal:succeeded',
+    ]);
+  });
+
+  it('after close: fresh bodies are refused and new requests become diagnostics', () => {
+    const s = opened();
+    const started = running(s, 1);
+    beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' });
+    expect(runPhase(s)).toBe('E');
+    expect(acceptEvent(s, started.fence, 'run-1:fresh')).toEqual({ kind: 'discarded', reason: 'fenced' });
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-2' })).toMatchObject(
+      { kind: 'accepted', demoted: true },
+    );
+    expect(queued(s)).toEqual(['closing', 'run-1:request(demoted)']);
+  });
+
+  it('a pending start under a close fence still stages its captured output (S, not E)', () => {
+    const s = opened();
+    const started = reserve(s, 1);
+    beginCleanup(s, { identity: identity('close-1'), ifRunActive: 'interrupt' });
+    expect(acceptEvent(s, started.fence, 'run-1:staged')).toMatchObject({ kind: 'accepted' });
+  });
+
+  it('an interrupt fence alone keeps the run R and still accepts ordinary output', () => {
+    const s = opened();
+    const started = running(s, 1);
+    reserveEffect(s, { effect: 'interrupt', identity: identity('interrupt-1'), runId: started.runId });
+    expect(runPhase(s)).toBe('R');
+    expect(acceptEvent(s, started.fence, 'run-1:partial')).toMatchObject({ kind: 'accepted', demoted: false });
   });
 });
