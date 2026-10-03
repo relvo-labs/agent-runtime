@@ -16,7 +16,7 @@ import {
   type Sequence,
 } from '@relvo-labs/agent-protocol';
 
-import { createInMemoryStore, type SessionRecord } from '../src/store.ts';
+import { createInMemoryStore, observeHistoryReadsForTesting, type SessionRecord } from '../src/store.ts';
 
 function attemptMutation(mutate: () => void): void {
   try {
@@ -52,6 +52,37 @@ function setup() {
 }
 
 describe('in-memory store mutation isolation', () => {
+  it('reads bounded pages without filtering a full event history', async () => {
+    const value = setup();
+    await value.store.commit((tx) => {
+      tx.createSession(value.session);
+      tx.emit({
+        sessionId: value.sessionId,
+        payload: {
+          type: 'session.opened',
+          providerId: 'scripted',
+          workspace: value.session.workspace,
+        },
+      });
+      for (let index = 0; index < 128; index += 1) {
+        tx.emit({ sessionId: value.sessionId, payload: { type: 'diagnostic', level: 'info', message: String(index) } });
+      }
+    });
+    let indexedReads = 0;
+    const stopObserving = observeHistoryReadsForTesting(value.store, () => {
+      indexedReads += 1;
+    });
+    let page: Awaited<ReturnType<typeof value.store.readEvents>>;
+    try {
+      page = await value.store.readEvents(value.sessionId, 100 as Sequence, 3);
+    } finally {
+      stopObserving();
+    }
+    expect(indexedReads).toBeLessThanOrEqual(16);
+    expect(page.events.map((entry) => entry.sequence)).toEqual([101, 102, 103]);
+    expect(page.hasMore).toBe(true);
+  });
+
   it('isolates ingress, transaction views, commit returns, snapshots, and event pages', async () => {
     const value = setup();
     const payload: EventPayload = {

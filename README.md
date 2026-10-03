@@ -14,6 +14,16 @@ Foundation v0.4 is an intentionally pre-1.0 base. It includes real protocol sche
 - Borrowed workspaces that are never destructively cleaned.
 - Generated JSON Schema derived from the authoritative Zod schemas.
 
+History reads compare the requested session's event sequence across at most three page
+reads. If that session keeps changing, `readEvents()` rejects with retryable
+`store_unavailable`; commits to other sessions do not force a reread. Failed provider
+ingestion leaves a queryable per-session fault. History reads and replaying subscriptions
+reject while that fault remains, including when it arises during a read. Close and
+shutdown still dispose the provider and release its workspace; a close receipt describes
+cleanup, not history completeness. A lost terminal event may leave a run non-terminal in
+the store until recovery is designed in issue #43. Borrowed `existing` workspaces remain
+untouched by release.
+
 ## Packages
 
 | Package                             | Responsibility                                                  |

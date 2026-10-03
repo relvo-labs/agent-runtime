@@ -145,7 +145,13 @@ describe('runtime lifecycle guards', () => {
       input: { parts: [{ type: 'text', text: 'ask' }] },
     });
     await value.controller.drain();
-    for (let pass = 0; pass < 8; pass += 1) await Promise.resolve();
+    const requested = value.runtime
+      .subscribe({ sessionId, fromSequence: 0, types: ['interaction.requested'] })
+      [Symbol.asyncIterator]();
+    await expect(requested.next()).resolves.toMatchObject({
+      value: { type: 'event', event: { payload: { type: 'interaction.requested' } } },
+    });
+    await requested.return?.();
     const snapshot = await value.runtime.getSession(sessionId);
     const interactionId = snapshot?.interactions[0]?.interactionId;
     expect(interactionId).toBeDefined();

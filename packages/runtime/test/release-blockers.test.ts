@@ -46,6 +46,7 @@ type ProviderControl = {
   readonly completion: Deferred<ProviderRunTermination>;
   readonly dispose: Deferred<undefined>;
   readonly start: Deferred<undefined>;
+  readonly startEntered: Deferred<undefined>;
   created: number;
   disposed: number;
   responses: number;
@@ -65,6 +66,7 @@ function controlledProvider(
     completion: deferred<ProviderRunTermination>(),
     dispose: deferred<undefined>(),
     start: deferred<undefined>(),
+    startEntered: deferred<undefined>(),
     created: 0,
     disposed: 0,
     responses: 0,
@@ -89,6 +91,7 @@ function controlledProvider(
       control.workspaces.push(init.workspace);
       return Promise.resolve({
         async startRun(request: ProviderRunRequest): Promise<ProviderRun> {
+          control.startEntered.resolve(undefined);
           if (options.emitInteraction) {
             request.sink.emit({
               payload: {
@@ -358,7 +361,7 @@ describe('shutdown boundary', () => {
       sessionId,
       input: { parts: [{ type: 'text', text: 'queued before shutdown' }] },
     });
-    for (let pass = 0; pass < 4; pass += 1) await Promise.resolve();
+    await control.startEntered.promise;
     const shuttingDown = value.runtime.shutdown();
     control.start.resolve(undefined);
     expect((await submitted).disposition).toBe('applied');
@@ -377,24 +380,10 @@ describe('shutdown boundary', () => {
       input: { parts: [{ type: 'text', text: 'never completes' }] },
     });
 
-    let settled = false;
-    const shuttingDown = value.runtime.shutdown().then(() => {
-      settled = true;
-    });
-    let state = (await value.runtime.getSession(sessionId))?.session.state;
-    for (let pass = 0; pass < 20 && state !== 'closed'; pass += 1) {
-      await Promise.resolve();
-      state = (await value.runtime.getSession(sessionId))?.session.state;
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const settledWithoutProviderCompletion = settled;
-
-    // Always release a pre-repair implementation so a failed assertion cannot
-    // strand the test hook on its intentionally unresolved provider promise.
+    await value.runtime.shutdown();
+    const state = (await value.runtime.getSession(sessionId))?.session.state;
     control.completion.resolve({ outcome: 'succeeded' });
-    await shuttingDown;
     expect(state).toBe('closed');
-    expect(settledWithoutProviderCompletion).toBe(true);
   });
 
   it('does not let a caller-owned command id suppress internal shutdown cleanup', async () => {

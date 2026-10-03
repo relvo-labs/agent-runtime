@@ -34,6 +34,19 @@ session and lease as rollback cleanup until both are released. Rollback failure 
 observably and stores no final receipt; an exact command retry or shutdown retries cleanup
 without acquiring another workspace or creating another provider session.
 
+The eventual close receipt describes the retained logical close operation, not only its
+last cleanup attempt. If an earlier attempt interrupted an active run before disposal or
+release failed, `interruptedActiveRun` remains true on the successful retry and on later
+receipt replay, even if a different close command completed cleanup in between. This
+follows the same command-ID reservation and first-acceptance rule.
+
+A provider ingestion commit failure records a queryable fault for that session. The
+fault prevents history reads, replaying subscriptions, and `quiesce()` from claiming
+complete history. Close still follows its normal interrupt, disposal, release, and
+receipt path. Its receipt reports cleanup, while the ingestion fault remains queryable
+and history reads continue to reject. If a terminal commit failed, the stored run can
+remain non-terminal; ingestion recovery is deferred to issue #43 with issue #6.
+
 Runtime shutdown is memoized. Its first call synchronously closes mutation admission,
 drains commands already admitted, closes every resulting live session, releases leases,
 and closes subscriptions. Concurrent callers receive the same cleanup promise; later
