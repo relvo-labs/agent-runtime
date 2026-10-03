@@ -75,7 +75,7 @@ continuation that interrupts and disposes once it arrives. Workspace release
 must wait for **confirmed successful provider disposal**; it must never race
 an unresolved start or disposal, because a provider may still use that lease.
 This is a narrow exception to the current attempt-all wording above: attempt
-every *safe independent* phase (e.g. disposal after a failed interrupt), retain
+every _safe independent_ phase (e.g. disposal after a failed interrupt), retain
 phase-tagged failures and retry only failures, but never release before disposal.
 Provider interrupt/dispose, followed by lease release on confirmed disposal, are
 **independent of FIFO persistence**: a permanently failing or ambiguous event/start commit

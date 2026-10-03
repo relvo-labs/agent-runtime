@@ -67,7 +67,7 @@ returns a truthful cleanup receipt. No claim is made about a byte/memory limit:
 one valid JSON body may be large. If session creation fails before an owner exists,
 discard its inactive sink without manufacturing a session fault. If a run start
 rejects after staging, discard only that run sink's provisional bodies and
-release their charged capacity; roll back O caused *solely* by that unowned
+release their charged capacity; roll back O caused _solely_ by that unowned
 staging, but keep an independent session-sink F/O. A late successful start
 must be committed before any of its retained run events, even if a close has
 already fenced admission. The provider handle may be disposed safely while
