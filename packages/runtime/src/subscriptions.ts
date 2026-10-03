@@ -92,8 +92,9 @@ const faultGuardInstallers = new WeakMap<
  *
  * Installs `guard` on a hub created by `createSubscriptionHub` and returns the
  * notifier that wakes that session's idle subscribers. The guard runs before
- * and after every replay page, before the live switch, before each buffered
- * live event, after every wake and before a `closed` marker. When it throws,
+ * and after every replay page, before and after every replay delivery, before
+ * the live switch, before each buffered live event, after every wake (also one
+ * that closed the subscriber) and before every `closed` marker. When it throws,
  * the subscriber's pending `next()` rejects with that error instead of hanging
  * or yielding a healthy-looking page or `closed` marker. A hub without an
  * installed guard behaves exactly as before.
@@ -223,12 +224,16 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
                 subscriber.terminal = event.payload.reason === 'failed' ? 'session_failed' : 'session_closed';
               }
               if (!matches(event)) continue;
+              // Before every replay delivery: a fault that arrived while this generator was
+              // suspended inside a page must not let the page's remaining events through.
+              checkFault();
               yield {
                 type: 'event',
                 event,
                 cursor: cursorFromSequence(event.sequence),
                 replay: true,
               };
+              checkFault();
               if (isClosed()) return;
             }
             if (page.hasMore) continue;
@@ -303,6 +308,7 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
 
             if (subscriber.terminal !== undefined) {
               const reason = subscriber.terminal;
+              checkFault();
               detach();
               yield {
                 type: 'closed',
@@ -315,8 +321,13 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             await new Promise<void>((resolve) => {
               subscriber.wake = resolve;
             });
+            // After every wake, even one that also closed the subscriber (a fault
+            // notification followed synchronously by `closeAll()`).
+            checkFault();
           }
 
+          // Never yield a healthy-looking `closed` marker while the session is faulted.
+          checkFault();
           yield {
             type: 'closed',
             cursor: cursorFromSequence(lastEmitted),

@@ -30,11 +30,13 @@ import {
   AgentRuntimeError,
   agentError,
   type AgentError,
+  type AgentSession,
   type EventEnvelope,
   type EventId,
   type RunId,
   type Sequence,
   type SessionId,
+  type SessionSnapshot,
   type TurnId,
 } from '@relvo-labs/agent-protocol';
 import type { ProviderEventSink } from '@relvo-labs/agent-provider';
@@ -59,8 +61,9 @@ import {
   type SessionIngestion,
   type TerminalOutcome,
 } from './ingestion.ts';
+import { applyEvent } from './projection.ts';
 import { captureProviderEvent, type CapturedProviderEvent } from './provider-capture.ts';
-import type { RuntimeStore, StoreTransaction } from './store.ts';
+import type { RuntimeStore, SessionRecord, StoreTransaction } from './store.ts';
 import { installIngestionFaultGuard, type SubscriptionHub } from './subscriptions.ts';
 
 // ---------------------------------------------------------------------------
@@ -236,6 +239,11 @@ type Entry = {
   notified: IngestionFaultView['kind'] | undefined;
   /** Last committed session sequence observed through this driver. */
   lastSequence: number;
+  /**
+   * The session record the open bundle created (constant size). Read-back folds the
+   * authoritative log from it to prove the snapshot projection is consistent.
+   */
+  initialSession: AgentSession | undefined;
 };
 
 type CapturedEnvelope = Readonly<{ eventId: EventId; sequence: Sequence; payload: string }>;
@@ -245,7 +253,36 @@ type Witness = {
   threw: boolean;
   readonly events: CapturedEnvelope[];
   receipt: Readonly<{ commandId: CommandIdentity['commandId']; fingerprint: string }> | undefined;
+  /** The session record this transaction created, if it is the open bundle. */
+  created: AgentSession | undefined;
 };
+
+/** JSON with object keys sorted, so equal projections compare equal across adapters. */
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)))
+      : item,
+  );
+}
+
+function recordProjection(record: SessionRecord): string {
+  return canonicalJson({
+    session: record.session,
+    turns: [...record.turns.values()],
+    runs: [...record.runs.values()],
+    interactions: [...record.interactions.values()],
+  });
+}
+
+function snapshotProjection(snapshot: SessionSnapshot): string {
+  return canonicalJson({
+    session: snapshot.session,
+    turns: snapshot.turns,
+    runs: snapshot.runs,
+    interactions: snapshot.interactions,
+  });
+}
 
 type Verdict = 'applied' | 'absent' | 'unknown';
 
@@ -264,8 +301,19 @@ function faultError(sessionId: SessionId, view: IngestionFaultView): AgentError 
       return {
         ...agentError(
           'store_unavailable',
-          `provider event history for session \`${sessionId}\` exceeded its ingestion capacity and is permanently incomplete`,
-          { details: { sessionId, fault: 'overflow', operationLimit: SESSION_OPERATION_LIMIT } },
+          view.permanent
+            ? `provider event history for session \`${sessionId}\` exceeded its ingestion capacity and is permanently incomplete`
+            : // Provisional: only an unresolved start's own staging overflowed. A rejected
+              // start withdraws it, so it must not be described as permanent.
+              `provider event history for session \`${sessionId}\` exceeded its ingestion capacity while a run start is unresolved; history cannot be certified unless that start is rejected`,
+          {
+            details: {
+              sessionId,
+              fault: 'overflow',
+              permanent: view.permanent,
+              operationLimit: SESSION_OPERATION_LIMIT,
+            },
+          },
         ),
         retryable: false,
       };
@@ -470,6 +518,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       hasSession: (sessionId) => tx.hasSession(sessionId),
       createSession: (session) => {
         tx.createSession(session);
+        witness.created = Object.freeze(structuredClone(session));
       },
       emit: (input) => {
         const envelope = tx.emit(input);
@@ -491,7 +540,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   /** Commit one head. Resolves `true` when the chain may continue; never rejects. */
   async function submit(entry: Entry, op: Operation<IngressPayload>): Promise<boolean> {
     const sessionId = entry.s.sessionId;
-    const witness: Witness = { ran: false, threw: false, events: [], receipt: undefined };
+    const witness: Witness = { ran: false, threw: false, events: [], receipt: undefined, created: undefined };
     let events: readonly EventEnvelope[];
     try {
       ({ events } = await store.commit((tx) => {
@@ -508,6 +557,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     }
     const advanced = advanceHead(entry.s, { kind: 'committed', ordinal: op.ordinal });
     if (advanced.kind !== 'advanced') return false;
+    if (witness.created !== undefined) entry.initialSession = witness.created;
     const last = events.at(-1);
     if (last !== undefined) entry.lastSequence = last.sequence;
     if (advanced.publish && events.length > 0) hub.publish(sessionId, events);
@@ -531,7 +581,8 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     if (!witness.ran || witness.threw) return reconciled(entry, op, 'absent', []);
 
     noteFault(entry);
-    const { verdict, envelopes } = await readBack(entry.s.sessionId, sequenceBefore, witness);
+    const { verdict, envelopes } = await readBack(entry, sequenceBefore, witness);
+    if (verdict === 'applied' && witness.created !== undefined) entry.initialSession = witness.created;
     return reconciled(entry, op, verdict, envelopes);
   }
 
@@ -554,12 +605,48 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return false;
   }
 
-  /** Read-after-failure at the captured position: full match, provable absence, or unknown. */
+  /**
+   * Replay the authoritative log through `through` onto the created session record,
+   * exactly as the store folds it (sequence stamped, then `applyEvent`). Returns the
+   * canonical projection digest, or `undefined` if the log is gapped, short or rejected
+   * by the fold. Only reached on the rare reconciliation path.
+   */
+  async function foldLog(sessionId: SessionId, initial: AgentSession, through: Sequence): Promise<string | undefined> {
+    const record: SessionRecord = {
+      session: structuredClone(initial),
+      turns: new Map(),
+      runs: new Map(),
+      interactions: new Map(),
+      events: [],
+    };
+    let cursor = 0;
+    while (cursor < through) {
+      const page = await store.readEvents(sessionId, cursor as Sequence, through - cursor);
+      if (page.events.length === 0) return undefined;
+      for (const event of page.events) {
+        if (event.sequence !== cursor + 1 || event.sequence > through) return undefined;
+        record.session = { ...record.session, sequence: event.sequence };
+        applyEvent(record, event);
+        cursor = event.sequence;
+      }
+    }
+    return recordProjection(record);
+  }
+
+  /**
+   * Read-after-failure at the captured position. Applied only when every witnessed
+   * envelope matches by id, sequence and payload AND the snapshot stands at exactly the
+   * last witnessed sequence AND its projection equals the fold of the authoritative log
+   * (from the session's created record) through that sequence (ADR-0004). Absent only
+   * when no envelope is present and the snapshot sequence is unchanged. Anything else,
+   * including any failed read, is unknown (permanent A).
+   */
   async function readBack(
-    sessionId: SessionId,
+    entry: Entry,
     sequenceBefore: Sequence,
     witness: Witness,
   ): Promise<{ verdict: Verdict; envelopes: readonly EventEnvelope[] }> {
+    const sessionId = entry.s.sessionId;
     const unknown = { verdict: 'unknown' as const, envelopes: [] };
     try {
       const verdicts: Verdict[] = [];
@@ -577,6 +664,17 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
             );
           });
         if (matches) {
+          // Matching envelopes alone do not certify application. The authoritative snapshot
+          // must stand at exactly the witnessed sequence (this session's head is blocked, so
+          // nothing else can have applied) and equal the projection its log folds to.
+          const last = witness.events.at(-1);
+          const initial = witness.created ?? entry.initialSession;
+          const snapshot = await store.read(sessionId);
+          if (last === undefined || initial === undefined || snapshot?.session.sequence !== last.sequence) {
+            return unknown;
+          }
+          const folded = await foldLog(sessionId, initial, last.sequence);
+          if (folded === undefined || folded !== snapshotProjection(snapshot)) return unknown;
           verdicts.push('applied');
           envelopes = page.events;
         } else if (page.events.length === 0) {
@@ -665,6 +763,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         retrying: undefined,
         notified: undefined,
         lastSequence: 0,
+        initialSession: undefined,
       };
       sessions.set(sessionId, entry);
       return sinkFor(entry, 'session');

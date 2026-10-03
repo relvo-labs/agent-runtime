@@ -34,6 +34,7 @@ import {
   type RunId,
   type Sequence,
   type SessionId,
+  type SessionSnapshot,
   type SubscriptionMessage,
   type TurnId,
 } from '@relvo-labs/agent-protocol';
@@ -80,6 +81,11 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
   let applyThenRejectNext = false;
   let gate: { entered: Deferred<undefined>; open: Deferred<undefined>; fail: boolean } | undefined;
   let commitCalls = 0;
+  /** Snapshot reads (`store.read`) observed; reconciliation must make at least one before certifying. */
+  let snapshotReads = 0;
+  /** Rewrites the next snapshot read, to simulate a store whose projection lags or disagrees with its log. */
+  let snapshotTransform: ((snapshot: SessionSnapshot) => SessionSnapshot) | undefined;
+  let failSnapshotReads = false;
 
   function guarded(tx: StoreTransaction): StoreTransaction {
     return {
@@ -135,7 +141,13 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
         for (const waiter of heldWaiters.splice(0)) waiter();
       });
     },
-    read: (sessionId) => gated(() => base.read(sessionId)),
+    read: (sessionId) =>
+      gated(async () => {
+        snapshotReads += 1;
+        if (failSnapshotReads) throw new Error('injected snapshot read failure');
+        const snapshot = await base.read(sessionId);
+        return snapshot === undefined || snapshotTransform === undefined ? snapshot : snapshotTransform(snapshot);
+      }),
     readEvents: (sessionId, from, limit) => gated(() => base.readEvents(sessionId, from, limit)),
     readInteraction: (sessionId, interactionId) => base.readInteraction(sessionId, interactionId),
     findReceipt: (commandId) => gated(() => base.findReceipt(commandId)),
@@ -143,6 +155,13 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
   };
 
   const hub = createSubscriptionHub({ store, clock });
+  /** Every envelope the hub was asked to publish, in call order: a duplicate publish is directly visible. */
+  const published: { sessionId: SessionId; eventId: string; sequence: number }[] = [];
+  const publish = hub.publish.bind(hub);
+  hub.publish = (sessionId, events) => {
+    for (const event of events) published.push({ sessionId, eventId: event.eventId, sequence: event.sequence });
+    publish(sessionId, events);
+  };
   const interrupts: { sessionId: SessionId; runId: RunId }[] = [];
   const driver = createIngressDriver({
     store,
@@ -341,6 +360,14 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
     history,
     liveSubscriber,
     commitCalls: () => commitCalls,
+    snapshotReads: () => snapshotReads,
+    published,
+    tamperSnapshots(transform: ((snapshot: SessionSnapshot) => SessionSnapshot) | undefined): void {
+      snapshotTransform = transform;
+    },
+    failSnapshotReads(fail: boolean): void {
+      failSnapshotReads = fail;
+    },
     hold(): void {
       holding = true;
     },
@@ -460,6 +487,10 @@ describe('S2-A2 shared session/run FIFO and capacity', () => {
       'run:live-2',
     ]);
     expect(events.map((event) => event.sequence)).toEqual(events.map((_, index) => index + 1));
+    // Every committed envelope was published exactly once, in commit order.
+    expect(value.published.filter((entry) => entry.sessionId === sessionId).map((entry) => entry.eventId)).toEqual(
+      events.map((event) => event.eventId),
+    );
     expect(value.driver.fault(sessionId)).toBeUndefined();
   });
 
@@ -613,12 +644,25 @@ describe('S2-A6 overflow target, retired sinks and activation', () => {
     const { sessionId } = await value.open();
     const run = value.reserveRun(sessionId);
     for (let index = 0; index <= PRE_ACTIVATION_LIMIT; index += 1) run.sink.emit(delta(`staged-${String(index)}`));
-    // Fail closed while the owner start is unresolved: replay cannot be certified either way.
-    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'overflow' });
+    // Fail closed while the owner start is unresolved, but do not call it permanent: a rejected
+    // start would roll this overflow back.
+    const provisional = value.driver.fault(sessionId);
+    expect(provisional).toMatchObject({
+      kind: 'overflow',
+      permanent: false,
+      error: { code: 'store_unavailable', retryable: false, details: { fault: 'overflow', permanent: false } },
+    });
+    expect(provisional?.error.message).not.toMatch(/permanent/iu);
 
     run.resolve();
     await value.driver.settled();
-    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'overflow', permanent: true });
+    const permanent = value.driver.fault(sessionId);
+    expect(permanent).toMatchObject({
+      kind: 'overflow',
+      permanent: true,
+      error: { retryable: false, details: { fault: 'overflow', permanent: true } },
+    });
+    expect(permanent?.error.message).toMatch(/permanently incomplete/u);
     const events = await value.history(sessionId);
     expect(texts(events)).toEqual(
       Array.from({ length: PRE_ACTIVATION_LIMIT }, (_, index) => `staged-${String(index)}`),
@@ -758,6 +802,7 @@ describe('S2-A7 fault wake and precedence', () => {
     const idle = subscriber.next();
 
     const reads = value.gateReads();
+    const snapshotReadsBefore = value.snapshotReads();
     value.applyThenRejectNext();
     sink.emit(note('applied then rejected'));
     await reads.entered;
@@ -770,7 +815,14 @@ describe('S2-A7 fault wake and precedence', () => {
     reads.release();
     await value.driver.settled();
     expect(value.driver.fault(sessionId)).toBeUndefined();
-    expect(messages(await value.history(sessionId))).toEqual(['applied then rejected']);
+    const events = await value.history(sessionId);
+    expect(messages(events)).toEqual(['applied then rejected']);
+    // The certifying proof read the projection snapshot, not only the log page.
+    expect(value.snapshotReads()).toBeGreaterThan(snapshotReadsBefore);
+    // Published exactly once, by the reconciliation, and the head advanced exactly once.
+    const applied = events.find((event) => event.payload.type === 'diagnostic');
+    expect(value.published.filter((entry) => entry.eventId === applied?.eventId)).toHaveLength(1);
+    expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
     const replay = await value.liveSubscriber(sessionId);
     await replay.return?.();
     expect(value.commitCalls()).toBe(2);
@@ -893,6 +945,133 @@ describe('S2-A7 fault wake and precedence', () => {
     expect(() => value.driver.ensureReplayReady(sessionId)).not.toThrow();
     await value.driver.quiesce();
     await expect(hubReplay(value, sessionId)).resolves.toBe('caught_up');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repair round 1: per-delivery replay guard, close race, projection-consistent proof
+// ---------------------------------------------------------------------------
+
+describe('S2R1 replay delivery and close race', () => {
+  it('a replay suspended inside one page rejects on its next pull once a fault arrives', async () => {
+    const value = fixture();
+    const { sessionId, sink } = await value.open();
+    sink.emit(note('first'));
+    sink.emit(note('second'));
+    await value.driver.settled();
+
+    const subscription = value.hub.subscribe(SubscriptionRequestSchema.parse({ sessionId }));
+    const iterator = subscription[Symbol.asyncIterator]();
+    const opened = await iterator.next();
+    expect(opened.value).toMatchObject({ type: 'event', replay: true, event: { payload: { type: 'session.opened' } } });
+
+    // Suspended after the first event of a page that already holds `first` and `second`.
+    value.failing.add(sessionId);
+    sink.emit(note('lost'));
+    await value.driver.settled();
+    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'failure' });
+    const next = await rejection(iterator.next());
+    expect(next.error).toMatchObject({ code: 'store_unavailable', retryable: true });
+    await subscription.close();
+  });
+
+  it('a fault notification followed synchronously by closeAll rejects instead of yielding closed', async () => {
+    const value = fixture();
+    const { sessionId, sink } = await value.open();
+    const subscriber = await value.liveSubscriber(sessionId);
+    const idle = subscriber.next();
+
+    value.hold();
+    sink.emit(note('head'));
+    await value.heldCount(1);
+    fillSessionBudget(value, sessionId, sink);
+    // The overflow wakes the idle subscriber synchronously; a shutdown-style closeAll follows in the same tick.
+    sink.emit(note('excess'));
+    value.hub.closeAll();
+    const woke = await rejection(idle);
+    expect(woke.error).toMatchObject({ code: 'store_unavailable', retryable: false });
+  });
+});
+
+describe('S2R1 reconciliation requires a projection-consistent proof', () => {
+  /** Apply a run delta whose commit promise then rejects; settle the reconciliation. */
+  async function appliedThenRejected(
+    value: Fixture,
+    tamper?: (snapshot: SessionSnapshot) => SessionSnapshot,
+    failSnapshot = false,
+  ) {
+    const { sessionId } = await value.open();
+    const run = await value.startRun(sessionId);
+    const publishedBefore = value.published.length;
+    const snapshotReadsBefore = value.snapshotReads();
+    value.tamperSnapshots(tamper);
+    value.failSnapshotReads(failSnapshot);
+    value.applyThenRejectNext();
+    run.sink.emit(delta('folded output'));
+    await value.driver.settled();
+    value.tamperSnapshots(undefined);
+    value.failSnapshotReads(false);
+    return {
+      sessionId,
+      published: value.published.slice(publishedBefore),
+      snapshotReads: value.snapshotReads() - snapshotReadsBefore,
+    };
+  }
+
+  async function expectRetainedPermanentA(value: Fixture, sessionId: SessionId, published: readonly unknown[]) {
+    expect(value.driver.fault(sessionId)).toMatchObject({
+      kind: 'ambiguous',
+      permanent: true,
+      error: { code: 'store_unavailable', retryable: false },
+    });
+    // Nothing published and the head was not removed: history is not certified.
+    expect(published).toEqual([]);
+    const state = value.driver.inspect(sessionId);
+    expect(state?.queue).toHaveLength(1);
+    expect(state?.queue[0]).toMatchObject({ kind: 'body' });
+    expect(state?.head).toMatchObject({ status: 'ambiguous' });
+    const calls = value.commitCalls();
+    expect((await rejection(value.driver.retry(sessionId))).error).toMatchObject({ retryable: false });
+    await value.driver.settled();
+    expect(value.commitCalls()).toBe(calls);
+  }
+
+  it('a consistent log and snapshot certify application: the head advances once and publishes once', async () => {
+    const value = fixture();
+    const { sessionId, published, snapshotReads } = await appliedThenRejected(value);
+    expect(snapshotReads).toBeGreaterThan(0);
+    expect(value.driver.fault(sessionId)).toBeUndefined();
+    const events = await value.history(sessionId);
+    expect(texts(events)).toEqual(['folded output']);
+    const applied = events.find((event) => event.payload.type === 'run.message_delta');
+    expect(published).toEqual([{ sessionId, eventId: applied?.eventId, sequence: applied?.sequence }]);
+    expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
+  });
+
+  it('a snapshot sequence behind the log keeps A permanent, publishes nothing and keeps the head', async () => {
+    const value = fixture();
+    const { sessionId, published, snapshotReads } = await appliedThenRejected(value, (snapshot) => ({
+      ...snapshot,
+      session: { ...snapshot.session, sequence: (snapshot.session.sequence - 1) as Sequence },
+    }));
+    expect(snapshotReads).toBeGreaterThan(0);
+    await expectRetainedPermanentA(value, sessionId, published);
+  });
+
+  it('a projection that disagrees with the log at the right sequence keeps A permanent', async () => {
+    const value = fixture();
+    const { sessionId, published, snapshotReads } = await appliedThenRejected(value, (snapshot) => ({
+      ...snapshot,
+      turns: snapshot.turns.map((turn) => ({ ...turn, output: 'not what the log folds to' })),
+    }));
+    expect(snapshotReads).toBeGreaterThan(0);
+    await expectRetainedPermanentA(value, sessionId, published);
+  });
+
+  it('an unavailable snapshot read keeps A permanent', async () => {
+    const value = fixture();
+    const { sessionId, published } = await appliedThenRejected(value, undefined, true);
+    await expectRetainedPermanentA(value, sessionId, published);
   });
 });
 
