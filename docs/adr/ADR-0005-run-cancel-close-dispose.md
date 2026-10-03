@@ -78,7 +78,7 @@ This is a narrow exception to the current attempt-all wording above: attempt
 every *safe independent* phase (e.g. disposal after a failed interrupt), retain
 phase-tagged failures and retry only failures, but never release before disposal.
 Provider interrupt/dispose, followed by lease release on confirmed disposal, are
-**independent of FIFO persistence**: a permanently failing event/start commit
+**independent of FIFO persistence**: a permanently failing or ambiguous event/start commit
 must not starve safe cleanup. The accepted prefix, run terminal, `session.closed`
 and successful close receipt remain blocked in their original log order until
 persistence is reconciled; cleanup effects alone never certify close success.
