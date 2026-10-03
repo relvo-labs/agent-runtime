@@ -3,11 +3,12 @@
  * through the private ingress seam (`src/ingress.ts`), driven against the real
  * in-memory store, the real subscription hub and captured provider sinks.
  *
- * `createAgentRuntime` does not route through this seam yet: terminal
- * submission (surface 3) and cleanup (surface 4) still commit directly, so a
- * partial cutover would leave an observable FIFO bypass. These tests therefore
- * prove the seam that the atomic cutover will install, not live runtime
- * behavior.
+ * `createAgentRuntime` does not route through this seam yet: cleanup
+ * (surface 4) still commits directly, so a partial cutover would leave an
+ * observable FIFO bypass. These tests therefore prove the seam that the atomic
+ * cutover will install, not live runtime behavior. Starts and terminals here
+ * use the surface 3 materialization (`settleStart`, `completeRun`); surface 3's
+ * own proofs are in `ingestion-commands.test.ts`.
  *
  * Scheduling is controlled with deferred store commits and reads. No test
  * sleeps or asserts elapsed time; "promptly" means a promise settles while
@@ -35,19 +36,14 @@ import {
   type Sequence,
   type SessionId,
   type SessionSnapshot,
+  type SubmitTurnCommand,
   type SubscriptionMessage,
   type TurnId,
 } from '@relvo-labs/agent-protocol';
-import type { ProviderEventSink } from '@relvo-labs/agent-provider';
+import { ProviderRejection, type ProviderEventSink, type ProviderRun } from '@relvo-labs/agent-provider';
 
 import { PRE_ACTIVATION_LIMIT, SESSION_OPERATION_LIMIT, type CommandIdentity } from '../src/ingestion.ts';
-import {
-  createIngressDriver,
-  ingressPlan,
-  materializePlainProviderEvent,
-  type IngressPlan,
-  type IngressStoreContract,
-} from '../src/ingress.ts';
+import { createIngressDriver, ingressPlan, type IngressPlan, type IngressStoreContract } from '../src/ingress.ts';
 import { createInMemoryStore, type CommitResult, type RuntimeStore, type StoreTransaction } from '../src/store.ts';
 import { createSubscriptionHub } from '../src/subscriptions.ts';
 
@@ -163,20 +159,18 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
     publish(sessionId, events);
   };
   const interrupts: { sessionId: SessionId; runId: RunId }[] = [];
-  const driver = createIngressDriver({
-    store,
-    hub,
-    storeContract: contract,
-    materializeEvent: (tx, input) => {
-      if (!materializePlainProviderEvent(tx, input)) {
-        throw new Error('interaction materialization belongs to surface 3');
-      }
-    },
-    interruptRun: (sessionId, runId) => {
-      interrupts.push({ sessionId, runId });
-      return Promise.resolve();
-    },
-  });
+  const driver = createIngressDriver({ store, hub, storeContract: contract, clock, idFactory });
+
+  /** A provider run handle that records interrupts and never completes on its own. */
+  function providerRun(sessionId: SessionId, runId: RunId): ProviderRun {
+    return {
+      completion: new Promise<never>(() => undefined),
+      interrupt: () => {
+        interrupts.push({ sessionId, runId });
+        return Promise.resolve();
+      },
+    };
+  }
 
   // ---- session and run helpers -----------------------------------------------------
   let commands = 0;
@@ -248,11 +242,17 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
     reject(): void;
   };
 
+  /** Reserve a start (surface 3 materializes the start bundle and receipt); the caller settles the provider. */
   function reserveRun(sessionId: SessionId): Run {
     const runId = RunIdSchema.parse(idFactory.next('run'));
     const turnId = TurnIdSchema.parse(idFactory.next('turn'));
-    const submit = identity('submit');
-    const reserved = driver.reserveRun(sessionId, { runId, turnId, attempt: 1, identity: submit });
+    const command: SubmitTurnCommand = {
+      commandId: CommandIdSchema.parse(`ingress-${String(++commands).padStart(6, '0')}-submit`),
+      type: 'submit_turn',
+      sessionId,
+      input: { parts: [{ type: 'text', text: 'go' }] },
+    };
+    const reserved = driver.reserveRun(sessionId, { command, acceptedAt: clock.now(), turnId, runId, attempt: 1 });
     if (reserved.kind !== 'reserved') throw new Error(`start refused: ${JSON.stringify(reserved)}`);
     return {
       runId,
@@ -260,32 +260,12 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
       ordinal: reserved.ordinal,
       sink: reserved.sink,
       resolve: () => {
-        driver.settleStart(sessionId, reserved.ordinal, {
-          kind: 'applied',
-          plan: ingressPlan((tx) => {
-            tx.emit({
-              sessionId,
-              payload: { type: 'turn.started', turnId, input: { parts: [{ type: 'text', text: 'go' }] } },
-            });
-            tx.emit({ sessionId, runId, payload: { type: 'run.started', turnId, attempt: 1 } });
-          }),
-        });
+        driver.settleStart(sessionId, reserved.ordinal, { kind: 'applied', run: providerRun(sessionId, runId) });
       },
       reject: () => {
         driver.settleStart(sessionId, reserved.ordinal, {
           kind: 'rejected',
-          plan: ingressPlan((tx) => {
-            tx.recordReceipt(submit.commandId, {
-              fingerprint: submit.fingerprint,
-              receipt: {
-                commandId: submit.commandId,
-                commandType: 'submit_turn',
-                disposition: 'rejected',
-                error: agentError('provider_rejected', 'start rejected'),
-                acceptedAt: submit.acceptedAt,
-              },
-            });
-          }),
+          error: new ProviderRejection(agentError('provider_rejected', 'start rejected')),
         });
       },
     };
@@ -298,36 +278,9 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
     return run;
   }
 
-  function terminalPlan(sessionId: SessionId, run: Run): IngressPlan {
-    return ingressPlan((tx, op) => {
-      if (op.kind !== 'terminal') throw new Error('terminal plan applied to a non-terminal operation');
-      const outcome = op.intent.outcome;
-      const error =
-        outcome === 'failed'
-          ? agentError(
-              'provider_contract_violation',
-              op.intent.overflowed ? 'provider event history overflowed' : 'failed',
-            )
-          : undefined;
-      tx.emit({
-        sessionId,
-        runId: run.runId,
-        payload: {
-          type: 'run.finished',
-          turnId: run.turnId,
-          termination: { outcome, at: clock.now(), ...(error === undefined ? {} : { error }) },
-        },
-      });
-      tx.emit({
-        sessionId,
-        payload: {
-          type: 'turn.settled',
-          turnId: run.turnId,
-          state: outcome === 'succeeded' ? 'completed' : outcome === 'interrupted' ? 'cancelled' : 'failed',
-          ...(error === undefined ? {} : { error }),
-        },
-      });
-    });
+  /** The provider's completion, through the surface 3 supervision entry and terminal materialization. */
+  function complete(sessionId: SessionId, run: Run): void {
+    driver.completeRun(sessionId, run.runId, { kind: 'resolved', value: { outcome: 'succeeded' } });
   }
 
   async function history(sessionId: SessionId): Promise<readonly EventEnvelope[]> {
@@ -356,7 +309,7 @@ function fixture(contract: IngressStoreContract = 'linearizable') {
     open,
     reserveRun,
     startRun,
-    terminalPlan,
+    complete,
     history,
     liveSubscriber,
     commitCalls: () => commitCalls,
@@ -561,7 +514,7 @@ describe('S2-A2 shared session/run FIFO and capacity', () => {
     });
 
     // The terminal slot is reserved outside the nonterminal budget; overflow fails a success intent.
-    value.driver.chooseTerminal(sessionId, run.runId, 'succeeded', value.terminalPlan(sessionId, run));
+    value.complete(sessionId, run);
     expect(state?.queue).toHaveLength(SESSION_OPERATION_LIMIT + 1);
     expect(state?.counted).toBe(SESSION_OPERATION_LIMIT);
     expect(state?.queue.at(-1)).toMatchObject({ kind: 'terminal', intent: { outcome: 'failed', overflowed: true } });
@@ -613,7 +566,7 @@ describe('S2-A6 overflow target, retired sinks and activation', () => {
     const value = fixture();
     const { sessionId, sink } = await value.open();
     const first = await value.startRun(sessionId);
-    value.driver.chooseTerminal(sessionId, first.runId, 'succeeded', value.terminalPlan(sessionId, first));
+    value.complete(sessionId, first);
     await value.driver.settled();
     expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
 
@@ -709,7 +662,7 @@ describe('S2-A6 overflow target, retired sinks and activation', () => {
     const { sessionId } = await value.open();
     const run = value.reserveRun(sessionId);
     run.sink.emit(delta('before completion'));
-    value.driver.chooseTerminal(sessionId, run.runId, 'succeeded', value.terminalPlan(sessionId, run));
+    value.complete(sessionId, run);
     run.sink.emit({
       payload: {
         type: 'interaction.requested',
