@@ -57,6 +57,7 @@ import {
 import { SESSION_OPERATION_LIMIT, runFenced, runPhase, type Operation } from '../src/ingestion.ts';
 import {
   createIngressDriver,
+  defaultStoreContract,
   ingressPlan,
   type IngressCommandOutcome,
   type IngressPayload,
@@ -137,7 +138,7 @@ const withdrawn = (providerRef: string): ProviderEventInput => ({
 });
 const yes: InteractionResponse = { kind: 'question', answer: 'yes' };
 /** Upstream prose a bare provider `Error` may carry: a credential and a native identifier. */
-const UPSTREAM_SECRET = 'api_key=sk-live-7f3a9c2e0b1d native_thread=thr_0123456789';
+const UPSTREAM_PROSE = 'api_key=sk-live-7f3a9c2e0b1d native_thread=thr_0123456789';
 const UNKNOWN_OUTCOME = 'the provider outcome of this command is unknown; retry the same command to deliver it again';
 
 // ---------------------------------------------------------------------------
@@ -183,7 +184,7 @@ function fakeRun(): FakeRun {
           case 'unknown':
             return Promise.reject(new Error('interrupt transport reset'));
           case 'secret':
-            return Promise.reject(new Error(`interrupt failed: ${UPSTREAM_SECRET}`));
+            return Promise.reject(new Error(`interrupt failed: ${UPSTREAM_PROSE}`));
         }
       },
     },
@@ -212,14 +213,30 @@ function fakeRun(): FakeRun {
 type FixtureOptions = {
   /** `default`: pass no store contract, so the driver chooses one for the adapter. */
   readonly contract?: IngressStoreContract | 'default';
-  /** Hand the driver the built-in in-memory store itself, its `commit` replaced in place by the controllable one. */
+  /**
+   * Hand the driver the built-in in-memory store itself, unmodified. `replaceBuiltInCommit()`
+   * later replaces its `commit` in place with the controllable one.
+   */
   readonly builtInStore?: boolean;
 };
 
 function fixture(options: FixtureOptions = {}) {
   const clock = createFixedClock();
   const idFactory = createCounterIdFactory();
-  const base = createInMemoryStore({ clock, idFactory });
+  /** The built-in store's own event id allocation throws once: a pre-apply failure inside its transaction. */
+  let failNextStoreEventId = false;
+  const base = createInMemoryStore({
+    clock,
+    idFactory: {
+      next: (kind) => {
+        if (kind === 'event' && failNextStoreEventId) {
+          failNextStoreEventId = false;
+          throw new Error('injected id allocation failure inside the built-in transaction');
+        }
+        return idFactory.next(kind);
+      },
+    },
+  });
   const baseCommit = base.commit.bind(base);
 
   /** Sessions whose emits throw inside the transaction: a definite pre-apply rejection. */
@@ -340,7 +357,6 @@ function fixture(options: FixtureOptions = {}) {
     publish(sessionId, events);
   };
 
-  if (options.builtInStore === true) base.commit = (mutate) => store.commit(mutate);
   const contract = options.contract ?? 'linearizable';
   const driver = createIngressDriver({
     store: options.builtInStore === true ? base : store,
@@ -585,6 +601,13 @@ function fixture(options: FixtureOptions = {}) {
     applyThenRejectNext(): void {
       applyThenRejectNext = true;
     },
+    /** Replace the built-in store's `commit` in place with the controllable one (same object, new function). */
+    replaceBuiltInCommit(): void {
+      base.commit = (mutate) => store.commit(mutate);
+    },
+    failNextStoreEventId(): void {
+      failNextStoreEventId = true;
+    },
     delayWriteNext(): void {
       delayWriteNext = true;
     },
@@ -642,6 +665,32 @@ async function rejection(promise: Promise<unknown>): Promise<AgentRuntimeError> 
     throw error;
   }
   throw new Error('expected an AgentRuntimeError rejection');
+}
+
+type Observed = { readonly state: () => 'pending' | 'fulfilled' | 'rejected' };
+
+/** Record how a promise settles without awaiting it, so a test can assert it is no longer pending. */
+function observe(promise: Promise<unknown>): Observed {
+  let state: 'pending' | 'fulfilled' | 'rejected' = 'pending';
+  promise.then(
+    () => {
+      state = 'fulfilled';
+    },
+    () => {
+      state = 'rejected';
+    },
+  );
+  return { state: () => state };
+}
+
+/**
+ * Yield microtasks (never timers) a bounded number of times until `observed` settles.
+ * A promise that stays pending afterwards is stranded: the test fails at once instead of
+ * timing out.
+ */
+async function settledWithin(observed: Observed): Promise<'fulfilled' | 'rejected' | 'pending'> {
+  for (let turn = 0; turn < 100 && observed.state() === 'pending'; turn += 1) await Promise.resolve();
+  return observed.state();
 }
 
 /** The queued slot of a command, if it is still in the FIFO. */
@@ -1256,17 +1305,17 @@ describe('S3-A3 response reservation and settlement', () => {
     const failures: readonly (readonly [string, () => Promise<undefined>])[] = [
       [
         'AgentRuntimeError',
-        () => Promise.reject(new AgentRuntimeError(agentError('provider_unavailable', UPSTREAM_SECRET))),
+        () => Promise.reject(new AgentRuntimeError(agentError('provider_unavailable', UPSTREAM_PROSE))),
       ],
       // Deliberately not `Error` instances: untyped provider failures of any shape.
       // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
-      ['AgentError-shaped object', () => Promise.reject(agentError('provider_rejected', UPSTREAM_SECRET))],
+      ['AgentError-shaped object', () => Promise.reject(agentError('provider_rejected', UPSTREAM_PROSE))],
       // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
-      ['string', () => Promise.reject(UPSTREAM_SECRET)],
+      ['string', () => Promise.reject(UPSTREAM_PROSE)],
       [
         'synchronous throw',
         () => {
-          throw new Error(UPSTREAM_SECRET);
+          throw new Error(UPSTREAM_PROSE);
         },
       ],
     ];
@@ -1717,10 +1766,10 @@ describe('S3R1 same-id admission', () => {
     // Any lookup issued before that commit now answers with what it read then (nothing).
     value.releaseLookups();
     const second = await outcomeOrCall(retried, turn.provider.entered(2));
-    expect(second).toEqual({
-      kind: 'outcome',
-      outcome: { kind: 'receipt', receipt: { ...receipt, disposition: 'duplicate' } },
-    });
+    // Round 3: the retry waited on the claim only until the reservation was bound, then shared
+    // that slot, so it receives the slot's own receipt, as any exact retry sharing a queued
+    // reservation does. A store `duplicate` answers only retries admitted after the commit.
+    expect(second).toEqual({ kind: 'outcome', outcome: { kind: 'receipt', receipt } });
     expect(turn.provider.calls).toHaveLength(1);
     await value.driver.settled();
     const events = await value.history(sessionId);
@@ -1905,7 +1954,7 @@ describe('S3R1 untyped provider failures', () => {
     const unknownStart = value.submit(startSession.sessionId);
     commandIds.push(unknownStart.command.commandId);
     await unknownStart.provider.entered();
-    await unknownStart.provider.reject(0, new Error(`startRun failed: ${UPSTREAM_SECRET}`));
+    await unknownStart.provider.reject(0, new Error(`startRun failed: ${UPSTREAM_PROSE}`));
     errors.push(await rejection(unknownStart.outcome));
 
     const responseSession = await value.open();
@@ -1917,7 +1966,7 @@ describe('S3R1 untyped provider failures', () => {
     );
     commandIds.push(reply.command.commandId);
     await reply.provider.entered();
-    await reply.provider.reject(0, new Error(UPSTREAM_SECRET));
+    await reply.provider.reject(0, new Error(UPSTREAM_PROSE));
     errors.push(await rejection(reply.outcome));
 
     const interruptSession = await value.open();
@@ -1965,7 +2014,7 @@ describe('S3R2 unknown provider start', () => {
     turn.sink().emit(delta('first attempt'));
     sessionSink.emit(note('session output'));
 
-    await turn.provider.reject(0, new Error(`spawn failed: ${UPSTREAM_SECRET}`));
+    await turn.provider.reject(0, new Error(`spawn failed: ${UPSTREAM_PROSE}`));
     const unknown = await rejection(turn.outcome);
     expect(unknown.error).toMatchObject({ code: 'provider_unavailable', retryable: true, message: UNKNOWN_OUTCOME });
     await value.driver.settled();
@@ -2158,8 +2207,16 @@ describe('S3R2 unknown interrupt and the shared interrupt outcome', () => {
     await turn.run.interruptEntered();
     const againCommand = value.interruptCommand(sessionId, turn.runId, 'again');
     const follower = value.interrupt(sessionId, againCommand);
+    // The waiting command has reserved its slot (as a follower) before the owner's call fails.
+    expect(await reservedSlot(value, sessionId, againCommand.commandId)).toMatchObject({ state: 'pending' });
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ invocations: 2 });
+    const following = observe(follower);
 
     turn.run.heldInterrupts[0]?.reject(new Error('interrupt transport reset'));
+    await rejection(owner);
+    await value.driver.settled();
+    // The reserved follower observes the unknown outcome; it is not stranded behind the settled owner call.
+    expect(await settledWithin(following)).toBe('rejected');
     for (const outcome of [owner, follower]) {
       expect((await rejection(outcome)).error).toMatchObject({
         code: 'provider_unavailable',
@@ -2219,15 +2276,270 @@ describe('S3R2 store contract default', () => {
     expect(value.published.filter((entry) => entry.type === 'diagnostic')).toHaveLength(0);
   });
 
-  it('the built-in in-memory store defaults to the strong contract: an apply-then-reject is reconciled as applied', async () => {
+  // Round 3: the round-2 version of this test replaced the built-in store's `commit` to inject an
+  // apply-then-reject, which is exactly the modification that must now forfeit automatic trust.
+  // An unmodified built-in store cannot apply then reject, so the strong contract is shown on the
+  // rejection it can produce: a pre-apply failure inside its own transaction is provably absent
+  // (retryable F) and its retry commits the head exactly once. Unverified, it would be permanent A.
+  it('the built-in in-memory store defaults to the strong contract while unmodified: a pre-apply rejection is retryable and commits once', async () => {
     const value = fixture({ contract: 'default', builtInStore: true });
     const { sessionId, sink } = await value.open();
-    value.applyThenRejectNext();
-    sink.emit(note('applied, then rejected'));
+    value.failNextStoreEventId();
+    sink.emit(note('committed once'));
+    await value.driver.settled();
+    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'failure', permanent: false });
+    await value.driver.retry(sessionId);
     await value.driver.settled();
     expect(value.driver.fault(sessionId)).toBeUndefined();
+    expect(messages(await value.history(sessionId)).filter((message) => message === 'committed once')).toHaveLength(1);
     expect(value.published.filter((entry) => entry.type === 'diagnostic')).toHaveLength(1);
     expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repair round 3
+// ---------------------------------------------------------------------------
+
+describe('S3R3 admission waits only until the reservation is bound', () => {
+  it('an exact retry admitted during the first receipt lookup shares the reservation and observes its unknown outcome', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    value.holdLookups(true);
+    const turn = value.submit(sessionId);
+    // Arrives while the first invocation's lookup is in flight: it waits on the claim, it does not look up.
+    const early = turn.retry();
+    value.holdLookups(false);
+    expect(value.heldLookupCount()).toBe(1);
+    const waiting = observe(early);
+
+    value.releaseLookup(0);
+    await turn.provider.entered();
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ claims: 1, invocations: 1 });
+    await turn.provider.reject(0, new Error('transport reset'));
+    expect((await rejection(turn.outcome)).error).toMatchObject({
+      code: 'provider_unavailable',
+      message: UNKNOWN_OUTCOME,
+    });
+    await value.driver.settled();
+
+    // The waiting retry shared the reserved invocation and observed its outcome; it is not stranded until a commit.
+    expect(await settledWithin(waiting)).toBe('rejected');
+    expect((await rejection(early)).error).toMatchObject({
+      code: 'provider_unavailable',
+      retryable: true,
+      message: UNKNOWN_OUTCOME,
+    });
+    expect(turn.provider.calls).toHaveLength(1);
+    // The claim is still held by the unresolved slot.
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ claims: 1, invocations: 0 });
+
+    // A later exact retry delivers the same start again into the same slot; the claim is released at commit.
+    const later = turn.retry();
+    await turn.provider.entered(2);
+    await turn.provider.resolve(1, fakeRun().handle);
+    expect(receiptOf(await later)).toMatchObject({ disposition: 'applied', sequence: 3 });
+    await value.driver.settled();
+    expect(turn.provider.calls).toHaveLength(2);
+    expect(types(await value.history(sessionId))).toEqual(['session.opened', 'turn.started', 'run.started']);
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ claims: 0, waiters: 0, invocations: 0 });
+  });
+
+  it('an exact retry admitted during the first receipt lookup shares the delivered outcome without a second provider call', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
+    value.holdLookups(true);
+    const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    const early = reply.retry();
+    value.holdLookups(false);
+    const waiting = observe(early);
+
+    value.releaseLookup(0);
+    await reply.provider.entered();
+    await reply.provider.resolve(0, undefined);
+    const receipt = receiptOf(await reply.outcome);
+    expect(receipt.disposition).toBe('applied');
+    expect(await settledWithin(waiting)).toBe('fulfilled');
+    expect(receiptOf(await early)).toEqual(receipt);
+    expect(reply.provider.calls).toHaveLength(1);
+    await value.driver.settled();
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ claims: 0, waiters: 0, invocations: 0 });
+  });
+});
+
+describe('S3R3 synchronous provider throws are never inspected or coerced', () => {
+  /** Thrown values whose inspection or coercion itself throws. */
+  const hostileThrows: readonly (readonly [string, () => unknown])[] = [
+    [
+      'an object whose toString and message getter throw',
+      () => ({
+        toString(): string {
+          throw new Error(`toString: ${UPSTREAM_PROSE}`);
+        },
+        get message(): string {
+          throw new Error(`message: ${UPSTREAM_PROSE}`);
+        },
+      }),
+    ],
+    [
+      'a revoked Proxy',
+      () => {
+        const { proxy, revoke } = Proxy.revocable({}, {});
+        revoke();
+        return proxy;
+      },
+    ],
+  ];
+
+  function expectUnknown(error: AgentRuntimeError, label: string): void {
+    expect(error.error, label).toMatchObject({
+      code: 'provider_unavailable',
+      retryable: true,
+      message: UNKNOWN_OUTCOME,
+    });
+    expect(JSON.stringify(error.error), label).not.toContain('sk-live');
+    expect(JSON.stringify(error.error), label).not.toContain('thr_0123456789');
+  }
+
+  for (const [label, hostile] of hostileThrows) {
+    describe(label, () => {
+      it('response delivery: the slot stays unknown and an exact retry delivers again', async () => {
+        const value = fixture();
+        const { sessionId } = await value.open();
+        const turn = await value.started(sessionId);
+        const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
+        const command = value.respondCommand(sessionId, interactionId);
+        let calls = 0;
+        const deliver = (): Promise<void> => {
+          calls += 1;
+          // A provider throwing a non-Error value synchronously.
+          if (calls === 1) throw hostile();
+          return Promise.resolve();
+        };
+        const call = () =>
+          value.driver.respondToInteraction(sessionId, { command, acceptedAt: value.clock.now(), deliver });
+        expectUnknown(await rejection(call()), label);
+        expect(slotOf(value, sessionId, command.commandId)).toMatchObject({ effect: 'response', state: 'unknown' });
+        expect(await value.base.findReceipt(command.commandId)).toBeUndefined();
+
+        expect(receiptOf(await call())).toMatchObject({ disposition: 'applied' });
+        expect(calls).toBe(2);
+        expect(JSON.stringify(value.published)).not.toContain('sk-live');
+      });
+
+      it('startRun: the start slot stays unknown and an exact retry starts again', async () => {
+        const value = fixture();
+        const { sessionId } = await value.open();
+        const command: SubmitTurnCommand = {
+          commandId: CommandIdSchema.parse('s3r3-hostile-start'),
+          type: 'submit_turn',
+          sessionId,
+          input: { parts: [{ type: 'text', text: 'go' }] },
+        };
+        let calls = 0;
+        const startRun = (): Promise<ProviderRun> => {
+          calls += 1;
+          if (calls === 1) throw hostile();
+          return Promise.resolve(fakeRun().handle);
+        };
+        const turnId = TurnIdSchema.parse(value.idFactory.next('turn'));
+        const runId = RunIdSchema.parse(value.idFactory.next('run'));
+        const call = () =>
+          value.driver.submitTurn(sessionId, {
+            command,
+            acceptedAt: value.clock.now(),
+            turnId,
+            runId,
+            attempt: 1,
+            startRun,
+          });
+        expectUnknown(await rejection(call()), label);
+        expect(slotOf(value, sessionId, command.commandId)).toMatchObject({ effect: 'start', state: 'unknown' });
+
+        expect(receiptOf(await call())).toMatchObject({ disposition: 'applied' });
+        expect(calls).toBe(2);
+      });
+
+      it('interrupt(): the interrupt slot stays unknown and its exact retry interrupts again', async () => {
+        const value = fixture();
+        const { sessionId } = await value.open();
+        const turn = value.submit(sessionId);
+        await turn.provider.entered();
+        let calls = 0;
+        const handle: ProviderRun = {
+          completion: new Promise<ProviderRunTermination>(() => undefined),
+          interrupt: (): Promise<void> => {
+            calls += 1;
+            if (calls === 1) throw hostile();
+            return Promise.resolve();
+          },
+        };
+        await turn.provider.resolve(0, handle);
+        expect(receiptOf(await turn.outcome).disposition).toBe('applied');
+        const command = value.interruptCommand(sessionId, turn.runId);
+        expectUnknown(await rejection(value.interrupt(sessionId, command)), label);
+        expect(slotOf(value, sessionId, command.commandId)).toMatchObject({ effect: 'interrupt', state: 'unknown' });
+
+        expect(receiptOf(await value.interrupt(sessionId, command))).toMatchObject({
+          disposition: 'applied',
+          result: { delivered: true },
+        });
+        expect(calls).toBe(2);
+      });
+    });
+  }
+});
+
+describe('S3R3 automatic store trust is checked at each use', () => {
+  it('a built-in store whose commit is replaced after the driver was created is unverified: a reject-before-delayed-write persists once and is never resubmitted', async () => {
+    const value = fixture({ contract: 'default', builtInStore: true });
+    const { sessionId, sink } = await value.open();
+    // The reviewer's counterexample: after the driver exists, `commit` becomes a wrapper whose
+    // promise rejects before its delayed write applies.
+    value.replaceBuiltInCommit();
+    value.delayWriteNext();
+    sink.emit(note('one operation'));
+    await value.driver.settled();
+    const retried = await value.driver.retry(sessionId).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await value.applyDelayedWrites();
+    await value.driver.settled();
+
+    // One operation, one persisted event: the head was never resubmitted.
+    expect(messages(await value.history(sessionId)).filter((message) => message === 'one operation')).toHaveLength(1);
+    expect(value.commitCalls()).toBe(1);
+    expect(value.driver.fault(sessionId)).toMatchObject({ kind: 'ambiguous', permanent: true });
+    expect(retried).toBeInstanceOf(AgentRuntimeError);
+    expect((retried as AgentRuntimeError).error).toMatchObject({ code: 'store_unavailable', retryable: false });
+    expect(value.published.filter((entry) => entry.type === 'diagnostic')).toHaveLength(0);
+  });
+
+  it('any replaced contract method or accessor makes a built-in store unverified, decided when asked', () => {
+    const make = () => createInMemoryStore({ clock: createFixedClock(), idFactory: createCounterIdFactory() });
+    const methods = ['commit', 'read', 'readEvents', 'readInteraction', 'findReceipt', 'listSessions'] as const;
+    for (const method of methods) {
+      const store = make();
+      expect(defaultStoreContract(store), method).toBe('linearizable');
+      const original: unknown = Reflect.get(store, method);
+      // Same behavior, different function: the guarantee can no longer be verified.
+      Reflect.set(store, method, (...args: unknown[]) => Reflect.apply(original as never, store, args));
+      expect(defaultStoreContract(store), method).toBe('unverified');
+    }
+    // An accessor, even one that returns the original function, cannot be verified at each use.
+    const accessor = make();
+    const commit: unknown = Reflect.get(accessor, 'commit');
+    Object.defineProperty(accessor, 'commit', { get: () => commit, configurable: true });
+    expect(defaultStoreContract(accessor)).toBe('unverified');
+    const revision = make();
+    Object.defineProperty(revision, 'revision', { get: () => 0, configurable: true });
+    expect(defaultStoreContract(revision)).toBe('unverified');
+    // A wrapper object is not the built-in store.
+    expect(defaultStoreContract(new Proxy(make(), {}))).toBe('unverified');
+    expect(defaultStoreContract({ ...make() })).toBe('unverified');
   });
 });
 

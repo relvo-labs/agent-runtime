@@ -40,10 +40,16 @@
  *   captured inside the transaction callback; on rejection A is set before any
  *   await, subscribers are woken and command attempts return before
  *   reconciliation I/O;
- * - only a store under the strong contract is reconciled by reading back: the
- *   built-in in-memory store by default, or one declared `linearizable`
+ * - only a store under the strong contract is reconciled by reading back: by
+ *   default a built-in in-memory store whose contract methods are still the
+ *   original built-in functions, checked at each use (when a commit is issued
+ *   and before each reconciliation read), or one declared `linearizable`
  *   internally. Any other adapter is unverified: A stays permanent and its
  *   head is never resubmitted;
+ * - a provider call is deregistered before its outcome fills the slot, so a
+ *   waiting `interrupt_run` mirrors an outcome that is already observed;
+ * - a thrown provider value is never inspected or coerced outside the guarded
+ *   classification; anything that cannot be classified is unknown;
  * - an overflow interrupts the current run once a provider handle exists.
  *
  * Process-local only; issue #6 owns crash-durable recovery.
@@ -200,7 +206,12 @@ export function ingressPlan(apply: IngressPlan['apply']): IngressPlan {
  */
 export type IngressStoreContract = 'linearizable' | 'unverified';
 
-/** The contract a store gets when none is declared: strong only for the built-in in-memory store. */
+/**
+ * The contract a store gets when none is declared: strong only for a built-in
+ * in-memory store whose contract members are still the original built-in
+ * functions. Decided when asked, so the driver asks at each use: a member
+ * replaced after the driver was created makes the store unverified from then on.
+ */
 export function defaultStoreContract(store: RuntimeStore): IngressStoreContract {
   return isBuiltInStore(store) ? 'linearizable' : 'unverified';
 }
@@ -473,6 +484,11 @@ type Invocation = 'filled' | 'unknown' | 'stale';
  * slot's receipt has committed (acknowledged or proven by reconciliation) and
  * is therefore visible to a lookup, or when admission ends without a
  * reservation. Command ids are global, like store receipts.
+ *
+ * An exact retry that finds the claim unbound (the first lookup is in flight)
+ * waits only until it is **bound** (or released), not until the commit: it then
+ * finds the reserved slot and shares its provider call and outcome, so an
+ * unknown outcome reaches it instead of stranding it until a later commit.
  */
 type Claim = {
   readonly sessionId: SessionId;
@@ -480,6 +496,9 @@ type Claim = {
   readonly acceptedAt: Timestamp;
   /** The reserved slot now holding the claim. */
   ordinal: number | undefined;
+  /** Settles when a reservation binds the claim to its slot, or when the claim is released. */
+  readonly bound: Promise<void>;
+  readonly signalBound: () => void;
   readonly released: Promise<void>;
   readonly release: () => void;
 };
@@ -697,18 +716,34 @@ function dedupe(
     : CommandReceiptSchema.parse({ ...existing.receipt, disposition: 'duplicate' });
 }
 
-/** Call a provider function, turning a synchronous throw into a rejection. */
+/**
+ * Call a provider function, turning a synchronous throw into a rejection of the
+ * thrown value itself. The value is never inspected or coerced here: a hostile
+ * one (a throwing `toString` or `message` getter, a revoked Proxy) could throw
+ * again, escape classification and leave its slot pending. Only
+ * `classifyEffectFailure` looks at it, guarded, and anything that throws there
+ * is unknown.
+ */
 function invoke<T>(call: () => Promise<T>): Promise<T> {
   try {
     return Promise.resolve(call());
   } catch (error) {
-    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- deliberately uninspected
+    return Promise.reject(error);
   }
 }
 
 export function createIngressDriver(options: IngressDriverOptions): IngressDriver {
   const { store, hub, clock, idFactory } = options;
-  const storeContract = options.storeContract ?? defaultStoreContract(store);
+  const declaredContract = options.storeContract;
+  /**
+   * The store contract at this moment. An explicit (internal) declaration is
+   * fixed; the default is re-decided at each use: when a commit is issued and
+   * before each reconciliation read.
+   */
+  function contractNow(): IngressStoreContract {
+    return declaredContract ?? defaultStoreContract(store);
+  }
   const sessions = new Map<SessionId, Entry>();
   const pending = new Set<Promise<unknown>>();
   const claims = new Map<CommandId, Claim>();
@@ -1105,15 +1140,48 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const run = entry.run;
     if (run === undefined || entry.s.run?.startOrdinal !== ordinal) return Promise.resolve('stale');
     const request: ProviderRunRequest = { input: run.command.input, sink: run.sink, runRef: run.runId };
-    const invocation = invoke(() => startRun(request)).then(
+    return callProvider(
+      entry,
+      ordinal,
+      () => startRun(request),
       (handle) => settleStart(entry, ordinal, { kind: 'applied', run: handle }),
-      (error: unknown) => settleStart(entry, ordinal, { kind: 'rejected', error }),
+      (error) => settleStart(entry, ordinal, { kind: 'rejected', error }),
     );
-    entry.invocations.set(ordinal, invocation);
+  }
+
+  /**
+   * Run one provider call for a reserved slot and register it as that slot's
+   * invocation, shared by exact retries while it is in flight. The call is
+   * deregistered **before** its outcome fills the slot: everything the fill
+   * runs synchronously (mirroring waiting `interrupt_run` commands, waking
+   * admissions) must see it as settled, not in flight, or a reserved follower
+   * would wait for a call that has already ended.
+   */
+  function callProvider<T>(
+    entry: Entry,
+    ordinal: number,
+    call: () => Promise<T>,
+    fulfilled: (value: T) => Invocation,
+    failed: (error: unknown) => Invocation,
+  ): Promise<Invocation> {
+    const registered: { invocation?: Promise<Invocation> } = {};
     const clear = (): void => {
-      if (entry.invocations.get(ordinal) === invocation) entry.invocations.delete(ordinal);
+      if (registered.invocation !== undefined && entry.invocations.get(ordinal) === registered.invocation) {
+        entry.invocations.delete(ordinal);
+      }
     };
-    invocation.then(clear, clear);
+    const invocation = invoke(call).then(
+      (value) => {
+        clear();
+        return fulfilled(value);
+      },
+      (error: unknown) => {
+        clear();
+        return failed(error);
+      },
+    );
+    registered.invocation = invocation;
+    entry.invocations.set(ordinal, invocation);
     return invocation;
   }
 
@@ -1198,11 +1266,17 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const released = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let signalBound!: () => void;
+    const bound = new Promise<void>((resolve) => {
+      signalBound = resolve;
+    });
     const claim: Claim = {
       sessionId: entry.s.sessionId,
       fingerprint,
       acceptedAt,
       ordinal: undefined,
+      bound,
+      signalBound,
       released,
       release,
     };
@@ -1210,9 +1284,20 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return claim;
   }
 
+  /**
+   * A reservation now holds the claim. Admissions waiting on it wake and share
+   * the slot (its provider call is registered in the same synchronous step);
+   * the claim itself stays held until the slot's receipt commits.
+   */
+  function bindClaim(claim: Claim, ordinal: number): void {
+    claim.ordinal = ordinal;
+    claim.signalBound();
+  }
+
   function dropClaim(commandId: CommandId, claim: Claim): void {
     if (claims.get(commandId) !== claim) return;
     claims.delete(commandId);
+    claim.signalBound();
     claim.release();
   }
 
@@ -1248,8 +1333,11 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
    * slot, a changed payload conflicts. Otherwise the command id's claim is
    * consulted: one held for a different payload (another session, or a lookup
    * in progress) is the live runtime's not-recorded conflict; one held for the
-   * same payload is waited for and admission starts over. Only an unclaimed id
-   * is claimed and looked up in the store. While the claim is held nothing
+   * same payload is waited for and admission starts over. An unbound claim is
+   * waited for only until a reservation binds it, after which the slot is in
+   * this queue and the retry shares it; a claim already bound to a slot this
+   * queue does not hold is waited for until it is released. Only an unclaimed
+   * id is claimed and looked up in the store. While the claim is held nothing
    * else can reserve this id, and the claim outlives the reservation until the
    * receipt commits, so the lookup can never miss a commit that happened while
    * it was in flight.
@@ -1265,7 +1353,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       if (held.fingerprint !== fingerprint) {
         return { kind: 'done', outcome: { kind: 'receipt', receipt: conflictReceipt(command, held.acceptedAt) } };
       }
-      await held.released;
+      await (held.ordinal === undefined ? held.bound : held.released);
     }
     const claim = takeClaim(entry, command, fingerprint, acceptedAt);
     let stored: Awaited<ReturnType<RuntimeStore['findReceipt']>>;
@@ -1401,19 +1489,16 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   function startEffect(entry: Entry, ordinal: number, call: EffectCall): Promise<Invocation> {
     const existing = entry.invocations.get(ordinal);
     if (existing !== undefined) return existing;
-    const invocation = invoke(call.deliver).then(
+    return callProvider(
+      entry,
+      ordinal,
+      call.deliver,
       () => fillEffect(entry, ordinal, { kind: 'applied', result: call.applied() }),
-      (error: unknown) =>
+      (error) =>
         classifyEffectFailure(error) === 'unknown'
           ? fillEffect(entry, ordinal, { kind: 'unknown' })
           : fillEffect(entry, ordinal, { kind: 'rejected', result: call.rejected(error) }),
     );
-    entry.invocations.set(ordinal, invocation);
-    const clear = (): void => {
-      if (entry.invocations.get(ordinal) === invocation) entry.invocations.delete(ordinal);
-    };
-    invocation.then(clear, clear);
-    return invocation;
   }
 
   /**
@@ -1867,6 +1952,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       created: undefined,
     };
     let events: readonly EventEnvelope[];
+    // Decided in the same synchronous step that calls `store.commit`: the guarantee
+    // a rejection carries is that of the function actually called.
+    const contract = contractNow();
     try {
       ({ events } = await store.commit((tx) => {
         witness.ran = true;
@@ -1878,7 +1966,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         }
       }));
     } catch {
-      return rejected(entry, op, witness);
+      return rejected(entry, op, witness, contract);
     }
     const advanced = advanceHead(entry.s, { kind: 'committed', ordinal: op.ordinal });
     if (advanced.kind !== 'advanced') return false;
@@ -1894,7 +1982,12 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return true;
   }
 
-  async function rejected(entry: Entry, op: Operation<IngressPayload>, witness: Witness): Promise<boolean> {
+  async function rejected(
+    entry: Entry,
+    op: Operation<IngressPayload>,
+    witness: Witness,
+    contract: IngressStoreContract,
+  ): Promise<boolean> {
     const first = witness.events[0];
     const sequenceBefore = (first === undefined ? entry.lastSequence : first.sequence - 1) as Sequence;
     const commitWitness: CommitWitness = {
@@ -1905,7 +1998,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     // A is recorded synchronously, before any reconciliation await.
     advanceHead(entry.s, { kind: 'rejected', ordinal: op.ordinal, witness: commitWitness });
 
-    if (storeContract !== 'linearizable') return reconciled(entry, op, 'unknown', [], witness);
+    if (contract !== 'linearizable') return reconciled(entry, op, 'unknown', [], witness);
     // The transaction never ran, or its mutate threw: the contract guarantees nothing applied.
     if (!witness.ran || witness.threw) return reconciled(entry, op, 'absent', [], witness);
 
@@ -1943,6 +2036,18 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   }
 
   /**
+   * A reconciliation read, issued only while the store contract still holds at
+   * this use. A contract member replaced since the commit was issued makes the
+   * read fail, so the verdict is unknown and A stays permanent.
+   */
+  function reconciliationRead<T>(read: () => Promise<T>): Promise<T> {
+    if (contractNow() !== 'linearizable') {
+      return Promise.reject(internal('the store contract can no longer be verified for a reconciliation read'));
+    }
+    return read();
+  }
+
+  /**
    * Replay the authoritative log through `through` onto the created session record,
    * exactly as the store folds it (sequence stamped, then `applyEvent`). Returns the
    * canonical projection digest, or `undefined` if the log is gapped, short or rejected
@@ -1958,7 +2063,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     };
     let cursor = 0;
     while (cursor < through) {
-      const page = await store.readEvents(sessionId, cursor as Sequence, through - cursor);
+      const page = await reconciliationRead(() => store.readEvents(sessionId, cursor as Sequence, through - cursor));
       if (page.events.length === 0) return undefined;
       for (const event of page.events) {
         if (event.sequence !== cursor + 1 || event.sequence > through) return undefined;
@@ -1989,7 +2094,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       const verdicts: Verdict[] = [];
       let envelopes: readonly EventEnvelope[] = [];
       if (witness.events.length > 0) {
-        const page = await store.readEvents(sessionId, sequenceBefore, witness.events.length);
+        const page = await reconciliationRead(() => store.readEvents(sessionId, sequenceBefore, witness.events.length));
         const matches =
           page.events.length === witness.events.length &&
           page.events.every((event, index) => {
@@ -2006,7 +2111,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
           // nothing else can have applied) and equal the projection its log folds to.
           const last = witness.events.at(-1);
           const initial = witness.created ?? entry.initialSession;
-          const snapshot = await store.read(sessionId);
+          const snapshot = await reconciliationRead(() => store.read(sessionId));
           if (last === undefined || initial === undefined || snapshot?.session.sequence !== last.sequence) {
             return unknown;
           }
@@ -2015,17 +2120,18 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
           verdicts.push('applied');
           envelopes = page.events;
         } else if (page.events.length === 0) {
-          const snapshot = await store.read(sessionId);
+          const snapshot = await reconciliationRead(() => store.read(sessionId));
           if ((snapshot?.session.sequence ?? 0) !== sequenceBefore) return unknown;
           verdicts.push('absent');
         } else {
           return unknown;
         }
       }
-      if (witness.receipt !== undefined) {
-        const found = await store.findReceipt(witness.receipt.commandId);
+      const receipt = witness.receipt;
+      if (receipt !== undefined) {
+        const found = await reconciliationRead(() => store.findReceipt(receipt.commandId));
         if (found === undefined) verdicts.push('absent');
-        else if (found.fingerprint === witness.receipt.fingerprint) verdicts.push('applied');
+        else if (found.fingerprint === receipt.fingerprint) verdicts.push('applied');
         else return unknown;
       }
       // An empty bundle wrote nothing either way.
@@ -2156,7 +2262,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         // Reserved: the slot holds the claim, the provider is called only now, and its
         // outcome fills this same slot.
         const { ordinal } = reserved;
-        claim.ordinal = ordinal;
+        bindClaim(claim, ordinal);
         return slotOutcome(entry, ordinal, startInvocation(entry, ordinal, input.startRun), false);
       });
     },
@@ -2193,7 +2299,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         if (reserved.kind === 'existing') return retryCommand(entry, reserved.op, responseRedelivery(reserved.op));
         const call = responseCall(entry, command, acceptedAt, deliver);
         if (call === undefined) throw internal(`interaction \`${command.interactionId}\` lost its route`);
-        claim.ordinal = reserved.ordinal;
+        bindClaim(claim, reserved.ordinal);
         return slotOutcome(entry, reserved.ordinal, startEffect(entry, reserved.ordinal, call), false);
       });
     },
@@ -2217,7 +2323,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         if (reserved.kind === 'existing') {
           return retryCommand(entry, reserved.op, interruptRedelivery(entry, command, reserved.op));
         }
-        claim.ordinal = reserved.ordinal;
+        bindClaim(claim, reserved.ordinal);
         const run = entry.run;
         if (run?.runId !== command.runId) throw internal(`run \`${command.runId}\` has no driver record`);
         if (!reserved.deliver) {
