@@ -2,6 +2,10 @@
 
 Status: Accepted
 
+The existing Decision below describes current behavior. The issue #43
+dispose-before-release dependency described at the end is **proposed, not yet
+implemented or accepted**; see `.hermes/plans/ingestion-recovery-issue-43-v2.md`.
+
 ## Context
 
 Killing a provider session to cancel one attempt destroys conversation state and makes the terminal outcome unclear.
@@ -60,3 +64,22 @@ It also retries retained open rollbacks and cannot succeed while any rollback re
 ## Consequences
 
 Hosts can continue after an interrupt. Closing remains the safe terminal fallback for less capable providers.
+
+## Proposed issue #43 dependency refinement (pending fresh review and acceptance)
+
+A close or shutdown must not await an unresolved `startRun()` (or provider
+response) forever. Fence admission ahead of the per-session command queue,
+retain its command identity, and promptly return a retryable cleanup error when
+an unresolved provider effect blocks safe disposal. Attach a late-handle
+continuation that interrupts and disposes once it arrives. Workspace release
+must wait for **confirmed successful provider disposal**; it must never race
+an unresolved start or disposal, because a provider may still use that lease.
+This is a narrow exception to the current attempt-all wording above: attempt
+every *safe independent* phase (e.g. disposal after a failed interrupt), retain
+phase-tagged failures and retry only failures, but never release before disposal.
+After a never-settling start, repeated close/shutdown calls remain promptly
+retryable, with no false terminal, receipt or lease-release claim. A permanent
+ingestion overflow does not prevent a successful **cleanup** receipt once the
+accepted prefix, terminal and real cleanup are committed; replay remains
+marked incomplete. Deterministic late-resolve, late-reject and never-settling
+provider tests must accompany acceptance of this refinement.
