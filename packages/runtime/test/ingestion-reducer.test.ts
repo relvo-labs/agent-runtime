@@ -1492,3 +1492,85 @@ describe('R1-4 post-fence run ingress in E', () => {
     expect(acceptEvent(s, started.fence, 'run-1:partial')).toMatchObject({ kind: 'accepted', demoted: false });
   });
 });
+
+// ---------------------------------------------------------------------------
+// S2-P3: command-admission capacity exception (maintainer decision 2026-10-03)
+// ---------------------------------------------------------------------------
+
+describe('S2-P3 command admission at capacity', () => {
+  /** Commit exactly one head operation, freeing one slot. */
+  function drainOne(s: Session): void {
+    const step = advanceHead(s, { kind: 'submit' });
+    if (step.kind !== 'submit') throw new Error(`head not submitted: ${JSON.stringify(step)}`);
+    expect(advanceHead(s, { kind: 'committed', ordinal: step.op.ordinal })).toMatchObject({ kind: 'advanced' });
+  }
+
+  it('refuses a start at capacity with retryable capacity, no O and no allocation; a retry succeeds after one slot drains', () => {
+    const s = opened();
+    fillToCap(s);
+    const before = { nextOrdinal: s.nextOrdinal, counted: s.counted, epoch: s.epoch, queue: queued(s) };
+    const ids = runIds(1);
+    const input = { ...ids, attempt: 1, identity: identity('submit-1') };
+
+    expect(reserveStart(s, input)).toEqual({ kind: 'refused', reason: 'capacity' });
+    // Nothing was lost: no overflow marker, no fault, no run, no ordinal or slot consumed.
+    expect(s.faults.overflow).toBeUndefined();
+    expect(ingestionFault(s)).toBeUndefined();
+    expect(s.run).toBeUndefined();
+    expect({ nextOrdinal: s.nextOrdinal, counted: s.counted, epoch: s.epoch, queue: queued(s) }).toEqual(before);
+    // Fresh provider ingress is still admitted once a slot frees: the refusal did not fence the session.
+    expect(runFenced(s)).toBe(false);
+
+    drainOne(s);
+    const retried = reserveStart(s, input);
+    expect(retried).toMatchObject({ kind: 'reserved', ordinal: before.nextOrdinal });
+    expect(s.counted).toBe(SESSION_OPERATION_LIMIT);
+    expect(s.run?.runId).toBe(ids.runId);
+    expect(ingestionFault(s)).toBeUndefined();
+    assertInvariants(s);
+  });
+
+  it('refuses a response reservation at capacity with retryable capacity, no O and no allocation; a retry succeeds after one slot drains', () => {
+    const s = opened();
+    const started = running(s, 1);
+    expect(acceptEvent(s, started.fence, 'run-1:request', { role: 'request', subject: 'interaction-1' })).toMatchObject(
+      { kind: 'accepted', demoted: false },
+    );
+    fillToCap(s);
+    const before = { nextOrdinal: s.nextOrdinal, counted: s.counted, queue: queued(s) };
+    const input = {
+      effect: 'response' as const,
+      identity: identity('respond-1'),
+      runId: started.runId,
+      subject: 'interaction-1',
+    };
+
+    expect(reserveEffect(s, input)).toEqual({ kind: 'refused', reason: 'capacity' });
+    expect(s.faults.overflow).toBeUndefined();
+    expect(ingestionFault(s)).toBeUndefined();
+    expect(s.run?.unresolved).toBe(0);
+    expect({ nextOrdinal: s.nextOrdinal, counted: s.counted, queue: queued(s) }).toEqual(before);
+    // The run is not fenced: the refusal is the caller's retryable answer, not lost history.
+    expect(runFenced(s)).toBe(false);
+    expect(runPhase(s)).toBe('R');
+
+    drainOne(s);
+    expect(reserveEffect(s, input)).toEqual({ kind: 'reserved', ordinal: before.nextOrdinal, deliver: true });
+    expect(s.counted).toBe(SESSION_OPERATION_LIMIT);
+    expect(s.run?.unresolved).toBe(1);
+    expect(ingestionFault(s)).toBeUndefined();
+    assertInvariants(s);
+  });
+
+  it('a provider body refused at the same capacity does set O: only provider history loss is an overflow', () => {
+    const s = opened();
+    fillToCap(s);
+    expect(reserveStart(s, { ...runIds(1), attempt: 1, identity: identity('submit-1') })).toEqual({
+      kind: 'refused',
+      reason: 'capacity',
+    });
+    expect(ingestionFault(s)).toBeUndefined();
+    expect(acceptEvent(s, 'session', 'excess')).toEqual({ kind: 'refused', reason: 'overflow' });
+    expect(ingestionFault(s)).toMatchObject({ kind: 'overflow', permanent: true });
+  });
+});
