@@ -77,9 +77,41 @@ export function bufferedEventCountForTesting(hub: SubscriptionHub): number {
   return count;
 }
 
+/** Throws while a session's history cannot be certified (ingestion fault A, O or F). */
+type IngestionFaultGuard = (sessionId: SessionId) => void;
+
+const faultGuardInstallers = new WeakMap<
+  SubscriptionHub,
+  (guard: IngestionFaultGuard) => (sessionId: SessionId) => void
+>();
+
+/**
+ * @internal Module-internal ingestion fault notifier (issue #43). Deliberately
+ * not a member of the public `SubscriptionHub` type and not re-exported from
+ * the package entry point.
+ *
+ * Installs `guard` on a hub created by `createSubscriptionHub` and returns the
+ * notifier that wakes that session's idle subscribers. The guard runs before
+ * and after every replay page, before and after every replay delivery, before
+ * the live switch, before each buffered live event, after every wake (also one
+ * that closed the subscriber) and before every `closed` marker. When it throws,
+ * the subscriber's pending `next()` rejects with that error instead of hanging
+ * or yielding a healthy-looking page or `closed` marker. A hub without an
+ * installed guard behaves exactly as before.
+ */
+export function installIngestionFaultGuard(
+  hub: SubscriptionHub,
+  guard: IngestionFaultGuard,
+): (sessionId: SessionId) => void {
+  const install = faultGuardInstallers.get(hub);
+  if (install === undefined) throw new Error('subscription hub was not created by createSubscriptionHub');
+  return install(guard);
+}
+
 export function createSubscriptionHub(options: SubscriptionHubOptions): SubscriptionHub {
   const replayPageSize = options.replayPageSize ?? 500;
   const subscribers = new Set<Subscriber>();
+  let faultGuard: IngestionFaultGuard | undefined;
 
   function notify(subscriber: Subscriber): void {
     const { wake } = subscriber;
@@ -162,6 +194,11 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
         return subscriber.closed;
       }
 
+      /** Rejects this subscriber's pending `next()` while its session has an ingestion fault. */
+      function checkFault(): void {
+        faultGuard?.(request.sessionId);
+      }
+
       async function* iterate(): AsyncGenerator<SubscriptionMessage> {
         try {
           if (isClosed()) return;
@@ -170,12 +207,15 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
           // ---- step 2: durable history -------------------------------------
           for (;;) {
             await options.checkReplayReady?.(request.sessionId);
+            checkFault();
             const page = await options.store.readEvents(
               request.sessionId,
               lastEmitted as Sequence,
               Math.min(replayPageSize, subscriber.bufferSize),
             );
             await options.checkReplayReady?.(request.sessionId);
+            // A fault that arrived while this page read was held must not let it look healthy.
+            checkFault();
             if (isClosed()) return;
             for (const event of page.events) {
               if (event.sequence <= lastEmitted) continue; // step 3
@@ -184,12 +224,16 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
                 subscriber.terminal = event.payload.reason === 'failed' ? 'session_failed' : 'session_closed';
               }
               if (!matches(event)) continue;
+              // Before every replay delivery: a fault that arrived while this generator was
+              // suspended inside a page must not let the page's remaining events through.
+              checkFault();
               yield {
                 type: 'event',
                 event,
                 cursor: cursorFromSequence(event.sequence),
                 replay: true,
               };
+              checkFault();
               if (isClosed()) return;
             }
             if (page.hasMore) continue;
@@ -201,6 +245,7 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             if (subscriber.highestPublishedSequence > lastEmitted) continue;
             const readiness = options.checkReplayReady?.(request.sessionId);
             if (readiness !== undefined) await readiness;
+            checkFault();
             if (subscriber.highestPublishedSequence > lastEmitted) continue;
             subscriber.phase = 'live';
             break;
@@ -220,6 +265,9 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
           // only now can overflow be a real loss of delivery.
           // ---- live --------------------------------------------------------
           while (!isClosed()) {
+            // Before a buffered event, after every wake and before `closed`: an
+            // ingestion fault rejects instead of extending a gapped history.
+            checkFault();
             const event = subscriber.buffer.shift();
             if (event !== undefined) {
               if (event.sequence <= lastEmitted) continue; // step 3
@@ -260,6 +308,7 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
 
             if (subscriber.terminal !== undefined) {
               const reason = subscriber.terminal;
+              checkFault();
               detach();
               yield {
                 type: 'closed',
@@ -272,8 +321,13 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
             await new Promise<void>((resolve) => {
               subscriber.wake = resolve;
             });
+            // After every wake, even one that also closed the subscriber (a fault
+            // notification followed synchronously by `closeAll()`).
+            checkFault();
           }
 
+          // Never yield a healthy-looking `closed` marker while the session is faulted.
+          checkFault();
           yield {
             type: 'closed',
             cursor: cursorFromSequence(lastEmitted),
@@ -323,5 +377,12 @@ export function createSubscriptionHub(options: SubscriptionHubOptions): Subscrip
   };
 
   subscriberSets.set(hub, subscribers);
+  faultGuardInstallers.set(hub, (guard) => {
+    if (faultGuard !== undefined) throw new Error('an ingestion fault guard is already installed on this hub');
+    faultGuard = guard;
+    return (sessionId) => {
+      for (const subscriber of subscribers) if (subscriber.sessionId === sessionId) notify(subscriber);
+    };
+  });
   return hub;
 }

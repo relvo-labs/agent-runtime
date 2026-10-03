@@ -151,6 +151,58 @@ export function observeHistoryReadsForTesting(store: RuntimeStore, observer: () 
   return () => historyReadObservers.delete(store);
 }
 
+/** The `RuntimeStore` methods whose behavior the strong store contract describes. */
+const CONTRACT_METHODS = ['commit', 'read', 'readEvents', 'readInteraction', 'findReceipt', 'listSessions'] as const;
+
+type BuiltInMembers = Readonly<{
+  /** The original `revision` getter, compared by identity only. */
+  revision: unknown;
+  methods: Readonly<Record<(typeof CONTRACT_METHODS)[number], unknown>>;
+}>;
+
+/**
+ * Stores created by `createInMemoryStore`, with the contract members each was
+ * created with. Provider ingestion recognizes such a store as meeting the strong
+ * store contract (a settled commit rejection never applies later, and a read
+ * after it is linearizable) only while those members are unchanged. Every other
+ * `RuntimeStore` is treated as unverified until surface 4 adds a public
+ * declaration (issue #43).
+ */
+const builtInStores = new WeakMap<RuntimeStore, BuiltInMembers>();
+
+/**
+ * @internal Whether `store` is a built-in in-memory store whose contract members
+ * are, right now, the original built-in functions: each method an own data
+ * property holding the function it was created with, and `revision` the
+ * original getter. Replacing any of them (before or after a driver was created)
+ * or turning one into an accessor forfeits automatic trust, because the
+ * replacement's rejection and read semantics are unknown. The store object is
+ * deliberately not frozen, which would change observable public behavior; the
+ * caller asks at each use instead. Not exported from the package entry point.
+ */
+export function isBuiltInStore(store: RuntimeStore): boolean {
+  const original = builtInStores.get(store);
+  if (original === undefined) return false;
+  const revision = Object.getOwnPropertyDescriptor(store, 'revision');
+  if (revision === undefined || 'value' in revision || revision.set !== undefined) return false;
+  if (ownGetter(revision) !== original.revision) return false;
+  return CONTRACT_METHODS.every((name) => {
+    const current = ownValue(store, name);
+    return current !== undefined && current === original.methods[name];
+  });
+}
+
+/** An accessor descriptor's getter, as an opaque value compared by identity only. */
+function ownGetter(descriptor: PropertyDescriptor | undefined): unknown {
+  return descriptor === undefined ? undefined : (Reflect.get(descriptor, 'get') as unknown);
+}
+
+/** An own data property's value, compared by identity only (never called through this reference). */
+function ownValue(store: RuntimeStore, name: (typeof CONTRACT_METHODS)[number]): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(store, name);
+  return descriptor !== undefined && 'value' in descriptor ? (descriptor.value as unknown) : undefined;
+}
+
 export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore {
   const defaultPageSize = options.defaultPageSize ?? 1000;
 
@@ -334,6 +386,17 @@ export function createInMemoryStore(options: InMemoryStoreOptions): RuntimeStore
       return Promise.resolve([...state.sessions.keys()]);
     },
   };
+  builtInStores.set(store, {
+    revision: ownGetter(Object.getOwnPropertyDescriptor(store, 'revision')),
+    methods: {
+      commit: ownValue(store, 'commit'),
+      read: ownValue(store, 'read'),
+      readEvents: ownValue(store, 'readEvents'),
+      readInteraction: ownValue(store, 'readInteraction'),
+      findReceipt: ownValue(store, 'findReceipt'),
+      listSessions: ownValue(store, 'listSessions'),
+    },
+  });
   return store;
 }
 

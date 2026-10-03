@@ -17,12 +17,10 @@ import {
   OpenSessionCommandSchema,
   RespondToInteractionCommandSchema,
   SubmitTurnCommandSchema,
-  ProviderEventInputSchema,
   agentError,
   canonicalCommandFingerprint,
   canTransition,
   isCommandAdmissible,
-  isJsonValue,
   JsonValueSchema,
   SubscriptionRequestSchema,
   toAgentError,
@@ -69,6 +67,7 @@ import {
 } from '@relvo-labs/agent-provider';
 import { validateWorkspaceLease, type WorkspaceLease, type WorkspaceProvider } from '@relvo-labs/agent-workspace';
 
+import { captureProviderEvent, type CapturedProviderEvent } from './provider-capture.ts';
 import { createProviderRegistry, type ProviderRegistry } from './registry.ts';
 import { createSubscriptionHub, type SubscriptionHub } from './subscriptions.ts';
 import { createInMemoryStore, type RuntimeStore, type StoreTransaction } from './store.ts';
@@ -636,35 +635,6 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
   // -------------------------------------------------------------------------
 
   const PRE_ACTIVATION_EVENT_LIMIT = 256;
-
-  type CapturedProviderEvent =
-    | { readonly valid: true; readonly input: ProviderEventInput }
-    | { readonly valid: false; readonly diagnostic: string };
-
-  function freezeProviderValue<T>(value: T, seen = new WeakSet<object>()): T {
-    if (value === null || typeof value !== 'object' || seen.has(value)) return value;
-    seen.add(value);
-    for (const child of Object.values(value)) freezeProviderValue(child, seen);
-    return Object.freeze(value);
-  }
-
-  /** Capture validity and values before control returns to provider code. */
-  function captureProviderEvent(input: ProviderEventInput): CapturedProviderEvent {
-    try {
-      if (!isJsonValue(input)) {
-        return { valid: false, diagnostic: 'provider emitted an invalid event: input is not acyclic plain JSON data' };
-      }
-      const parsed = ProviderEventInputSchema.safeParse(input);
-      return parsed.success
-        ? { valid: true, input: freezeProviderValue(parsed.data) }
-        : {
-            valid: false,
-            diagnostic: `provider emitted an invalid event: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}`,
-          };
-    } catch {
-      return { valid: false, diagnostic: 'provider emitted an invalid event: input could not be inspected safely' };
-    }
-  }
 
   function retainWithdrawal(
     sessionId: SessionId,
