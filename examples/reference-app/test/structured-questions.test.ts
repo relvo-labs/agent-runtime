@@ -80,6 +80,10 @@ function faultableStore(
     },
     store: {
       ...base,
+      // This wrapper never applies a commit whose promise it rejects ('before' rejects
+      // without calling the store; 'after' throws inside the transaction, discarding it),
+      // so it explicitly declares the strong store contract (issue #43).
+      contract: { version: 1, level: 'strong' },
       commit: (mutate) => {
         if (rejectNext) {
           const phase = rejectNext;
@@ -404,7 +408,10 @@ describe('claude structured questions through the runtime', () => {
     };
 
     vertical.failNextCommit();
-    await expect(vertical.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    // The failed commit is the session's retryable ingestion fault; the store's own text is not surfaced.
+    await expect(vertical.runtime.respondToInteraction(command)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } },
+    });
 
     // The provider side effect already happened: the SDK is unblocked exactly
     // once, with the answers the host gave.
@@ -648,7 +655,10 @@ describe('codex structured questions through the runtime', () => {
     };
 
     vertical.failNextCommit();
-    await expect(vertical.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    // The failed commit is the session's retryable ingestion fault; the store's own text is not surfaced.
+    await expect(vertical.runtime.respondToInteraction(command)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } },
+    });
 
     // The native reply was written exactly once, before the commit failed.
     expect(codexReplies(vertical.fake)).toHaveLength(1);

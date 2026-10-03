@@ -4,12 +4,13 @@
  * permanent overflow, commit witness and reconciliation, fault query and fault
  * wake. Surface 3: start ownership, terminal submission, response and
  * interrupt reservations, interaction routing and immutable retries.
+ * Surface 4: session open and close through the FIFO, cleanup execution
+ * (interrupt, dispose, release) independent of persistence, retirement.
  *
- * PRIVATE SEAM. This module is not exported from the package entry point and
- * `createAgentRuntime` does not use it yet. Session close and shutdown
- * (surface 4) still commit directly in `runtime.ts`; routing commands and
- * provider ingress through the FIFO without them would let those commits
- * bypass it, so the live runtime switches over atomically once they land.
+ * Internal module. It is not exported from the package entry point; since
+ * surface 4 `createAgentRuntime` routes every session open, command, provider
+ * callback, close and shutdown through it, so no session-history commit
+ * bypasses the FIFO.
  *
  * Every ordering, capacity and fault decision is made by the surface 1 reducer
  * (`ingestion.ts`). This driver executes its decisions:
@@ -50,7 +51,13 @@
  *   waiting `interrupt_run` mirrors an outcome that is already observed;
  * - a thrown provider value is never inspected or coerced outside the guarded
  *   classification; anything that cannot be classified is unknown;
- * - an overflow interrupts the current run once a provider handle exists.
+ * - an overflow interrupts the current run once a provider handle exists;
+ * - an admitted close fences the session without waiting on any provider
+ *   promise. Its cleanup calls (interrupt, dispose, then release only after a
+ *   confirmed disposal) run as the reducer allows them, also from a late start
+ *   or response settlement, whether or not history can be persisted; `closing`,
+ *   the run terminal and `session.closed` stay in FIFO order;
+ * - a closed session is retired: only a permanent overflow marker survives.
  *
  * Process-local only; issue #6 owns crash-durable recovery.
  */
@@ -60,9 +67,11 @@ import {
   AgentRuntimeError,
   CommandReceiptSchema,
   RUN_STATE_TABLE,
+  WorkspaceReleaseReportSchema,
   agentError,
   canTransition,
   canonicalCommandFingerprint,
+  toAgentError,
   type AgentCommand,
   type AgentError,
   type AgentSession,
@@ -85,6 +94,7 @@ import {
   type SubmitTurnCommand,
   type Timestamp,
   type TurnId,
+  type WorkspaceReleaseReport,
 } from '@relvo-labs/agent-protocol';
 import {
   ProviderRejection,
@@ -99,13 +109,18 @@ import {
   SESSION_OPERATION_LIMIT,
   acceptEvent,
   advanceHead,
+  beginCleanup,
   chooseTerminal,
   createSessionIngestion,
   ingestionFault,
   reserveEffect,
   reserveStart,
+  retire,
   settleEffect,
   type BodyOperation,
+  type CleanupPhase,
+  type CleanupStep,
+  type ClosedOperation,
   type CommandIdentity,
   type CommitWitness,
   type EffectOperation,
@@ -121,7 +136,13 @@ import {
 } from './ingestion.ts';
 import { applyEvent } from './projection.ts';
 import { captureProviderEvent, type CapturedProviderEvent } from './provider-capture.ts';
-import { isBuiltInStore, type RuntimeStore, type SessionRecord, type StoreTransaction } from './store.ts';
+import {
+  declaresStrongContract,
+  isBuiltInStore,
+  type RuntimeStore,
+  type SessionRecord,
+  type StoreTransaction,
+} from './store.ts';
 import { installIngestionFaultGuard, type SubscriptionHub } from './subscriptions.ts';
 
 // ---------------------------------------------------------------------------
@@ -200,20 +221,24 @@ export function ingressPlan(apply: IngressPlan['apply']): IngressPlan {
  * applied or absent. `unverified`: none of this is known, so a rejected head
  * stays ambiguous (A) for the runtime lifetime and is never resubmitted.
  *
- * Internal only (maintainer decision 2026-10-03): the built-in in-memory store
- * is recognized as `linearizable`; every other store defaults to `unverified`.
- * A public declaration for custom adapters arrives with surface 4.
+ * Maintainer decision 2026-10-03: the built-in in-memory store is recognized
+ * as `linearizable` implicitly; any other store is `linearizable` only through
+ * the public `contract: { version: 1, level: 'strong' }` declaration
+ * (`RuntimeStoreContract`) and defaults to `unverified`.
  */
 export type IngressStoreContract = 'linearizable' | 'unverified';
 
 /**
- * The contract a store gets when none is declared: strong only for a built-in
- * in-memory store whose contract members are still the original built-in
- * functions. Decided when asked, so the driver asks at each use: a member
- * replaced after the driver was created makes the store unverified from then on.
+ * The contract a store gets unless the driver is given one internally: strong
+ * for a built-in in-memory store whose contract members are still the original
+ * built-in functions, or for any store that explicitly declares the version 1
+ * `strong` contract (the host's responsibility, honored even on a modified
+ * built-in store). Decided when asked, so the driver asks at each use: a member
+ * replaced, or a declaration withdrawn, after the driver was created makes the
+ * store unverified from then on.
  */
 export function defaultStoreContract(store: RuntimeStore): IngressStoreContract {
-  return isBuiltInStore(store) ? 'linearizable' : 'unverified';
+  return isBuiltInStore(store) || declaresStrongContract(store) ? 'linearizable' : 'unverified';
 }
 
 export type MaterializeEventInput = Readonly<{
@@ -309,7 +334,19 @@ export type IngressDriverOptions = {
   readonly storeContract?: IngressStoreContract;
   readonly clock: Clock;
   readonly idFactory: IdFactory;
+  /** Called once a closed (or discarded) session's ingestion is retired, so the caller can drop its own state. */
+  readonly retired?: (sessionId: SessionId) => void;
 };
+
+/**
+ * The session-level cleanup effects a close executes, handed over when the open
+ * is filled. Disposal ends every provider use; release is attempted only after
+ * a confirmed disposal.
+ */
+export type SessionCleanup = Readonly<{
+  dispose: () => Promise<void>;
+  release: () => Promise<WorkspaceReleaseReport>;
+}>;
 
 /** Internal fault query entry: one per session, precedence A > O > F. */
 export type IngressFault = Readonly<{
@@ -317,7 +354,41 @@ export type IngressFault = Readonly<{
   kind: IngestionFaultView['kind'];
   permanent: boolean;
   failureCount?: number;
+  /** `completion` when the blocking head is a run terminal, else `event`. */
+  stage: 'event' | 'completion';
+  /** The run the blocking head belongs to, when it belongs to one. */
+  runId?: RunId;
   error: AgentError;
+}>;
+
+/**
+ * The outcome of one close or shutdown attempt that did not throw. `closed`
+ * carries the close receipt (absent for shutdown's internal close). A pending
+ * provider effect, a failed cleanup phase or a persistence fault throws a
+ * typed error instead, so the caller never receives a fabricated outcome.
+ */
+export type CloseOutcome =
+  | Readonly<{ kind: 'closed'; receipt: CommandReceipt | undefined }>
+  | Readonly<{ kind: 'reject-active'; runId: RunId }>
+  | Readonly<{ kind: 'refused'; reason: RefusalReason }>;
+
+/** A command identity the driver holds: a claimed command slot, an unresolved open, or an admitted close. */
+export type HeldIdentity = Readonly<{ sessionId: SessionId; fingerprint: string; acceptedAt: Timestamp }>;
+
+/** Aggregate driver bookkeeping for retirement proofs. Test-facing. */
+export type IngressTotals = Readonly<{
+  sessions: number;
+  runs: number;
+  startingRuns: number;
+  routes: number;
+  withdrawals: number;
+  waiters: number;
+  invocations: number;
+  claims: number;
+  lifecycleClaims: number;
+  closing: number;
+  retiredMarkers: number;
+  supervised: number;
 }>;
 
 export type ReserveRunResult =
@@ -365,11 +436,48 @@ export type IngressBookkeeping = Readonly<{
 export type IngressDriver = {
   /** Reserve the session-open effect at ordinal 0 and return the inactive session sink. */
   openSession(sessionId: SessionId, identity: CommandIdentity): ProviderEventSink;
-  /** Fill the open reservation. A rejected open discards the session without a fault marker. */
+  /**
+   * Fill the open reservation. A rejected open discards the session without a
+   * fault marker. An applied open may hand over the session's cleanup effects.
+   */
   settleOpen(
     sessionId: SessionId,
-    outcome: Readonly<{ kind: 'applied'; plan: IngressPlan }> | Readonly<{ kind: 'rejected' }>,
+    outcome:
+      Readonly<{ kind: 'applied'; plan: IngressPlan; cleanup?: SessionCleanup }> | Readonly<{ kind: 'rejected' }>,
   ): void;
+  /**
+   * Wait for the open slot's commit and return the receipt its plan recorded.
+   * A persistence fault rejects (F retryable, A not). `undefined`: the slot is
+   * no longer queued (it committed before this call), so read the store.
+   * `resume` (an exact retry) resubmits a proven-absent (F) head.
+   */
+  openOutcome(sessionId: SessionId, resume: boolean): Promise<CommandReceipt | undefined>;
+  /**
+   * Admit a close (or, without an identity, shutdown's internal close) and run
+   * every cleanup call the reducer allows now. Never waits on an unresolved
+   * provider start, response or interrupt: those make it throw a retryable
+   * error at once, and the cleanup continues on its own when they settle.
+   * Resolves only after the `session.closed` bundle (and its receipt) commits.
+   */
+  closeSession(
+    sessionId: SessionId,
+    input: Readonly<{ identity?: CommandIdentity; ifRunActive: 'interrupt' | 'reject'; resume: boolean }>,
+  ): Promise<CloseOutcome>;
+  /** The identity a command id currently holds in the driver, if any. */
+  commandIdentity(commandId: CommandId): HeldIdentity | undefined;
+  /** Sessions with live (not retired) ingestion, sorted. */
+  liveSessions(): readonly SessionId[];
+  /** Whether the driver knows the session: live, or retired with a permanent overflow marker. */
+  knows(sessionId: SessionId): boolean;
+  /**
+   * Resolves once every operation accepted for the session so far has been
+   * committed, or as soon as a fault (A or F) blocks the head or the session
+   * retires. Never rejects. Lets a command return only after the output its
+   * provider emitted while the command ran (activation staging) is persisted.
+   */
+  drained(sessionId: SessionId): Promise<void>;
+  /** Aggregate bookkeeping. Test-facing. */
+  totals(): IngressTotals;
   /** Reserve the start ordinal and slot before provider `startRun()`; the run sink is ordered behind it. */
   reserveRun(sessionId: SessionId, input: SubmitTurnInput): ReserveRunResult;
   /**
@@ -408,13 +516,17 @@ export type IngressDriver = {
   /** Throws while the session has A, O or F. */
   ensureReplayReady(sessionId: SessionId): void;
   /**
-   * Internal retry (the public API is surface 4). A: refuses without
-   * resubmitting. Healthy: no-op. F: resubmits the same head, and reports F if
-   * it fails again. O: drains the accepted prefix, then still reports O.
-   * Concurrent retries share one drain.
+   * Retry one session's ingestion (backs `AgentRuntime.retryProviderIngestion`).
+   * A: refuses without resubmitting. Healthy: no-op. F: resubmits the same head,
+   * and reports F if it fails again. O: drains the accepted prefix, then still
+   * reports O (also for a retired session's marker). Concurrent retries share
+   * one drain. Never calls a provider or workspace effect.
    */
   retry(sessionId: SessionId): Promise<void>;
-  /** Waits for in-flight ingress; rejects as soon as any session has a fault. */
+  /**
+   * Waits for in-flight ingress and for every supervised run's completion to be
+   * handled; rejects as soon as any session has a fault.
+   */
   quiesce(): Promise<void>;
   /**
    * Waits for every scheduled commit and reconciliation, and for every overflow
@@ -457,9 +569,20 @@ type DriverRun = {
   readonly routes: Map<InteractionId, Route>;
   /** Provider references that still route to an interaction. */
   readonly refs: Map<string, InteractionId>;
+  /** The close-cause terminal's timestamp, stamped once at its first materialization and reused on retry. */
+  closeAt: Timestamp | undefined;
+  /**
+   * A completion observed while close's own interrupt call was in flight. It is
+   * applied when that call settles, so a provider that completes in response to
+   * the close interrupt does not hide that the close interrupted an active run.
+   */
+  deferredCompletion: RunTermination | undefined;
+  /** Ends the quiesce tracking of this run's completion once the run is retired. */
+  stopSupervision: (() => void) | undefined;
 };
 
-type Waiter = { resolve(receipt: CommandReceipt): void; reject(error: AgentRuntimeError): void };
+/** `undefined` only for shutdown's internal close, which records no receipt. */
+type Waiter = { resolve(receipt: CommandReceipt | undefined): void; reject(error: AgentRuntimeError): void };
 
 type Follower = {
   readonly command: InterruptRunCommand;
@@ -503,8 +626,34 @@ type Claim = {
   readonly release: () => void;
 };
 
+/**
+ * What a provider sink holds: a cell pointing at its live session. Retirement
+ * empties the cell, so a stale sink keeps neither the session nor any handle,
+ * body or map, only its own immutable fence.
+ */
+type SinkCell = { entry: Entry | undefined };
+
+type CleanupFailure = Readonly<{ error: AgentError; cause: unknown }>;
+
 type Entry = {
   readonly s: SessionIngestion<IngressPayload>;
+  readonly cell: SinkCell;
+  /** Session-level cleanup effects, handed over when the open is filled. */
+  cleanup: SessionCleanup | undefined;
+  /** The release report a successful release produced; `session.closed` carries it. */
+  releaseReport: WorkspaceReleaseReport | undefined;
+  /** The last failure of each cleanup phase, for phase-tagged close errors. */
+  readonly cleanupErrors: Map<CleanupPhase, CleanupFailure>;
+  /** Cleanup calls in flight, so a concurrent close attempt can wait for them. */
+  readonly cleanupCalls: Map<CleanupPhase, Promise<void>>;
+  /**
+   * Set when `session.closed` committed: its receipt, for a close attempt still
+   * in flight when the session retired (the entry is then reachable only from
+   * that attempt).
+   */
+  closed: Readonly<{ receipt: CommandReceipt | undefined }> | undefined;
+  /** `drained()` callers, each waiting until the head passes its ordinal. */
+  drainWaiters: { readonly through: number; readonly resolve: () => void }[];
   /** The running head chain, if any. */
   chain: Promise<void> | undefined;
   /** A pump is queued on a microtask. */
@@ -636,6 +785,45 @@ function overflowError(): AgentError {
   );
 }
 
+/** The reason passed to `ProviderRun.interrupt()` when a close interrupts the run. */
+const CLOSE_INTERRUPT_REASON = 'session closing';
+
+/** Public phase names in a close error's `details.failures`, unchanged from the pre-#43 runtime. */
+const CLEANUP_PHASE_NAMES: Readonly<Record<CleanupPhase, 'run_interrupt' | 'provider_dispose' | 'workspace_release'>> =
+  {
+    interrupt: 'run_interrupt',
+    dispose: 'provider_dispose',
+    release: 'workspace_release',
+  };
+
+/** What an unfinished close is waiting for, as `details.pending`. */
+type ClosePending = 'start' | 'response' | 'interrupt' | 'cleanup';
+
+const PENDING_TEXT: Readonly<Record<ClosePending, string>> = {
+  start: 'an unresolved provider run start',
+  response: 'an unresolved provider interaction response',
+  interrupt:
+    'an `interrupt_run` whose provider outcome is unknown or still in flight; only that command (or its exact retry) can resolve it',
+  cleanup: 'a cleanup call that is still in flight',
+};
+
+/** A failed cleanup call as a typed error. Read defensively: a hostile thrown value gets a fixed message. */
+function cleanupFailure(phase: CleanupPhase, cause: unknown): CleanupFailure {
+  const fallback = phase === 'release' ? 'workspace_unavailable' : 'provider_unavailable';
+  try {
+    const converted = toAgentError(cause, fallback);
+    const error = AgentErrorSchema.parse({
+      code: converted.code,
+      message: converted.message.slice(0, 2000),
+      retryable: converted.retryable,
+      ...(converted.providerCode === undefined ? {} : { providerCode: converted.providerCode }),
+    });
+    return { error, cause };
+  } catch {
+    return { error: agentError(fallback, `session cleanup phase \`${CLEANUP_PHASE_NAMES[phase]}\` failed`), cause };
+  }
+}
+
 function turnState(outcome: RunTermination['outcome']): 'completed' | 'failed' | 'cancelled' {
   return outcome === 'succeeded' ? 'completed' : outcome === 'interrupted' ? 'cancelled' : 'failed';
 }
@@ -747,6 +935,12 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   const sessions = new Map<SessionId, Entry>();
   const pending = new Set<Promise<unknown>>();
   const claims = new Map<CommandId, Claim>();
+  /** Closed sessions whose history overflowed: one small permanent marker each, for the runtime lifetime. */
+  const retiredOverflow = new Set<SessionId>();
+  /** Identities of unresolved opens and admitted closes, which are not admitted through `admit`. */
+  const lifecycle = new Map<CommandId, HeldIdentity>();
+  /** Provider completions being observed, until handled or until their run is retired. */
+  const supervision = new Set<Promise<unknown>>();
   let raiseFault: () => void = () => undefined;
   let faultSignal = new Promise<void>((resolve) => {
     raiseFault = resolve;
@@ -772,6 +966,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
   /** Wake subscribers and quiesce at each transition into A, O or F, before any reconciliation I/O. */
   function noteFault(entry: Entry): void {
+    checkDrained(entry);
     const kind = ingestionFault(entry.s)?.kind;
     if (kind === entry.notified) return;
     entry.notified = kind;
@@ -784,26 +979,98 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     resolve();
   }
 
+  /** Release `drained()` callers whose prefix committed, or every caller once A or F blocks the head. */
+  function checkDrained(entry: Entry): void {
+    if (entry.drainWaiters.length === 0) return;
+    const blocked = retryView(entry.s);
+    const head = entry.s.queue[0];
+    const done = (through: number): boolean =>
+      entry.cell.entry === undefined ||
+      blocked?.kind === 'ambiguous' ||
+      blocked?.kind === 'failure' ||
+      head === undefined ||
+      head.ordinal > through;
+    const remaining = entry.drainWaiters.filter((waiter) => {
+      if (!done(waiter.through)) return true;
+      waiter.resolve();
+      return false;
+    });
+    entry.drainWaiters = remaining;
+  }
+
   function fault(sessionId: SessionId): IngressFault | undefined {
     const entry = sessions.get(sessionId);
-    const view = entry === undefined ? undefined : ingestionFault(entry.s);
+    if (entry === undefined) {
+      if (!retiredOverflow.has(sessionId)) return undefined;
+      const marker: IngestionFaultView = { kind: 'overflow', retryable: false, permanent: true };
+      return { sessionId, kind: 'overflow', permanent: true, stage: 'event', error: faultError(sessionId, marker) };
+    }
+    const view = ingestionFault(entry.s);
     if (view === undefined) return undefined;
+    const ordinal = view.ordinal;
+    const op = ordinal === undefined ? undefined : entry.s.queue.find((candidate) => candidate.ordinal === ordinal);
+    const runId = op === undefined || op.kind === 'closing' || op.kind === 'closed' ? undefined : op.runId;
     return {
       sessionId,
       kind: view.kind,
       permanent: view.permanent,
       ...(view.failureCount === undefined ? {} : { failureCount: view.failureCount }),
+      stage: op?.kind === 'terminal' ? 'completion' : 'event',
+      ...(runId === undefined ? {} : { runId }),
       error: faultError(sessionId, view),
     };
   }
 
   function faults(): readonly IngressFault[] {
-    return [...sessions.keys()]
+    return [...new Set([...sessions.keys(), ...retiredOverflow])]
       .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
       .flatMap((sessionId) => {
         const found = fault(sessionId);
         return found === undefined ? [] : [found];
       });
+  }
+
+  /**
+   * A close that could not finish now: phase-tagged failures of the cleanup
+   * calls that failed, and what it is still waiting for. Always retryable.
+   */
+  function closeError(entry: Entry, failed: readonly CleanupPhase[], pending?: ClosePending): AgentRuntimeError {
+    const sessionId = entry.s.sessionId;
+    const failures = failed.flatMap((phase) => {
+      const failure = entry.cleanupErrors.get(phase);
+      return failure === undefined ? [] : [{ phase, ...failure }];
+    });
+    const code =
+      pending !== undefined || failed.some((phase) => phase !== 'release')
+        ? 'provider_unavailable'
+        : 'workspace_unavailable';
+    const error = agentError(
+      code,
+      pending === undefined
+        ? `session \`${sessionId}\` cleanup did not complete`
+        : `session \`${sessionId}\` close is waiting for ${PENDING_TEXT[pending]}; its cleanup continues when that settles and the same close can be retried`,
+      {
+        details: {
+          sessionId,
+          ...(pending === undefined ? {} : { pending }),
+          failures: failures.map(({ phase, error: failure }) => ({
+            phase: CLEANUP_PHASE_NAMES[phase],
+            error: failure,
+          })),
+        },
+      },
+    );
+    return new AgentRuntimeError(
+      error,
+      failures.length === 0
+        ? undefined
+        : {
+            cause: new AggregateError(
+              failures.map((failure) => failure.cause),
+              'session cleanup failed',
+            ),
+          },
+    );
   }
 
   function ensureReplayReady(sessionId: SessionId): void {
@@ -818,9 +1085,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
    * marked handled at once: it may reject (a fault) while the caller is still
    * waiting on the provider, and the caller observes it afterwards.
    */
-  function addWaiter(entry: Entry, ordinal: number): { promise: Promise<CommandReceipt>; cancel(): void } {
+  function addWaiter(entry: Entry, ordinal: number): { promise: Promise<CommandReceipt | undefined>; cancel(): void } {
     let waiter!: Waiter;
-    const promise = new Promise<CommandReceipt>((resolve, reject) => {
+    const promise = new Promise<CommandReceipt | undefined>((resolve, reject) => {
       waiter = { resolve, reject };
     });
     promise.catch(() => undefined);
@@ -849,15 +1116,32 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     for (const waiter of all) waiter.reject(error);
   }
 
-  /** A committed command slot hands its receipt to every attempt waiting for it. */
+  /**
+   * A committed command slot hands its receipt to every attempt waiting for it.
+   * Only shutdown's internal close commits its `session.closed` without one.
+   */
   function settleWaiters(entry: Entry, op: Operation<IngressPayload>, receipt: CommandReceipt | undefined): void {
     const list = entry.waiters.get(op.ordinal);
     if (list === undefined) return;
     entry.waiters.delete(op.ordinal);
     for (const waiter of list) {
-      if (receipt === undefined) waiter.reject(internal(`slot ${String(op.ordinal)} committed without a receipt`));
-      else waiter.resolve(receipt);
+      if (receipt === undefined && op.kind !== 'closed') {
+        waiter.reject(internal(`slot ${String(op.ordinal)} committed without a receipt`));
+      } else {
+        waiter.resolve(receipt);
+      }
     }
+  }
+
+  /**
+   * Wait for a queued operation (the open slot or the `session.closed` bundle)
+   * to commit. A fault at the blocking head rejects at once; an exact retry
+   * (`resume`) resubmits a proven-absent (F) head first.
+   */
+  function waitForSlot(entry: Entry, ordinal: number, resume: boolean): Promise<CommandReceipt | undefined> {
+    const waiter = addWaiter(entry, ordinal);
+    checkBlocked(entry, resume);
+    return waiter.promise;
   }
 
   /**
@@ -885,7 +1169,8 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const waiter = addWaiter(entry, ordinal);
     return new Promise<IngressCommandOutcome>((resolve, reject) => {
       waiter.promise.then((receipt) => {
-        resolve({ kind: 'receipt', receipt });
+        if (receipt === undefined) reject(internal(`slot ${String(ordinal)} committed without a receipt`));
+        else resolve({ kind: 'receipt', receipt });
       }, reject);
       invocation?.then(
         (result) => {
@@ -913,9 +1198,12 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
   // ---- runs and routing -------------------------------------------------------------
 
-  /** Drop the driver-side run once the reducer has retired it. */
+  /** Drop the driver-side run (handle, routes, sink, followers) once the reducer has retired it. */
   function syncRun(entry: Entry): void {
-    if (entry.run !== undefined && entry.s.run?.runId !== entry.run.runId) entry.run = undefined;
+    const run = entry.run;
+    if (run === undefined || entry.s.run?.runId === run.runId) return;
+    entry.run = undefined;
+    run.stopSupervision?.();
   }
 
   function currentRun(entry: Entry, fence: RunSinkFence): DriverRun | undefined {
@@ -999,10 +1287,18 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
   // ---- ingress --------------------------------------------------------------
 
+  /**
+   * A provider sink. It reaches its session only through the session's cell,
+   * which retirement empties: a stale sink then captures nothing and holds no
+   * session, handle, body or map, only its immutable fence.
+   */
   function sinkFor(entry: Entry, source: 'session' | RunSinkFence): ProviderEventSink {
+    const { cell } = entry;
     return Object.freeze({
       emit(input: Parameters<ProviderEventSink['emit']>[0]): void {
-        accept(entry, source, captureProviderEvent(input));
+        const current = cell.entry;
+        if (current === undefined) return;
+        accept(current, source, captureProviderEvent(input));
       },
     });
   }
@@ -1019,42 +1315,104 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       }
       schedule(entry);
     } else if (result.kind === 'refused') {
-      if (result.interrupt !== undefined) cleanupInterrupt(entry, result.interrupt);
+      // The reducer already claimed the run's one interrupt for this overflow.
+      if (result.interrupt !== undefined) void runCleanup(entry, { kind: 'attempt', phase: 'interrupt' });
       noteFault(entry);
     }
   }
 
-  /** Execute the reducer's overflow interrupt off the provider's call stack, handling both outcomes. */
-  function cleanupInterrupt(entry: Entry, runId: RunId): void {
-    const handle = entry.run?.runId === runId ? entry.run.handle : undefined;
-    const settle = (outcome: 'succeeded' | 'failed'): void => {
-      settleEffect(entry.s, { cleanup: 'interrupt', outcome });
-      mirrorInterrupt(entry);
-      schedule(entry);
-    };
-    track(
-      Promise.resolve()
-        .then(() => {
-          if (handle === undefined) throw internal(`run \`${runId}\` has no provider handle to interrupt`);
-          return handle.interrupt(OVERFLOW_INTERRUPT_REASON);
-        })
-        .then(
-          () => {
-            settle('succeeded');
-          },
-          () => {
-            settle('failed');
-          },
-        ),
+  // ---- cleanup execution -----------------------------------------------------------
+  //
+  // The reducer decides every cleanup call (`beginCleanup`, `settleEffect`); the
+  // driver only executes the step it is given and reports the outcome back,
+  // which yields the next step. Calls run off the caller's and the provider's
+  // stack, both outcomes are handled, and none of them waits for persistence.
+
+  /**
+   * Execute cleanup steps in order, starting with `step`, and resolve with the
+   * first step that is not an attempt: `stopped` (pending provider use, a call
+   * in flight elsewhere, or failed phases) or `complete`.
+   */
+  function runCleanup(entry: Entry, step: CleanupStep | undefined): Promise<CleanupStep | undefined> {
+    if (step?.kind !== 'attempt') return Promise.resolve(step);
+    const { phase } = step;
+    let finished!: () => void;
+    entry.cleanupCalls.set(
+      phase,
+      new Promise<void>((resolve) => {
+        finished = resolve;
+      }),
     );
+    const chain = Promise.resolve()
+      .then(() => cleanupCall(entry, phase))
+      .then(
+        (value: unknown) => recordCleanup(entry, phase, 'succeeded', value),
+        (error: unknown) => recordCleanup(entry, phase, 'failed', error),
+      )
+      .then((next) => {
+        finished();
+        return runCleanup(entry, next);
+      });
+    track(chain);
+    return chain;
   }
 
-  /** Follow-up of a fill: without an admitted close the only one is an overflow's deferred interrupt. */
-  function afterFill(entry: Entry, result: SettleResult, runId: RunId | undefined): void {
-    syncRun(entry);
-    if (result.next?.kind === 'attempt' && result.next.phase === 'interrupt' && runId !== undefined) {
-      cleanupInterrupt(entry, runId);
+  /** The provider or workspace effect of one cleanup phase. Any throw becomes a rejection, uninspected. */
+  function cleanupCall(entry: Entry, phase: CleanupPhase): Promise<unknown> {
+    if (phase === 'interrupt') {
+      const handle = entry.run?.handle;
+      if (handle === undefined)
+        throw internal(`session \`${entry.s.sessionId}\` has no provider run handle to interrupt`);
+      return handle.interrupt(entry.s.close === undefined ? OVERFLOW_INTERRUPT_REASON : CLOSE_INTERRUPT_REASON);
     }
+    const cleanup = entry.cleanup;
+    if (cleanup === undefined) throw internal(`session \`${entry.s.sessionId}\` has no cleanup handles`);
+    return phase === 'dispose' ? cleanup.dispose() : cleanup.release();
+  }
+
+  /** Report one cleanup call's outcome to the reducer and return the next step it allows. */
+  function recordCleanup(
+    entry: Entry,
+    phase: CleanupPhase,
+    outcome: 'succeeded' | 'failed',
+    value: unknown,
+  ): CleanupStep | undefined {
+    entry.cleanupCalls.delete(phase);
+    let recorded = outcome;
+    if (outcome === 'failed') {
+      entry.cleanupErrors.set(phase, cleanupFailure(phase, value));
+    } else if (phase === 'release') {
+      let report: ReturnType<typeof WorkspaceReleaseReportSchema.safeParse> | undefined;
+      try {
+        report = WorkspaceReleaseReportSchema.safeParse(value);
+      } catch {
+        report = undefined;
+      }
+      if (report?.success === true) {
+        entry.releaseReport = report.data;
+        entry.cleanupErrors.delete(phase);
+      } else {
+        recorded = 'failed';
+        entry.cleanupErrors.set(phase, {
+          error: agentError('workspace_unavailable', 'workspace release produced no valid release report'),
+          cause: value,
+        });
+      }
+    } else {
+      entry.cleanupErrors.delete(phase);
+    }
+    const settled = settleEffect(entry.s, { cleanup: phase, outcome: recorded });
+    if (phase === 'interrupt') mirrorInterrupt(entry);
+    if (phase !== 'release') applyDeferredCompletion(entry);
+    noteFault(entry);
+    schedule(entry);
+    return settled.next;
+  }
+
+  /** Follow-up of a fill: an overflow's deferred interrupt, or the cleanup an admitted close may now continue. */
+  function afterFill(entry: Entry, result: SettleResult): void {
+    syncRun(entry);
+    if (result.next?.kind === 'attempt') void runCleanup(entry, result.next);
     noteFault(entry);
     schedule(entry);
   }
@@ -1084,6 +1442,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       interruptRejection: undefined,
       routes: new Map(),
       refs: new Map(),
+      closeAt: undefined,
+      deferredCompletion: undefined,
+      stopSupervision: undefined,
     };
     return { kind: 'reserved', ordinal: result.ordinal, sink };
   }
@@ -1107,7 +1468,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         attempt: run.attempt,
       };
       result = settleEffect(entry.s, { ordinal, outcome: { kind: 'applied', result: start } });
-      supervise(entry, run.runId, outcome.run);
+      supervise(entry, run, outcome.run);
     } else if (classifyEffectFailure(outcome.error) === 'unknown') {
       // The provider may or may not have started the run. The slot stays unresolved at its
       // ordinal and the run record stays starting (S): no handle, no supervision, its staged
@@ -1120,7 +1481,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       result = settleEffect(entry.s, { ordinal, outcome: { kind: 'rejected', result: { kind: 'receipt', receipt } } });
     }
     if (result.kind === 'refused') return 'stale';
-    afterFill(entry, result, run.runId);
+    afterFill(entry, result);
     return 'filled';
   }
 
@@ -1185,9 +1546,14 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return invocation;
   }
 
-  /** Observe the provider completion with fulfilment and rejection handlers. */
-  function supervise(entry: Entry, runId: RunId, handle: ProviderRun): void {
+  /**
+   * Observe the provider completion with fulfilment and rejection handlers.
+   * `quiesce` waits for it until it is handled or its run is retired (a close
+   * fallback terminal retires a run whose provider never completes).
+   */
+  function supervise(entry: Entry, run: DriverRun, handle: ProviderRun): void {
     const sessionId = entry.s.sessionId;
+    const { runId } = run;
     let completion: Promise<unknown>;
     try {
       completion = Promise.resolve(handle.completion);
@@ -1195,7 +1561,12 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       completeRun(sessionId, runId, { kind: 'rejected', error });
       return;
     }
-    completion.then(
+    let stop!: () => void;
+    const stopped = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    run.stopSupervision = stop;
+    const handled = completion.then(
       (value) => {
         completeRun(sessionId, runId, { kind: 'resolved', value });
       },
@@ -1203,6 +1574,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         completeRun(sessionId, runId, { kind: 'rejected', error });
       },
     );
+    const observed: Promise<void> = Promise.race([handled, stopped]).finally(() => {
+      supervision.delete(observed);
+    });
+    supervision.add(observed);
   }
 
   /** Parse and stamp the provider's terminal input once, exactly as the live runtime words it. */
@@ -1236,6 +1611,33 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const entry = sessions.get(sessionId);
     if (entry === undefined) return;
     const termination = stamp(completion);
+    const run = entry.run;
+    if (
+      run?.runId === runId &&
+      entry.s.run?.runId === runId &&
+      entry.s.run.terminal === undefined &&
+      closeEnding(entry)
+    ) {
+      // Close's own interrupt or disposal call is in flight: a provider may complete in
+      // answer to it before the call itself returns. Observe the outcome once that call
+      // settles, so the close records that it ended an active run (its fallback terminal
+      // wins, as the pre-#43 runtime's close did); if the call fails, this completion is
+      // used instead.
+      run.deferredCompletion ??= termination;
+      return;
+    }
+    chooseCompletion(entry, runId, termination);
+  }
+
+  /** An admitted close's own interrupt or disposal call is in flight. */
+  function closeEnding(entry: Entry): boolean {
+    const close = entry.s.close;
+    const record = entry.s.run;
+    if (close === undefined) return false;
+    return (record?.interrupt === 'in-flight' && record.interruptOwner === 'cleanup') || close.dispose === 'in-flight';
+  }
+
+  function chooseCompletion(entry: Entry, runId: RunId, termination: RunTermination): void {
     // A stale or duplicate completion is ignored by the reducer: exactly one terminal per run.
     chooseTerminal(entry.s, {
       runId,
@@ -1244,6 +1646,15 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       detail: { kind: 'termination', termination },
     });
     schedule(entry);
+  }
+
+  /** Apply a completion deferred behind close's interrupt or disposal once neither call is in flight. */
+  function applyDeferredCompletion(entry: Entry): void {
+    const run = entry.run;
+    const deferred = run?.deferredCompletion;
+    if (run === undefined || deferred === undefined || closeEnding(entry)) return;
+    run.deferredCompletion = undefined;
+    chooseCompletion(entry, run.runId, deferred);
   }
 
   // ---- command admission and effect calls ---------------------------------------------
@@ -1394,11 +1805,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     outcome: EffectOutcome<IngressPayload>,
     mirror = true,
   ): Invocation {
-    const runId = entry.s.run?.runId;
     const op = entry.s.queue.find((candidate) => candidate.ordinal === ordinal);
     const result = settleEffect(entry.s, { ordinal, outcome });
     if (result.kind === 'refused') return 'stale';
-    afterFill(entry, result, runId);
+    afterFill(entry, result);
     if (mirror && op?.kind === 'effect' && op.effect === 'interrupt') mirrorInterrupt(entry);
     return outcome.kind === 'unknown' ? 'unknown' : 'filled';
   }
@@ -1834,19 +2244,100 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     }
   }
 
+  /** `session.state_changed → closing`, unless the session already is closing. */
+  function materializeClosing(tx: StoreTransaction, sessionId: SessionId): void {
+    const state = tx.session(sessionId).session.state;
+    if (state !== 'closing')
+      tx.emit({ sessionId, payload: { type: 'session.state_changed', from: state, to: 'closing' } });
+  }
+
+  /**
+   * `session.closed` with the release report of the confirmed release, and the
+   * close command's applied receipt (shutdown's internal close records none).
+   * `interruptedActiveRun` is the reducer's accumulated close fact.
+   */
+  function materializeClosed(tx: StoreTransaction, entry: Entry, op: ClosedOperation): void {
+    const sessionId = entry.s.sessionId;
+    const report = entry.releaseReport;
+    if (report === undefined) throw internal(`session \`${sessionId}\` would close without a release report`);
+    const closed = tx.emit({
+      sessionId,
+      payload: { type: 'session.closed', reason: 'requested', workspaceRelease: report },
+    });
+    const identity = op.identity;
+    if (identity === undefined) return;
+    tx.recordReceipt(identity.commandId, {
+      fingerprint: identity.fingerprint,
+      receipt: CommandReceiptSchema.parse({
+        commandId: identity.commandId,
+        commandType: 'close_session',
+        disposition: 'applied',
+        result: { type: 'session_closed', sessionId, interruptedActiveRun: op.interruptedActiveRun },
+        sequence: closed.sequence,
+        acceptedAt: identity.acceptedAt,
+      }),
+    });
+  }
+
+  /**
+   * The close-selected terminal (close proved the provider run ended): the run
+   * moves to `interrupting` if it is not already, still-pending interactions
+   * are cancelled, then `run.finished` (`interrupted`, reason `session closing`)
+   * and `turn.settled` (`cancelled`), exactly as the pre-#43 close fallback
+   * recorded them. Its timestamp is stamped once and reused by a retried head.
+   */
+  function materializeCloseTerminal(tx: StoreTransaction, entry: Entry, op: TerminalOperation<IngressPayload>): void {
+    const sessionId = entry.s.sessionId;
+    const { runId, turnId } = op;
+    let view = tx.session(sessionId);
+    const run = view.runs.get(runId);
+    if (run === undefined || run.termination !== undefined) return;
+    const driverRun = entry.run?.runId === runId ? entry.run : undefined;
+    const at = driverRun === undefined ? clock.now() : (driverRun.closeAt ??= clock.now());
+    if (run.state !== 'interrupting' && canTransition(RUN_STATE_TABLE, run.state, 'interrupting')) {
+      tx.emit({ sessionId, runId, payload: { type: 'run.state_changed', from: run.state, to: 'interrupting' } });
+      view = tx.session(sessionId);
+    }
+    for (const interactionId of run.pendingInteractionIds) {
+      const interaction = view.interactions.get(interactionId);
+      if (interaction === undefined || interaction.status === 'settled') continue;
+      tx.emit({
+        sessionId,
+        runId,
+        payload: {
+          type: 'interaction.settled',
+          interactionId,
+          turnId: interaction.turnId,
+          settlement: { outcome: 'cancelled', settledAt: at },
+        },
+      });
+    }
+    tx.emit({
+      sessionId,
+      runId,
+      payload: {
+        type: 'run.finished',
+        turnId,
+        termination: { outcome: 'interrupted', at, reason: CLOSE_INTERRUPT_REASON },
+      },
+    });
+    tx.emit({ sessionId, payload: { type: 'turn.settled', turnId, state: 'cancelled' } });
+  }
+
   /**
    * The run's terminal bundle: cancellations of still-pending interactions,
    * `run.finished`, then `turn.settled`, validated against the run state at
    * this ordinal. The frozen intent decides the outcome (an overflow may have
    * failed an unsubmitted success); the frozen timestamp stamps every event.
+   * A close admitted while this terminal was placed but not yet submitted puts
+   * `closing` first in the same bundle (`closingFirst`).
    */
-  function materializeTerminal(
-    tx: StoreTransaction,
-    sessionId: SessionId,
-    op: TerminalOperation<IngressPayload>,
-  ): void {
-    if (op.closingFirst || op.intent.cause !== 'completion') {
-      throw internal('session close is not integrated with provider ingress yet (surface 4)');
+  function materializeTerminal(tx: StoreTransaction, entry: Entry, op: TerminalOperation<IngressPayload>): void {
+    const sessionId = entry.s.sessionId;
+    if (op.closingFirst) materializeClosing(tx, sessionId);
+    if (op.intent.cause === 'close') {
+      materializeCloseTerminal(tx, entry, op);
+      return;
     }
     const detail = op.intent.detail;
     if (detail?.kind !== 'termination') throw internal('a completion terminal must carry its termination');
@@ -1897,7 +2388,8 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     });
   }
 
-  function materialize(tx: StoreTransaction, sessionId: SessionId, op: Operation<IngressPayload>): void {
+  function materialize(tx: StoreTransaction, entry: Entry, op: Operation<IngressPayload>): void {
+    const sessionId = entry.s.sessionId;
     switch (op.kind) {
       case 'body':
         materializeBody(tx, sessionId, op);
@@ -1906,11 +2398,14 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         materializeEffect(tx, sessionId, op);
         return;
       case 'terminal':
-        materializeTerminal(tx, sessionId, op);
+        materializeTerminal(tx, entry, op);
         return;
       case 'closing':
+        materializeClosing(tx, sessionId);
+        return;
       case 'closed':
-        throw internal('session close is not integrated with provider ingress yet (surface 4)');
+        materializeClosed(tx, entry, op);
+        return;
     }
   }
 
@@ -1959,7 +2454,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       ({ events } = await store.commit((tx) => {
         witness.ran = true;
         try {
-          materialize(recording(tx, witness), sessionId, op);
+          materialize(recording(tx, witness), entry, op);
         } catch (error) {
           witness.threw = true;
           throw error;
@@ -1974,12 +2469,53 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const last = events.at(-1);
     if (last !== undefined) entry.lastSequence = last.sequence;
     if (advanced.publish && events.length > 0) hub.publish(sessionId, events);
+    return afterCommit(entry, op, witness.receiptValue);
+  }
+
+  /**
+   * After a head committed (acknowledged, or proven applied by reconciliation):
+   * retire settled routes and the run, hand the receipt to its waiters, release
+   * the command claim and lifecycle identity, and retire a closed session.
+   * Returns whether the chain may continue.
+   */
+  function afterCommit(entry: Entry, op: Operation<IngressPayload>, receipt: CommandReceipt | undefined): boolean {
     retireSettled(entry, op);
     syncRun(entry);
-    settleWaiters(entry, op, witness.receiptValue);
+    settleWaiters(entry, op, receipt);
     releaseClaim(entry, op);
+    if (op.kind === 'effect' && op.effect === 'open') releaseLifecycle(entry, op.identity.commandId);
     noteFault(entry);
-    return true;
+    if (op.kind !== 'closed') return true;
+    entry.closed = { receipt };
+    retireSession(entry);
+    return false;
+  }
+
+  function releaseLifecycle(entry: Entry, commandId: CommandId): void {
+    if (lifecycle.get(commandId)?.sessionId === entry.s.sessionId) lifecycle.delete(commandId);
+  }
+
+  /**
+   * Drop a closed (or discarded) session. Only a permanent overflow marker
+   * survives; every sink of the session is cut off from it, and the caller is
+   * told so it can drop its own provider session and lease references.
+   */
+  function retireSession(entry: Entry): void {
+    const sessionId = entry.s.sessionId;
+    if (retire(entry.s)?.overflow === true) retiredOverflow.add(sessionId);
+    if (sessions.get(sessionId) === entry) sessions.delete(sessionId);
+    entry.cell.entry = undefined;
+    checkDrained(entry);
+    const run = entry.run;
+    entry.run = undefined;
+    run?.stopSupervision?.();
+    entry.cleanup = undefined;
+    entry.releaseReport = undefined;
+    entry.cleanupErrors.clear();
+    entry.invocations.clear();
+    entry.waiters.clear();
+    for (const [commandId, held] of lifecycle) if (held.sessionId === sessionId) lifecycle.delete(commandId);
+    options.retired?.(sessionId);
   }
 
   async function rejected(
@@ -2023,12 +2559,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       if (last !== undefined) entry.lastSequence = last.sequence;
       // Publish the read-back envelopes once; never append another copy.
       if (result.publish && envelopes.length > 0) hub.publish(entry.s.sessionId, envelopes);
-      retireSettled(entry, op);
-      syncRun(entry);
-      settleWaiters(entry, op, witness.receiptValue);
-      releaseClaim(entry, op);
-      noteFault(entry);
-      return true;
+      return afterCommit(entry, op, witness.receiptValue);
     }
     noteFault(entry);
     failWaiters(entry);
@@ -2153,6 +2684,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   function retry(sessionId: SessionId): Promise<void> {
     const entry = sessions.get(sessionId);
     if (entry === undefined) {
+      // A retired session keeps only its overflow marker: nothing is left to drain.
+      const marker = fault(sessionId);
+      if (marker !== undefined) return Promise.reject(new AgentRuntimeError(marker.error));
       return Promise.reject(new AgentRuntimeError(agentError('unknown_session', `unknown session \`${sessionId}\``)));
     }
     const s = entry.s;
@@ -2187,11 +2721,71 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
   async function quiesce(): Promise<void> {
     throwIfFaulted();
-    for (let pass = 0; pass < 100 && pending.size > 0; pass += 1) {
-      await Promise.race([Promise.allSettled([...pending]), faultSignal]);
+    for (let pass = 0; pass < 100 && (pending.size > 0 || supervision.size > 0); pass += 1) {
+      await Promise.race([Promise.allSettled([...pending, ...supervision]), faultSignal]);
       throwIfFaulted();
     }
     throwIfFaulted();
+  }
+
+  // ---- close ------------------------------------------------------------------
+
+  async function closeSession(
+    sessionId: SessionId,
+    input: Readonly<{ identity?: CommandIdentity; ifRunActive: 'interrupt' | 'reject'; resume: boolean }>,
+  ): Promise<CloseOutcome> {
+    const entry = sessions.get(sessionId);
+    if (entry === undefined) return { kind: 'refused', reason: 'session-ended' };
+    const request = {
+      ...(input.identity === undefined ? {} : { identity: input.identity }),
+      ifRunActive: input.ifRunActive,
+    };
+    // Admission is synchronous and fences the session ahead of any queued work.
+    const admitted = beginCleanup(entry.s, request);
+    if (admitted.kind !== 'cleanup') return admitted;
+    const identity = entry.s.close?.identity;
+    if (identity !== undefined) {
+      lifecycle.set(identity.commandId, {
+        sessionId,
+        fingerprint: identity.fingerprint,
+        acceptedAt: identity.acceptedAt,
+      });
+    }
+    // `closing` (or a terminal now carrying it) may be committable at once.
+    schedule(entry);
+    let step = await runCleanup(entry, admitted.step);
+    // A cleanup call another attempt (or a late start's continuation) has in flight
+    // is this close's own effect: wait for it, a bounded number of times, then go on.
+    for (let waits = 0; step?.kind === 'stopped' && step.pending === 'in-flight' && waits < 3; waits += 1) {
+      await Promise.allSettled([...entry.cleanupCalls.values()]);
+      if (sessions.get(sessionId) !== entry) return retiredOutcome(entry);
+      const again = beginCleanup(entry.s, request);
+      if (again.kind !== 'cleanup') return again;
+      step = await runCleanup(entry, again.step);
+    }
+    // The cleanup chain may already have committed `session.closed` and retired the session.
+    if (sessions.get(sessionId) !== entry) return retiredOutcome(entry);
+    if (step === undefined) throw internal(`session \`${sessionId}\` close produced no cleanup step`);
+    if (step.kind === 'stopped') {
+      if (step.pending === 'start') throw closeError(entry, step.failed, 'start');
+      if (step.pending === 'effect') throw closeError(entry, step.failed, 'response');
+      if (step.pending === 'in-flight') throw closeError(entry, step.failed, 'cleanup');
+      throw closeError(entry, step.failed);
+    }
+    if (step.kind !== 'complete') throw internal(`session \`${sessionId}\` close stopped on an unexecuted step`);
+    // Disposal and release succeeded. The run's terminal still waits for an unresolved
+    // `interrupt_run` outcome: only its owning command can resolve it.
+    if (step.closed === 'awaiting-history') throw closeError(entry, [], 'interrupt');
+    const closed = entry.s.queue.find((op) => op.kind === 'closed');
+    if (closed === undefined) return retiredOutcome(entry);
+    const receipt = await waitForSlot(entry, closed.ordinal, input.resume);
+    return { kind: 'closed', receipt };
+  }
+
+  /** The outcome for a close attempt whose session closed (and retired) while it ran. */
+  function retiredOutcome(entry: Entry): CloseOutcome {
+    const closed = entry.closed;
+    return closed === undefined ? { kind: 'refused', reason: 'session-ended' } : { kind: 'closed', ...closed };
   }
 
   // ---- surface ----------------------------------------------------------------
@@ -2199,8 +2793,16 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   return {
     openSession(sessionId, identity) {
       if (sessions.has(sessionId)) throw internal(`provider ingress for session \`${sessionId}\` already exists`);
+      const cell: SinkCell = { entry: undefined };
       const entry: Entry = {
         s: createSessionIngestion<IngressPayload>(sessionId, identity),
+        cell,
+        cleanup: undefined,
+        releaseReport: undefined,
+        cleanupErrors: new Map(),
+        cleanupCalls: new Map(),
+        closed: undefined,
+        drainWaiters: [],
         chain: undefined,
         scheduled: false,
         retrying: undefined,
@@ -2211,7 +2813,13 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         waiters: new Map(),
         invocations: new Map(),
       };
+      cell.entry = entry;
       sessions.set(sessionId, entry);
+      lifecycle.set(identity.commandId, {
+        sessionId,
+        fingerprint: identity.fingerprint,
+        acceptedAt: identity.acceptedAt,
+      });
       return sinkFor(entry, 'session');
     },
 
@@ -2227,10 +2835,75 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       if (result.kind === 'refused') throw internal(`session \`${sessionId}\` has no pending open reservation`);
       if (result.kind === 'discarded') {
         // No owner ever existed: drop the unowned sink and any marker it set.
-        sessions.delete(sessionId);
+        retireSession(entry);
         return;
       }
+      if (outcome.kind === 'applied' && outcome.cleanup !== undefined) entry.cleanup = outcome.cleanup;
       schedule(entry);
+    },
+
+    openOutcome(sessionId, resume) {
+      const entry = sessions.get(sessionId);
+      if (entry?.s.state !== 'opening' || entry.s.queue[0]?.ordinal !== 0) return Promise.resolve(undefined);
+      return waitForSlot(entry, 0, resume);
+    },
+
+    closeSession,
+
+    drained(sessionId) {
+      const entry = sessions.get(sessionId);
+      if (entry === undefined) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        entry.drainWaiters.push({ through: entry.s.nextOrdinal - 1, resolve });
+        checkDrained(entry);
+      });
+    },
+
+    commandIdentity(commandId) {
+      const claim = claims.get(commandId);
+      if (claim !== undefined) {
+        return { sessionId: claim.sessionId, fingerprint: claim.fingerprint, acceptedAt: claim.acceptedAt };
+      }
+      return lifecycle.get(commandId);
+    },
+
+    liveSessions: () => [...sessions.keys()].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+
+    knows: (sessionId) => sessions.has(sessionId) || retiredOverflow.has(sessionId),
+
+    totals() {
+      let runs = 0;
+      let startingRuns = 0;
+      let routes = 0;
+      let withdrawals = 0;
+      let waiters = 0;
+      let invocations = 0;
+      let closing = 0;
+      for (const entry of sessions.values()) {
+        if (entry.run !== undefined) runs += 1;
+        if (entry.s.run !== undefined && entry.s.run.start !== 'committed') startingRuns += 1;
+        routes += entry.run?.routes.size ?? 0;
+        for (const op of entry.s.queue) {
+          if (op.kind === 'body' && op.role === 'withdrawal') withdrawals += 1;
+        }
+        for (const list of entry.waiters.values()) waiters += list.length;
+        invocations += entry.invocations.size;
+        if (entry.s.close !== undefined && entry.s.state !== 'closed') closing += 1;
+      }
+      return {
+        sessions: sessions.size,
+        runs,
+        startingRuns,
+        routes,
+        withdrawals,
+        waiters,
+        invocations,
+        claims: claims.size,
+        lifecycleClaims: lifecycle.size,
+        closing,
+        retiredMarkers: retiredOverflow.size,
+        supervised: supervision.size,
+      };
     },
 
     reserveRun: (sessionId, input) => reserveRun(requireEntry(sessionId), input),

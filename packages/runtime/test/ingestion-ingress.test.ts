@@ -3,12 +3,11 @@
  * through the private ingress seam (`src/ingress.ts`), driven against the real
  * in-memory store, the real subscription hub and captured provider sinks.
  *
- * `createAgentRuntime` does not route through this seam yet: cleanup
- * (surface 4) still commits directly, so a partial cutover would leave an
- * observable FIFO bypass. These tests therefore prove the seam that the atomic
- * cutover will install, not live runtime behavior. Starts and terminals here
- * use the surface 3 materialization (`settleStart`, `completeRun`); surface 3's
- * own proofs are in `ingestion-commands.test.ts`.
+ * Since surface 4 `createAgentRuntime` routes everything through this seam;
+ * these tests drive the seam directly for fine-grained control, and
+ * `runtime-cutover.test.ts` proves the same rules through the public runtime.
+ * Starts and terminals here use the surface 3 materialization (`settleStart`,
+ * `completeRun`); surface 3's own proofs are in `ingestion-commands.test.ts`.
  *
  * Scheduling is controlled with deferred store commits and reads. No test
  * sleeps or asserts elapsed time; "promptly" means a promise settles while

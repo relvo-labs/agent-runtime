@@ -92,6 +92,36 @@ export type CommitResult = {
   readonly events: readonly EventEnvelope[];
 };
 
+/**
+ * A store adapter's explicit, self-asserted declaration of the guarantees it
+ * provides. Version 1 has two levels:
+ *
+ * - `baseline`: each `commit` applies atomically (session, events, projection
+ *   and receipts all or nothing), allocates gapless per-session sequences,
+ *   folds with `applyEvent` and fails closed, isolates every value it accepts
+ *   or returns, and answers receipts (including rejections) by command ID.
+ * - `strong`: `baseline`, plus a commit whose promise rejected is never applied
+ *   later, and a read issued after that rejection observes every commit
+ *   applied before it (linearizable read-after-failure).
+ *
+ * Provider ingestion acts only on `{ version: 1, level: 'strong' }`: only then
+ * may it read back a rejected commit to prove it applied or absent and resubmit
+ * a proven-absent one. Anything else, including no declaration, `baseline`, an
+ * unknown version, a malformed value or a property that throws when read, is
+ * treated as unverified: a rejected commit leaves that session's history
+ * permanently uncertified and is never resubmitted. The declaration is read
+ * again each time it matters, so replacing it changes later decisions only.
+ *
+ * The runtime cannot verify a declaration. Declaring `strong` is a promise the
+ * adapter (or the host that wraps it) makes and is responsible for keeping.
+ * A store returned by `createInMemoryStore` carries no declaration: it is
+ * trusted implicitly, and only while its contract members are unmodified.
+ */
+export type RuntimeStoreContract = {
+  readonly version: 1;
+  readonly level: 'baseline' | 'strong';
+};
+
 export type RuntimeStore = {
   readonly revision: number;
   commit<T>(mutate: (tx: StoreTransaction) => T): Promise<{ value: T } & CommitResult>;
@@ -100,7 +130,25 @@ export type RuntimeStore = {
   readInteraction(sessionId: SessionId, interactionId: InteractionId): Promise<AgentInteraction | undefined>;
   findReceipt(commandId: CommandId): Promise<ReceiptRecord | undefined>;
   listSessions(): Promise<readonly SessionId[]>;
+  /** Optional, additive: the guarantees this adapter declares. See `RuntimeStoreContract`. */
+  readonly contract?: RuntimeStoreContract;
 };
+
+/**
+ * @internal Whether `store` explicitly declares the version 1 `strong` contract
+ * right now. Read defensively: a throwing accessor, a revoked proxy or any
+ * malformed value is simply not a declaration. Not exported from the package
+ * entry point.
+ */
+export function declaresStrongContract(store: RuntimeStore): boolean {
+  try {
+    const declared: unknown = Reflect.get(store, 'contract');
+    if (typeof declared !== 'object' || declared === null) return false;
+    return Reflect.get(declared, 'version') === 1 && Reflect.get(declared, 'level') === 'strong';
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // In-memory implementation
@@ -165,8 +213,8 @@ type BuiltInMembers = Readonly<{
  * created with. Provider ingestion recognizes such a store as meeting the strong
  * store contract (a settled commit rejection never applies later, and a read
  * after it is linearizable) only while those members are unchanged. Every other
- * `RuntimeStore` is treated as unverified until surface 4 adds a public
- * declaration (issue #43).
+ * `RuntimeStore`, including a modified built-in one, is unverified unless it
+ * carries an explicit `contract` declaration (issue #43).
  */
 const builtInStores = new WeakMap<RuntimeStore, BuiltInMembers>();
 

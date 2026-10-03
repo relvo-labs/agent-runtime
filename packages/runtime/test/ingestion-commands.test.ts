@@ -4,10 +4,9 @@
  * private ingress seam (`src/ingress.ts`), against the real in-memory store,
  * the real subscription hub and fake provider handles.
  *
- * `createAgentRuntime` does not route through this seam yet: close and
- * shutdown (surface 4) still commit directly, so wiring these commands alone
- * would leave an observable FIFO bypass. These tests prove the seam the atomic
- * cutover will install, not live runtime behavior.
+ * Since surface 4 `createAgentRuntime` routes every command through this seam;
+ * these tests drive the seam directly for fine-grained control, and
+ * `runtime-cutover.test.ts` proves the cutover through the public runtime.
  *
  * Determinism: every provider call returns a deferred promise the test settles
  * explicitly; store commits, acknowledgements and reconciliation reads are held
