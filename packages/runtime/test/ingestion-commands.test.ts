@@ -1391,6 +1391,53 @@ describe('S3 interrupt_run reservation', () => {
     expect(types(await value.history(sessionId))).not.toContain('run.state_changed');
   });
 
+  // Maintainer decision A (plan, design commit 6b0e8b1): a definite rejection resolves the shared
+  // interrupt and rolls back its fence. Only its exact retry replays it; a new command id is a new
+  // interrupt that reaches the provider, so the run can still be interrupted.
+  it('after a definite interrupt rejection the exact retry replays its receipt, while a fresh command interrupts again and is not mirrored', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    turn.run.interruptMode = 'reject';
+    const rejectedCommand = value.interruptCommand(sessionId, turn.runId);
+    const rejected = receiptOf(await value.interrupt(sessionId, rejectedCommand));
+    expect(rejected).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'provider_rejected', message: 'interrupt refused' },
+    });
+    await value.driver.settled();
+    const state = value.driver.inspect(sessionId);
+    expect(state === undefined ? undefined : runFenced(state)).toBe(false);
+    expect(turn.run.interrupts).toEqual(['stop']);
+
+    // (a) The exact retry returns the same committed rejected receipt without calling the provider.
+    turn.run.interruptMode = 'resolve';
+    expect(receiptOf(await value.interrupt(sessionId, rejectedCommand))).toEqual(rejected);
+    expect(turn.run.interrupts).toEqual(['stop']);
+
+    // (b) A fresh command id is a new interrupt: it calls the provider again, fences the run and
+    // records `interrupting`.
+    const freshCommand = value.interruptCommand(sessionId, turn.runId, 'again');
+    const fresh = receiptOf(await value.interrupt(sessionId, freshCommand));
+    expect(turn.run.interrupts).toEqual(['stop', 'again']);
+    // (c) The earlier rejection is not mirrored to it.
+    expect(fresh).toMatchObject({
+      commandId: freshCommand.commandId,
+      disposition: 'applied',
+      result: { type: 'run_interrupt_requested', runId: turn.runId, delivered: true },
+    });
+    expect(fresh).not.toHaveProperty('error');
+    await value.driver.settled();
+    const after = value.driver.inspect(sessionId);
+    expect(after === undefined ? undefined : runFenced(after)).toBe(true);
+    const changes = (await value.history(sessionId)).filter((event) => event.payload.type === 'run.state_changed');
+    expect(changes.map((event) => event.payload)).toEqual([
+      { type: 'run.state_changed', from: 'running', to: 'interrupting' },
+    ]);
+    expect((await value.base.findReceipt(freshCommand.commandId))?.receipt).toEqual(fresh);
+    expect((await value.base.findReceipt(rejectedCommand.commandId))?.receipt).toEqual(rejected);
+  });
+
   it('a second interrupt while one is in flight waits for the shared interrupt and mirrors its delivery, without reaching the provider', async () => {
     const value = fixture();
     const { sessionId } = await value.open();
