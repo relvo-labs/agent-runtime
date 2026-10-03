@@ -65,7 +65,13 @@ Decision (which could leave replay apparently complete) would no longer apply.
 The overflow marker survives close for the runtime lifetime, even when close
 returns a truthful cleanup receipt. No claim is made about a byte/memory limit:
 one valid JSON body may be large. If session creation fails before an owner exists,
-discard its inactive sink without manufacturing a session fault.
+discard its inactive sink without manufacturing a session fault. If a run start
+rejects after staging, discard only that run sink's provisional bodies and
+release their charged capacity; roll back O caused *solely* by that unowned
+staging, but keep an independent session-sink F/O. A late successful start
+must be committed before any of its retained run events, even if a close has
+already fenced admission. The provider handle may be disposed safely while
+the start/ingress store head is faulted, but close receipts cannot bypass it.
 
 Review/implementation proof: emit 257 events before activation and assert the
 accepted prefix plus permanent O, not just a warning; emit 1,024 bodies across

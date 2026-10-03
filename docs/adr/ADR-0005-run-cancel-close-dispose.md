@@ -77,6 +77,11 @@ an unresolved start or disposal, because a provider may still use that lease.
 This is a narrow exception to the current attempt-all wording above: attempt
 every *safe independent* phase (e.g. disposal after a failed interrupt), retain
 phase-tagged failures and retry only failures, but never release before disposal.
+Provider interrupt/dispose, followed by lease release on confirmed disposal, are
+**independent of FIFO persistence**: a permanently failing event/start commit
+must not starve safe cleanup. The accepted prefix, run terminal, `session.closed`
+and successful close receipt remain blocked in their original log order until
+persistence is reconciled; cleanup effects alone never certify close success.
 After a never-settling start, repeated close/shutdown calls remain promptly
 retryable, with no false terminal, receipt or lease-release claim. A permanent
 ingestion overflow does not prevent a successful **cleanup** receipt once the
