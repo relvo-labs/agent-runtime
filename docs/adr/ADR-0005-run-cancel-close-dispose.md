@@ -78,10 +78,16 @@ A permanent overflow (O) does not prevent a successful close, and the session ke
 overflow marker afterwards. A retryable failure (F) blocks the receipt until it is retried.
 A permanently ambiguous commit (A) blocks it for good, although the cleanup effects still
 run. If an open's provider session or lease exists but the open was never filled, rollback
-also disposes first and releases only after a confirmed disposal.
+also disposes first and releases only after a confirmed disposal. While the runtime still
+owns a session whose `session.closed` commit is unconfirmed, a close is answered by that
+ownership, not by the store's receipt or closed state: under A the exact retry and any other
+close ID fail closed with the non-retryable fault, and no cleanup effect is repeated.
 
 Runtime shutdown is memoized per attempt. Its first call synchronously closes mutation
-admission and fences every live session with shutdown's internal close. That close neither
+admission to new work and fences every live session with shutdown's internal close. A
+command ID that still holds an unresolved identity, such as an `interrupt_run` with an
+unknown outcome, is still admitted for its owner's exact retry: only that retry can
+resolve it, and shutdown cannot succeed until it is resolved. That close neither
 looks up nor records a caller receipt, so a caller cannot reserve a synthetic ID and
 suppress cleanup. It resumes a proven-unapplied (F) head, retries retained open rollbacks,
 and never waits on an unresolved provider promise. A blocked session is reported

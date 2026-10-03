@@ -408,6 +408,21 @@ export type IngressRefusal = RefusalReason | 'interaction-unrouted' | 'interacti
 export type IngressCommandOutcome =
   Readonly<{ kind: 'receipt'; receipt: CommandReceipt }> | Readonly<{ kind: 'refused'; reason: IngressRefusal }>;
 
+/**
+ * What a command saw when it was invoked, taken synchronously before any
+ * runtime queue or await (`IngressDriver.witness`). Public admission serializes
+ * same-ID and same-session commands, so by the time a command is admitted the
+ * provider call it was concurrent with may already have settled; the witness
+ * keeps that call's outcome reachable, so the command shares it instead of
+ * calling the provider again. Opaque outside this module.
+ */
+export type AdmissionWitness = Readonly<{
+  /** This command ID's own provider call that was in flight at invocation. */
+  own: Readonly<{ sessionId: SessionId; ordinal: number; invocation: Promise<Invocation> }> | undefined;
+  /** The run's command-owned interrupt that was in flight or unknown at invocation (`interrupt_run` only). */
+  interrupt: InterruptAttempt | undefined;
+}>;
+
 export type SubmitTurnInput = Readonly<{
   command: SubmitTurnCommand;
   acceptedAt: Timestamp;
@@ -492,7 +507,8 @@ export type IngressDriver = {
   /** `submit_turn`: reserve, call `startRun`, fill the same slot, resolve when it commits. */
   submitTurn(
     sessionId: SessionId,
-    input: SubmitTurnInput & Readonly<{ startRun: (request: ProviderRunRequest) => Promise<ProviderRun> }>,
+    input: SubmitTurnInput &
+      Readonly<{ startRun: (request: ProviderRunRequest) => Promise<ProviderRun>; witness?: AdmissionWitness }>,
   ): Promise<IngressCommandOutcome>;
   /** Supervision entry: choose the run's terminal from its provider completion, once. */
   completeRun(sessionId: SessionId, runId: RunId, completion: RunCompletion): void;
@@ -503,13 +519,24 @@ export type IngressDriver = {
       command: RespondToInteractionCommand;
       acceptedAt: Timestamp;
       deliver: (providerRef: string, response: RespondToInteractionCommand['response']) => Promise<void>;
+      witness?: AdmissionWitness;
     }>,
   ): Promise<IngressCommandOutcome>;
-  /** `interrupt_run` (validated by the caller): reserve and fence, interrupt once, fill the same slot. */
+  /**
+   * `interrupt_run` (validated by the caller): reserve and fence, interrupt once, fill the same slot.
+   * A command whose witness saw another command's interrupt in flight never calls the provider: it
+   * mirrors that interrupt's outcome, including a definite rejection that settled before admission.
+   */
   interruptRun(
     sessionId: SessionId,
-    input: Readonly<{ command: InterruptRunCommand; acceptedAt: Timestamp }>,
+    input: Readonly<{ command: InterruptRunCommand; acceptedAt: Timestamp; witness?: AdmissionWitness }>,
   ): Promise<IngressCommandOutcome>;
+  /**
+   * Capture, synchronously at public invocation and before any queue, the provider call this
+   * command ID already has in flight and, for an `interrupt_run` naming `target`, the run's
+   * command-owned interrupt in flight or with an unknown outcome. Never throws; holds no lock.
+   */
+  witness(commandId: CommandId, target?: Readonly<{ sessionId: SessionId; runId: RunId }>): AdmissionWitness;
   fault(sessionId: SessionId): IngressFault | undefined;
   /** Every faulted session, sorted by session id. */
   faults(): readonly IngressFault[];
@@ -566,6 +593,8 @@ type DriverRun = {
   readonly followers: Map<number, Follower>;
   /** The error of the last definitely rejected owning `interrupt_run`, mirrored to its followers. */
   interruptRejection: AgentError | undefined;
+  /** The current command-owned interrupt attempt (its owner and that owner's exact retries). */
+  interruptAttempt: InterruptAttempt | undefined;
   readonly routes: Map<InteractionId, Route>;
   /** Provider references that still route to an interaction. */
   readonly refs: Map<string, InteractionId>;
@@ -599,6 +628,14 @@ type SharedInterrupt =
   | Readonly<{ kind: 'unknown' }>;
 
 type Invocation = 'filled' | 'unknown' | 'stale';
+
+/**
+ * One command-owned run interrupt, from its owner's first call until a definite
+ * outcome. A witness that saw it in flight mirrors its definite rejection even
+ * after the rejection rolled the fence back (decision A applies only to an
+ * interrupt invoked after that rejection).
+ */
+type InterruptAttempt = { readonly runId: RunId; rejection: AgentError | undefined };
 
 /**
  * Same-id admission. Taken synchronously before the receipt lookup, so no
@@ -1290,7 +1327,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   /**
    * A provider sink. It reaches its session only through the session's cell,
    * which retirement empties: a stale sink then captures nothing and holds no
-   * session, handle, body or map, only its immutable fence.
+   * session, handle, body or map, only its immutable fence. A run sink whose
+   * run is retired (or whose terminal is placed) is also discarded before
+   * capture, while its session stays open: it never inspects its input.
    */
   function sinkFor(entry: Entry, source: 'session' | RunSinkFence): ProviderEventSink {
     const { cell } = entry;
@@ -1298,9 +1337,22 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       emit(input: Parameters<ProviderEventSink['emit']>[0]): void {
         const current = cell.entry;
         if (current === undefined) return;
+        if (source !== 'session' && runSinkRetired(current, source)) return;
         accept(current, source, captureProviderEvent(input));
       },
     });
+  }
+
+  /**
+   * The reducer's input-independent discard of a run sink (`acceptEvent`:
+   * `stale-sink` and `post-terminal`), decided from the fence alone so a
+   * retired run's sink is dropped before its input is captured. The reducer
+   * still makes the same decision for everything that reaches it.
+   */
+  function runSinkRetired(entry: Entry, fence: RunSinkFence): boolean {
+    const run = entry.s.run;
+    if (run?.runId !== fence.runId || run.epoch !== fence.epoch) return true;
+    return run.terminal !== undefined && run.terminal.state !== 'intent';
   }
 
   function accept(entry: Entry, source: 'session' | RunSinkFence, event: CapturedProviderEvent): void {
@@ -1440,6 +1492,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       handle: undefined,
       followers: new Map(),
       interruptRejection: undefined,
+      interruptAttempt: undefined,
       routes: new Map(),
       refs: new Map(),
       closeAt: undefined,
@@ -1915,14 +1968,23 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
    * An exact retry of a reserved command: share an in-flight provider call,
    * deliver an unknown one again (`redeliver`), or wait for the filled slot.
    * Only this path ever repeats a provider effect, and only for the identical
-   * command: a changed payload conflicts at admission.
+   * command: a changed payload conflicts at admission. A retry that was
+   * invoked while this slot's call was in flight (its `witness`) shares that
+   * call's outcome even if it settled before this retry was admitted, so a
+   * concurrent retry never redelivers; only a retry invoked after an unknown
+   * outcome delivers again.
    */
   function retryCommand(
     entry: Entry,
     op: EffectOperation<IngressPayload>,
     redeliver: (() => Promise<Invocation>) | undefined,
+    witness: AdmissionWitness | undefined,
   ): Promise<IngressCommandOutcome> {
     let invocation = entry.invocations.get(op.ordinal);
+    const own = witness?.own;
+    if (invocation === undefined && own?.sessionId === entry.s.sessionId && own.ordinal === op.ordinal) {
+      invocation = own.invocation;
+    }
     if (invocation === undefined && op.state === 'unknown' && redeliver !== undefined) invocation = redeliver();
     return slotOutcome(entry, op.ordinal, invocation, true);
   }
@@ -1956,6 +2018,8 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
   function interruptCall(entry: Entry, command: InterruptRunCommand, acceptedAt: Timestamp): EffectCall {
     const handle = entry.run?.runId === command.runId ? entry.run.handle : undefined;
+    // The owner's attempt, shared by its exact retries: a definite rejection is recorded on it.
+    const attempt = entry.run?.runId === command.runId ? entry.run.interruptAttempt : undefined;
     const owned = structuredClone(command);
     return {
       deliver: () => {
@@ -1972,8 +2036,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       applied: () => ({ kind: 'interrupt', command: owned, delivered: true }),
       rejected: (error) => {
         const agent = providerError(error);
-        // Waiting `interrupt_run` commands mirror this definite rejection.
+        // Waiting `interrupt_run` commands mirror this definite rejection, and so does any
+        // command invoked while this attempt was in flight but admitted only after it.
         if (entry.run?.runId === command.runId) entry.run.interruptRejection = agent;
+        if (attempt !== undefined) attempt.rejection = agent;
         return { kind: 'receipt', receipt: rejectedReceipt(owned, agent, acceptedAt) };
       },
     };
@@ -2867,6 +2933,30 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       return lifecycle.get(commandId);
     },
 
+    witness(commandId, target) {
+      let own: AdmissionWitness['own'];
+      const claim = claims.get(commandId);
+      if (claim?.ordinal !== undefined) {
+        const invocation = sessions.get(claim.sessionId)?.invocations.get(claim.ordinal);
+        if (invocation !== undefined) own = { sessionId: claim.sessionId, ordinal: claim.ordinal, invocation };
+      }
+      let interrupt: InterruptAttempt | undefined;
+      if (target !== undefined) {
+        const entry = sessions.get(target.sessionId);
+        const record = entry?.s.run;
+        const run = entry?.run;
+        if (
+          record?.runId === target.runId &&
+          run?.runId === record.runId &&
+          record.interrupt === 'in-flight' &&
+          typeof record.interruptOwner === 'number'
+        ) {
+          interrupt = run.interruptAttempt;
+        }
+      }
+      return { own, interrupt };
+    },
+
     liveSessions: () => [...sessions.keys()].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
 
     knows: (sessionId) => sessions.has(sessionId) || retiredOverflow.has(sessionId),
@@ -2922,7 +3012,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         op.effect === 'start' ? () => startInvocation(entry, op.ordinal, input.startRun) : undefined;
       const admission = await admit(entry, command, input.acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
-      if (admission.kind === 'pending') return retryCommand(entry, admission.op, startRedelivery(admission.op));
+      if (admission.kind === 'pending') {
+        return retryCommand(entry, admission.op, startRedelivery(admission.op), input.witness);
+      }
       const { claim } = admission;
       return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
         const reserved = reserveRun(entry, input);
@@ -2930,7 +3022,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         if (reserved.kind === 'existing') {
           const op = pendingCommand(entry, command.commandId);
           if (op === undefined) throw internal(`start ${String(reserved.ordinal)} vanished`);
-          return retryCommand(entry, op, startRedelivery(op));
+          return retryCommand(entry, op, startRedelivery(op), input.witness);
         }
         // Reserved: the slot holds the claim, the provider is called only now, and its
         // outcome fills this same slot.
@@ -2944,14 +3036,16 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
     async respondToInteraction(sessionId, input) {
       const entry = requireEntry(sessionId);
-      const { command, acceptedAt, deliver } = input;
+      const { command, acceptedAt, deliver, witness } = input;
       const admission = await admit(entry, command, acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
       const responseRedelivery = (op: EffectOperation<IngressPayload>): (() => Promise<Invocation>) | undefined => {
         const call = responseCall(entry, command, op.identity.acceptedAt, deliver);
         return call === undefined ? undefined : () => startEffect(entry, op.ordinal, call);
       };
-      if (admission.kind === 'pending') return retryCommand(entry, admission.op, responseRedelivery(admission.op));
+      if (admission.kind === 'pending') {
+        return retryCommand(entry, admission.op, responseRedelivery(admission.op), witness);
+      }
       const { claim } = admission;
       return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
         // Settlement ownership is decided here, synchronously, before any provider call:
@@ -2969,7 +3063,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
           subject: command.interactionId,
         });
         if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
-        if (reserved.kind === 'existing') return retryCommand(entry, reserved.op, responseRedelivery(reserved.op));
+        if (reserved.kind === 'existing') {
+          return retryCommand(entry, reserved.op, responseRedelivery(reserved.op), witness);
+        }
         const call = responseCall(entry, command, acceptedAt, deliver);
         if (call === undefined) throw internal(`interaction \`${command.interactionId}\` lost its route`);
         bindClaim(claim, reserved.ordinal);
@@ -2979,11 +3075,11 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
     async interruptRun(sessionId, input) {
       const entry = requireEntry(sessionId);
-      const { command, acceptedAt } = input;
+      const { command, acceptedAt, witness } = input;
       const admission = await admit(entry, command, acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
       if (admission.kind === 'pending') {
-        return retryCommand(entry, admission.op, interruptRedelivery(entry, command, admission.op));
+        return retryCommand(entry, admission.op, interruptRedelivery(entry, command, admission.op), witness);
       }
       const { claim } = admission;
       return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
@@ -2994,11 +3090,25 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         });
         if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
         if (reserved.kind === 'existing') {
-          return retryCommand(entry, reserved.op, interruptRedelivery(entry, command, reserved.op));
+          return retryCommand(entry, reserved.op, interruptRedelivery(entry, command, reserved.op), witness);
         }
         bindClaim(claim, reserved.ordinal);
         const run = entry.run;
         if (run?.runId !== command.runId) throw internal(`run \`${command.runId}\` has no driver record`);
+        const witnessed = witness?.interrupt;
+        if (witnessed?.runId === command.runId && witnessed.rejection !== undefined) {
+          // Invoked while another command's interrupt was in flight, admitted after that
+          // interrupt was definitely rejected: mirror the rejection, never call the provider.
+          // (Decision A: only an interrupt invoked after the rejection calls again.)
+          fillEffect(entry, reserved.ordinal, {
+            kind: 'rejected',
+            result: {
+              kind: 'receipt',
+              receipt: rejectedReceipt(structuredClone(command), witnessed.rejection, acceptedAt),
+            },
+          });
+          return slotOutcome(entry, reserved.ordinal, undefined, false);
+        }
         if (!reserved.deliver) {
           // The run's one interrupt is already in flight or observed: never call the provider
           // again; wait for that shared outcome and mirror it.
@@ -3007,6 +3117,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
         }
         // This command owns the run's one interrupt.
         run.interruptRejection = undefined;
+        run.interruptAttempt = { runId: run.runId, rejection: undefined };
         return slotOutcome(
           entry,
           reserved.ordinal,

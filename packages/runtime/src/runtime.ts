@@ -23,6 +23,7 @@ import {
   InterruptRunCommandSchema,
   OpenSessionCommandSchema,
   RespondToInteractionCommandSchema,
+  RunIdSchema,
   SessionIdSchema,
   SubmitTurnCommandSchema,
   agentError,
@@ -73,6 +74,7 @@ import { SESSION_OPERATION_LIMIT, type RefusalReason } from './ingestion.ts';
 import {
   createIngressDriver,
   ingressPlan,
+  type AdmissionWitness,
   type HeldIdentity,
   type IngressCommandOutcome,
   type IngressDriver,
@@ -272,13 +274,43 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     return commandId !== undefined ? serializeByKey(commandQueues, commandId, withinSession) : withinSession();
   }
 
+  /**
+   * Once shutdown starts, new work is fenced. A command ID that still holds an
+   * unresolved identity (a reserved command slot whose outcome is unknown or
+   * not yet committed, an open or its rollback, an admitted close, an
+   * unrecorded validation rejection) is still admitted: only its owner's exact
+   * retry can resolve it, and shutdown cannot settle until it is resolved. A
+   * changed payload under such an ID is answered with the usual conflict.
+   */
   function coordinateMutation<T>(input: unknown, sessionScoped: boolean, operation: () => Promise<T>): Promise<T> {
-    if (lifecycle !== 'accepting') {
+    if (lifecycle !== 'accepting' && !holdsUnresolvedIdentity(input)) {
       return Promise.reject(
         new AgentRuntimeError(agentError('session_closed', `runtime is ${lifecycle.replace('_', ' ')}`)),
       );
     }
     return coordinateCommand(input, sessionScoped, operation);
+  }
+
+  function holdsUnresolvedIdentity(input: unknown): boolean {
+    const commandId = CommandIdSchema.safeParse(ownDataString(input, 'commandId'));
+    return commandId.success && heldIdentity(commandId.data) !== undefined;
+  }
+
+  /**
+   * What the command saw at invocation, before any queue: its own provider
+   * call in flight (a concurrent exact retry shares it instead of delivering
+   * again) and, for `interrupt_run`, the run's interrupt in flight or unknown
+   * (a concurrent new-ID interrupt mirrors its outcome). Synchronous.
+   */
+  function witnessAtInvocation(input: unknown, interrupt: boolean): AdmissionWitness | undefined {
+    const commandId = CommandIdSchema.safeParse(ownDataString(input, 'commandId'));
+    if (!commandId.success) return undefined;
+    if (!interrupt) return driver.witness(commandId.data);
+    const sessionId = SessionIdSchema.safeParse(ownDataString(input, 'sessionId'));
+    const runId = RunIdSchema.safeParse(ownDataString(input, 'runId'));
+    return sessionId.success && runId.success
+      ? driver.witness(commandId.data, { sessionId: sessionId.data, runId: runId.data })
+      : driver.witness(commandId.data);
   }
 
   // -------------------------------------------------------------------------
@@ -888,7 +920,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     throw new AgentRuntimeError(agentError('internal', `open \`${command.commandId}\` has no recorded outcome`));
   }
 
-  async function submitTurn(input: SubmitTurnCommandInput): Promise<CommandReceipt> {
+  async function submitTurn(input: SubmitTurnCommandInput, witness?: AdmissionWitness): Promise<CommandReceipt> {
     const parsed = parseCommand(SubmitTurnCommandSchema, input, 'submit_turn');
     if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
@@ -908,6 +940,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         runId: run?.runId ?? (idFactory.next('run') as RunId),
         attempt: 1,
         startRun: (request) => session.providerSession.startRun(request),
+        ...(witness === undefined ? {} : { witness }),
       });
       return await settleOutcome(command, outcome, held.acceptedAt);
     }
@@ -943,12 +976,13 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       runId: idFactory.next('run') as RunId,
       attempt: 1,
       startRun: (request) => session.providerSession.startRun(request),
+      ...(witness === undefined ? {} : { witness }),
     });
     if (outcome.kind === 'refused' && outcome.reason === 'run-active') return await runActive();
     return await settleOutcome(command, outcome, acceptedAt);
   }
 
-  async function interruptRun(input: InterruptRunCommandInput): Promise<CommandReceipt> {
+  async function interruptRun(input: InterruptRunCommandInput, witness?: AdmissionWitness): Promise<CommandReceipt> {
     const parsed = parseCommand(InterruptRunCommandSchema, input, 'interrupt_run');
     if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
@@ -958,7 +992,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     if (existing !== undefined) return existing;
     const held = driver.commandIdentity(command.commandId);
     if (held !== undefined) {
-      const outcome = await driver.interruptRun(held.sessionId, { command, acceptedAt: held.acceptedAt });
+      const outcome = await driver.interruptRun(held.sessionId, {
+        command,
+        acceptedAt: held.acceptedAt,
+        ...(witness === undefined ? {} : { witness }),
+      });
       return await interruptOutcome(command, outcome, held.acceptedAt);
     }
 
@@ -986,7 +1024,11 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     if (!capability.ok) {
       return await rejectAndRecord(command, receipt(command, 'rejected', { error: capability.error }, acceptedAt));
     }
-    const outcome = await driver.interruptRun(sessionId, { command, acceptedAt });
+    const outcome = await driver.interruptRun(sessionId, {
+      command,
+      acceptedAt,
+      ...(witness === undefined ? {} : { witness }),
+    });
     return await interruptOutcome(command, outcome, acceptedAt);
   }
 
@@ -1027,7 +1069,10 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     return await settleOutcome(command, outcome, acceptedAt);
   }
 
-  async function respondToInteraction(input: RespondToInteractionCommandInput): Promise<CommandReceipt> {
+  async function respondToInteraction(
+    input: RespondToInteractionCommandInput,
+    witness?: AdmissionWitness,
+  ): Promise<CommandReceipt> {
     const parsed = parseCommand(RespondToInteractionCommandSchema, input, 'respond_to_interaction');
     if (!parsed.ok) return await invalidCommandOutcome(parsed.invalid);
     const command = parsed.command;
@@ -1042,6 +1087,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         command,
         acceptedAt: held.acceptedAt,
         deliver: (providerRef, response) => session.providerSession.respondToInteraction(providerRef, response),
+        ...(witness === undefined ? {} : { witness }),
       });
       return await responseOutcome(command, outcome, held.acceptedAt);
     }
@@ -1067,6 +1113,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       command,
       acceptedAt,
       deliver: (providerRef, response) => session.providerSession.respondToInteraction(providerRef, response),
+      ...(witness === undefined ? {} : { witness }),
     });
     return await responseOutcome(command, outcome, acceptedAt);
   }
@@ -1164,8 +1211,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     const { sessionId } = command;
     const fingerprint = canonicalCommandFingerprint(command);
 
-    const existing = await existingCommandOutcome(command);
-    if (existing !== undefined) return existing;
+    // Retained close ownership comes first. While the driver still owns this session, its
+    // `session.closed` bundle has not been confirmed committed: the store's receipt or
+    // closed state may be the unconfirmed result of an ambiguous commit (A), so neither
+    // shortcut may answer for the driver. An exact retry goes to the driver, which fails
+    // closed under A, resumes a proven-absent (F) head, and never repeats a cleanup effect.
+    const retained = driver.inspect(sessionId) !== undefined;
+    const ownedClose = driver.commandIdentity(command.commandId);
+    const resumesOwnedClose = retained && ownedClose?.sessionId === sessionId && ownedClose.fingerprint === fingerprint;
+    if (!resumesOwnedClose) {
+      const existing = await existingCommandOutcome(command);
+      if (existing !== undefined) return existing;
+    }
     const held = driver.commandIdentity(command.commandId);
     // An exact retry keeps the first acceptance and resumes a proven-absent head.
     const acceptedAt = held?.acceptedAt ?? clock.now();
@@ -1182,7 +1239,7 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
         ),
       );
     }
-    if (snapshot.session.state === 'closed' || snapshot.session.state === 'failed') {
+    if (!retained && (snapshot.session.state === 'closed' || snapshot.session.state === 'failed')) {
       return await alreadyClosed(command, acceptedAt);
     }
 
@@ -1242,12 +1299,17 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     switch (reason) {
       case 'command-conflict':
         return conflictReceipt(command, driver.commandIdentity(command.commandId)?.acceptedAt ?? acceptedAt);
-      case 'busy':
+      case 'busy': {
+        // The admitted close's bundle has an unknown commit outcome: no other close can
+        // answer for it, and waiting cannot help.
+        const blocked = driver.fault(sessionId);
+        if (blocked?.kind === 'ambiguous') throw new AgentRuntimeError(blocked.error);
         throw transient(
           'illegal_state_transition',
           `session \`${sessionId}\` is already being closed by another close command; retry after it completes`,
           { sessionId, reason: 'close-in-progress' },
         );
+      }
       case 'session-ended': {
         const stored = await store.findReceipt(command.commandId);
         if (stored !== undefined) return dedupe(command, stored);
@@ -1400,9 +1462,18 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
     retryProviderIngestion,
 
     openSession: (command) => coordinateMutation(command, false, () => openSession(command)),
-    submitTurn: (command) => coordinateMutation(command, true, () => submitTurn(command)),
-    interruptRun: (command) => coordinateMutation(command, true, () => interruptRun(command)),
-    respondToInteraction: (command) => coordinateMutation(command, true, () => respondToInteraction(command)),
+    submitTurn: (command) => {
+      const witness = witnessAtInvocation(command, false);
+      return coordinateMutation(command, true, () => submitTurn(command, witness));
+    },
+    interruptRun: (command) => {
+      const witness = witnessAtInvocation(command, true);
+      return coordinateMutation(command, true, () => interruptRun(command, witness));
+    },
+    respondToInteraction: (command) => {
+      const witness = witnessAtInvocation(command, false);
+      return coordinateMutation(command, true, () => respondToInteraction(command, witness));
+    },
     closeSession: (command) => coordinateMutation(command, false, () => closeSession(command)),
 
     dispatch(rawCommand: AgentCommandInput): Promise<CommandReceipt> {
@@ -1410,14 +1481,22 @@ export function createAgentRuntime(options: AgentRuntimeOptions): AgentRuntime {
       switch (commandType) {
         case 'open_session':
           return coordinateMutation(rawCommand, false, () => openSession(rawCommand as OpenSessionCommandInput));
-        case 'submit_turn':
-          return coordinateMutation(rawCommand, true, () => submitTurn(rawCommand as SubmitTurnCommandInput));
-        case 'interrupt_run':
-          return coordinateMutation(rawCommand, true, () => interruptRun(rawCommand as InterruptRunCommandInput));
-        case 'respond_to_interaction':
+        case 'submit_turn': {
+          const witness = witnessAtInvocation(rawCommand, false);
+          return coordinateMutation(rawCommand, true, () => submitTurn(rawCommand as SubmitTurnCommandInput, witness));
+        }
+        case 'interrupt_run': {
+          const witness = witnessAtInvocation(rawCommand, true);
           return coordinateMutation(rawCommand, true, () =>
-            respondToInteraction(rawCommand as RespondToInteractionCommandInput),
+            interruptRun(rawCommand as InterruptRunCommandInput, witness),
           );
+        }
+        case 'respond_to_interaction': {
+          const witness = witnessAtInvocation(rawCommand, false);
+          return coordinateMutation(rawCommand, true, () =>
+            respondToInteraction(rawCommand as RespondToInteractionCommandInput, witness),
+          );
+        }
         case 'close_session':
           return coordinateMutation(rawCommand, false, () => closeSession(rawCommand as CloseSessionCommandInput));
         default:

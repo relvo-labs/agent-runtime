@@ -36,7 +36,11 @@ An exact retry of a definitely rejected command replays its rejected receipt. A 
 command ID after a definite interrupt rejection is a new interrupt and calls the provider
 again. While a run's one interrupt is in flight, or its outcome is unknown and still
 owned by its command, any other `interrupt_run` waits for and mirrors that outcome. It
-never calls the provider; only the owning command's exact retry does.
+never calls the provider; only the owning command's exact retry does. This is decided when
+the command is invoked, before any runtime queue: an `interrupt_run` invoked while another
+command's interrupt was in flight mirrors that interrupt's outcome even if it settled, as
+a definite rejection, before this command was admitted. Only an `interrupt_run` invoked
+after the rejection calls the provider again.
 
 If a slot's commit fails, the command returns the session's ingestion fault: retryable
 when the commit is proven not to have applied, non-retryable when its outcome is unknown.
@@ -53,7 +57,10 @@ flight. A same-payload admission that finds the claim unbound waits until it is 
 then shares the slot's provider call and outcome. A different payload is the not-recorded
 `command_id_conflict`. Claims are released when their slot commits, so they are bounded by
 unresolved slots, including unknown ones, until an exact retry resolves them. Same-ID
-commands are also serialized by the runtime. `submit_turn`, `interrupt_run` and
+commands are also serialized by the runtime. An exact retry invoked while the original's
+provider call is in flight shares that call's outcome even when it is admitted only after
+the call settled: a concurrent retry never re-delivers, and receives the same unknown
+outcome. Only an exact retry invoked after an unknown outcome delivers again. `submit_turn`, `interrupt_run` and
 `respond_to_interaction` for one session run one at a time; `close_session` does not join
 that queue (ADR-0005). Unrelated sessions proceed independently, and queue entries are
 removed after their final waiter settles.

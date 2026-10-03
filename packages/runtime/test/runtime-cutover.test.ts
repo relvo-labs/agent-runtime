@@ -1507,3 +1507,330 @@ describe('S4 activation overflow through the public runtime', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// S4 review repair (F1–F4): owner recovery during shutdown, interrupt outcome
+// sharing at invocation time, close under commit uncertainty, retired run sinks
+// ---------------------------------------------------------------------------
+
+/** A value whose every reflection throws and is counted: any capture would touch it. */
+function reflectionTrap(): { readonly value: ProviderEventInput; inspections(): number } {
+  let inspections = 0;
+  const touched = (): never => {
+    inspections += 1;
+    throw new Error('a retired sink inspected its input');
+  };
+  const value = new Proxy(
+    {},
+    { getPrototypeOf: touched, ownKeys: touched, getOwnPropertyDescriptor: touched, get: touched, has: touched },
+  ) as ProviderEventInput;
+  return { value, inspections: () => inspections };
+}
+
+async function microtasks(count: number): Promise<void> {
+  for (let turn = 0; turn < count; turn += 1) await Promise.resolve();
+}
+
+describe('S4 review F1: shutdown fences new work but admits exact owner recovery', () => {
+  it('an unknown interrupt fails shutdown retryably; the owner exact retry resolves it and shutdown then succeeds', async () => {
+    const value = await harness({ interruptMode: 'reject-untyped' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const interrupt = { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+    expect((await rejection(value.runtime.interruptRun(interrupt))).error).toMatchObject({
+      code: 'provider_unavailable',
+      message: UNKNOWN_OUTCOME,
+    });
+
+    expect((await rejection(value.runtime.shutdown())).error).toMatchObject({ retryable: true });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+
+    // New work stays fenced: a new interrupt id, a fresh submit and a fresh open.
+    expect(
+      (await rejection(value.runtime.interruptRun({ ...interrupt, commandId: value.next('interrupt') }))).error,
+    ).toMatchObject({ code: 'session_closed' });
+    expect((await rejection(value.runtime.submitTurn(value.submitCommand(sessionId)))).error).toMatchObject({
+      code: 'session_closed',
+    });
+    // A changed payload under the unresolved id is a conflict, never a delivery.
+    expect(await value.runtime.interruptRun({ ...interrupt, reason: 'changed' })).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(value.runs[0]?.interrupts).toHaveLength(1);
+
+    // The owner's exact retry is admitted and delivers the same interrupt once more.
+    const run = value.runs[0];
+    if (run === undefined) throw new Error('no run');
+    run.interruptMode = 'resolve';
+    expect(await value.runtime.interruptRun(interrupt)).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    expect(run.interrupts).toHaveLength(2);
+
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    // Cleanup was never repeated, and the run ended exactly once before the session closed.
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    const kinds = await value.types(sessionId);
+    expect(kinds.filter((kind) => kind.startsWith('run.finished'))).toEqual(['run.finished:interrupted']);
+    expect(kinds.at(-1)).toBe('session.closed');
+    // Once nothing is unresolved, the same id is fenced like any other.
+    expect((await rejection(value.runtime.interruptRun(interrupt))).error).toMatchObject({ code: 'session_closed' });
+  });
+});
+
+describe('S4 review F2: interrupt outcome sharing is decided at invocation, before any queue', () => {
+  it('a new-ID interrupt invoked during an in-flight interrupt mirrors its definite rejection; a later one calls again', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = value.runs[0];
+    if (run === undefined) throw new Error('no run');
+    const owner = { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.interruptRun(follower);
+    await microtasks(100);
+    run.interruptMode = 'resolve';
+    run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+
+    const refused = { disposition: 'rejected', error: { code: 'provider_rejected', message: 'definite rejection' } };
+    expect(await first).toMatchObject(refused);
+    expect(await following).toMatchObject(refused);
+    expect(run.interrupts).toHaveLength(1);
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(refused);
+    expect(await value.runtime.interruptRun(follower)).toMatchObject(refused);
+    expect(run.interrupts).toHaveLength(1);
+
+    // Decision A is unchanged: an interrupt invoked after the rejection calls the provider again.
+    expect(await value.runtime.interruptRun({ ...owner, commandId: value.next('interrupt') })).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    expect(run.interrupts).toHaveLength(2);
+  });
+
+  it('a concurrent exact retry shares an unknown interrupt outcome; only a later exact retry delivers again', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = value.runs[0];
+    if (run === undefined) throw new Error('no run');
+    const owner = { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+    const first = value.runtime.interruptRun(owner);
+    first.catch(() => undefined);
+    await until(() => run.heldInterrupts.length === 1);
+    const concurrent = value.runtime.interruptRun(owner);
+    concurrent.catch(() => undefined);
+    await microtasks(100);
+    run.interruptMode = 'resolve';
+    run.heldInterrupts[0]?.reject(new Error('transport'));
+
+    for (const attempt of [first, concurrent]) {
+      expect((await rejection(attempt)).error).toMatchObject({
+        code: 'provider_unavailable',
+        message: UNKNOWN_OUTCOME,
+      });
+    }
+    expect(run.interrupts).toHaveLength(1);
+
+    // An exact retry invoked after the unknown outcome is the owner's recovery: it delivers again.
+    expect(await value.runtime.interruptRun(owner)).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    expect(run.interrupts).toHaveLength(2);
+  });
+
+  it('a new-ID interrupt invoked during an in-flight interrupt mirrors its unknown outcome without calling the provider', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = value.runs[0];
+    if (run === undefined) throw new Error('no run');
+    const owner = { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+    const first = value.runtime.interruptRun(owner);
+    first.catch(() => undefined);
+    await until(() => run.heldInterrupts.length === 1);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.interruptRun(follower);
+    following.catch(() => undefined);
+    await microtasks(100);
+    run.interruptMode = 'resolve';
+    run.heldInterrupts[0]?.reject(new Error('transport'));
+
+    for (const attempt of [first, following]) {
+      expect((await rejection(attempt)).error).toMatchObject({
+        code: 'provider_unavailable',
+        message: UNKNOWN_OUTCOME,
+      });
+    }
+    expect(run.interrupts).toHaveLength(1);
+
+    // Only the owner resolves it; the follower then mirrors the observed success without a call.
+    expect(await value.runtime.interruptRun(owner)).toMatchObject({
+      disposition: 'applied',
+      result: { delivered: true },
+    });
+    expect(await value.runtime.interruptRun(follower)).toMatchObject({ result: { delivered: true } });
+    expect(run.interrupts).toHaveLength(2);
+  });
+
+  it('a changed payload under an in-flight interrupt id conflicts and never reaches the provider', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = value.runs[0];
+    if (run === undefined) throw new Error('no run');
+    const owner = { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const changed = value.runtime.interruptRun({ ...owner, reason: 'changed' });
+    await microtasks(100);
+    run.heldInterrupts[0]?.resolve(undefined);
+    expect(await first).toMatchObject({ disposition: 'applied', result: { delivered: true } });
+    expect(await changed).toMatchObject({ disposition: 'rejected', error: { code: 'command_id_conflict' } });
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('a concurrent exact response retry shares an unknown delivery outcome without redelivery', async () => {
+    const value = await harness({ holdResponses: true });
+    const sessionId = await value.open();
+    await value.startRun(sessionId);
+    value.runs[0]?.request.sink.emit(question('q-1'));
+    const interactionId = await value.interactionId(sessionId);
+    const respond = {
+      commandId: value.next('respond'),
+      type: 'respond_to_interaction' as const,
+      sessionId,
+      interactionId,
+      response: yes,
+    };
+    const first = value.runtime.respondToInteraction(respond);
+    first.catch(() => undefined);
+    await until(() => value.responses.length === 1);
+    const concurrent = value.runtime.respondToInteraction(respond);
+    concurrent.catch(() => undefined);
+    await microtasks(100);
+    value.responses[0]?.result.reject(new Error('transport'));
+    expect((await rejection(first)).error).toMatchObject({ code: 'provider_unavailable', message: UNKNOWN_OUTCOME });
+    await microtasks(100);
+    // The concurrent retry shared the first delivery; it did not deliver again.
+    expect(value.responses).toHaveLength(1);
+    expect((await rejection(concurrent)).error).toMatchObject({
+      code: 'provider_unavailable',
+      message: UNKNOWN_OUTCOME,
+    });
+    expect(value.responses).toHaveLength(1);
+
+    const again = value.runtime.respondToInteraction(respond);
+    await until(() => value.responses.length === 2);
+    value.responses[1]?.result.resolve(undefined);
+    expect(await again).toMatchObject({ disposition: 'applied' });
+    expect(value.responses).toHaveLength(2);
+  });
+});
+
+describe('S4 review F3: close resolves retained ownership before receipt shortcuts', () => {
+  it('an undeclared applied-then-rejected close stays fail-closed for its exact retry and for any other close id', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const gate = value.holdDispose();
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    closing.catch(() => undefined);
+    await until(() => value.counts().disposes === 1);
+    await microtasks(100);
+    expect((await value.base.read(sessionId))?.session.state).toBe('closing');
+    value.control.failNext('apply-then-reject');
+    gate.resolve(undefined);
+
+    const permanent = { code: 'store_unavailable', retryable: false, details: { fault: 'ambiguous' } };
+    expect((await rejection(closing)).error).toMatchObject(permanent);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([{ sessionId, error: permanent }]);
+    // The unverified store did apply the bundle, receipt included; the runtime does not trust it.
+    expect((await value.base.read(sessionId))?.session.state).toBe('closed');
+    expect(await receiptOf(value, close.commandId)).toMatchObject({ disposition: 'applied' });
+
+    expect((await rejection(value.runtime.closeSession(close))).error).toMatchObject(permanent);
+    const other = value.closeCommand(sessionId);
+    expect((await rejection(value.runtime.closeSession(other))).error).toMatchObject(permanent);
+    expect(await receiptOf(value, other.commandId)).toBeUndefined();
+    // A changed payload under the retained id is still a conflict.
+    expect(await value.runtime.closeSession({ ...close, ifRunActive: 'reject' })).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    // No cleanup effect was repeated, and the bundle was never resubmitted.
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    expect((await value.types(sessionId)).filter((kind) => kind === 'session.closed')).toHaveLength(1);
+    expect((await rejection(value.runtime.shutdown())).error).toMatchObject({ retryable: false });
+  });
+
+  it('a declared strong closed bundle reconciles once, then answers its exact retry without repeating cleanup', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const gate = value.holdDispose();
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    closing.catch(() => undefined);
+    await until(() => value.counts().disposes === 1);
+    await microtasks(100);
+    value.control.failNext('apply-then-reject');
+    gate.resolve(undefined);
+    await closing.catch(() => undefined);
+    await until(() => value.runtime.getProviderIngestionFaults().length === 0);
+    expect(await value.runtime.closeSession(close)).toMatchObject({
+      disposition: 'duplicate',
+      result: { type: 'session_closed' },
+    });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    expect((await value.types(sessionId)).filter((kind) => kind === 'session.closed')).toHaveLength(1);
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+  });
+});
+
+describe('S4 review F4: a retired run sink inspects nothing while its session stays open', () => {
+  it('discards hostile input before capture, and a later run still captures its own output', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    await value.startRun(sessionId);
+    const finished = value.runs[0];
+    if (finished === undefined) throw new Error('no run');
+    finished.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    const before = (await value.history(sessionId)).length;
+
+    const trap = reflectionTrap();
+    expect(() => {
+      finished.request.sink.emit(trap.value);
+    }).not.toThrow();
+    expect(trap.inspections()).toBe(0);
+    await value.runtime.quiesce();
+    expect(await value.history(sessionId)).toHaveLength(before);
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+
+    // A newer run of the same session: the old sink stays inert, the new one is live.
+    await value.startRun(sessionId);
+    const current = value.runs[1];
+    if (current === undefined) throw new Error('no second run');
+    finished.request.sink.emit(trap.value);
+    expect(trap.inspections()).toBe(0);
+    current.request.sink.emit(delta('second run output'));
+    current.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    const texts = (await value.history(sessionId)).flatMap((event) =>
+      event.payload.type === 'run.message_delta' ? [event.payload.text] : [],
+    );
+    expect(texts).toEqual(['second run output']);
+
+    // Session retirement keeps the zero-inspection guarantee for both sink kinds.
+    const sessionSink = value.sessionSink();
+    await value.runtime.closeSession(value.closeCommand(sessionId));
+    current.request.sink.emit(trap.value);
+    sessionSink.emit(trap.value);
+    expect(trap.inspections()).toBe(0);
+  });
+});
