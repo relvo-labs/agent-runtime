@@ -21,6 +21,11 @@
  *   is called, and the provider's outcome fills that same slot: a start bundle
  *   or rejected receipt, a response settlement or rejected receipt, an
  *   interrupt receipt. An ambiguous outcome leaves the slot unresolved;
+ * - one command id is admitted once: a synchronous claim taken before the
+ *   receipt lookup is held by the reserved slot until its receipt commits;
+ * - a response owns its interaction from reservation: the queued reservation
+ *   refuses a competitor, and the route is retired when the settlement
+ *   commits, so a settled interaction can never be delivered to again;
  * - every queued payload is plain data the reducer deep-freezes, and
  *   materialization is a deterministic function of that payload and the
  *   projection at its ordinal, so a retried head is the identical value;
@@ -46,11 +51,11 @@ import {
   agentError,
   canTransition,
   canonicalCommandFingerprint,
-  toAgentError,
   type AgentCommand,
   type AgentError,
   type AgentSession,
   type Clock,
+  type CommandId,
   type CommandReceipt,
   type CommandResult,
   type EventEnvelope,
@@ -70,6 +75,7 @@ import {
   type TurnId,
 } from '@relvo-labs/agent-protocol';
 import {
+  ProviderRejection,
   ProviderRunTerminationSchema,
   isProviderRejection,
   type ProviderEventSink,
@@ -299,8 +305,19 @@ export type SubmitTurnInput = Readonly<{
 export type RunCompletion =
   Readonly<{ kind: 'resolved'; value: unknown }> | Readonly<{ kind: 'rejected'; error: unknown }>;
 
-/** Driver-side bookkeeping for the current run, for retirement proofs. */
-export type IngressBookkeeping = Readonly<{ run: boolean; routes: number; waiters: number; invocations: number }>;
+/**
+ * Driver-side bookkeeping for retirement proofs: the current run, its live
+ * interaction routes and provider references, command waiters, provider calls
+ * in flight, and command admission claims held for this session.
+ */
+export type IngressBookkeeping = Readonly<{
+  run: boolean;
+  routes: number;
+  refs: number;
+  waiters: number;
+  invocations: number;
+  claims: number;
+}>;
 
 export type IngressDriver = {
   /** Reserve the session-open effect at ordinal 0 and return the inactive session sink. */
@@ -356,7 +373,13 @@ export type IngressDriver = {
   retry(sessionId: SessionId): Promise<void>;
   /** Waits for in-flight ingress; rejects as soon as any session has a fault. */
   quiesce(): Promise<void>;
-  /** Waits for every scheduled commit, reconciliation and overflow interrupt. Test-facing. */
+  /**
+   * Waits for every scheduled commit and reconciliation, and for every overflow
+   * interrupt, which includes the provider's own `interrupt()` promise: a
+   * provider whose overflow interrupt never settles keeps this pending.
+   * Command calls (`startRun`, response delivery, a command interrupt) are not
+   * awaited. Test-facing.
+   */
   settled(): Promise<void>;
   /** Direct reducer state for deterministic inspection. */
   inspect(sessionId: SessionId): Readonly<SessionIngestion<IngressPayload>> | undefined;
@@ -368,8 +391,10 @@ type Route = { readonly providerRef: string; withdrawn: boolean };
 
 /**
  * Driver-side facts about the reducer's one active or starting run: the
- * provider handle and interaction routes. Dropped as soon as the reducer
- * retires the run (terminal commit or start rejection).
+ * provider handle and the routes of its unsettled interactions. A route is
+ * retired when its settlement (response or withdrawal) commits; the whole
+ * record is dropped as soon as the reducer retires the run (terminal commit or
+ * start rejection).
  */
 type DriverRun = {
   readonly runId: RunId;
@@ -385,6 +410,24 @@ type DriverRun = {
 type Waiter = { resolve(receipt: CommandReceipt): void; reject(error: AgentRuntimeError): void };
 
 type Invocation = 'filled' | 'unknown' | 'stale';
+
+/**
+ * Same-id admission. Taken synchronously before the receipt lookup, so no
+ * other invocation of this command id can look up, reserve or start while it
+ * is held. A reservation binds it to its slot; it is released only when that
+ * slot's receipt has committed (acknowledged or proven by reconciliation) and
+ * is therefore visible to a lookup, or when admission ends without a
+ * reservation. Command ids are global, like store receipts.
+ */
+type Claim = {
+  readonly sessionId: SessionId;
+  readonly fingerprint: string;
+  readonly acceptedAt: Timestamp;
+  /** The reserved slot now holding the claim. */
+  ordinal: number | undefined;
+  readonly released: Promise<void>;
+  readonly release: () => void;
+};
 
 type Entry = {
   readonly s: SessionIngestion<IngressPayload>;
@@ -553,15 +596,21 @@ function rejectedReceipt(command: AgentCommand, error: AgentError, acceptedAt: T
   });
 }
 
+/** The receipt message of a provider failure that carries no typed reason. */
+const UNTYPED_PROVIDER_FAILURE = 'provider rejected the operation without a typed reason';
+
 /**
- * The live runtime's mapping of a rejected provider call onto a receipt error,
- * validated so a malformed provider error can never leave a reserved slot
- * unfillable (the live runtime would throw out of the command instead).
+ * A rejected provider call as a receipt error. Only a `ProviderRejection` is
+ * the SPI's deliberately normalized, typed reason; its error is validated so a
+ * malformed one can never leave a reserved slot unfillable. Any other failure
+ * (a bare `Error`, an `AgentRuntimeError`, any thrown value) carries upstream
+ * prose that may hold credentials, native identifiers or paths, so it is
+ * classified, never copied: a fixed `provider_rejected` message.
  */
 function providerError(error: unknown): AgentError {
   try {
-    const candidate: unknown = isProviderRejection(error) ? error.agentError : toAgentError(error, 'provider_rejected');
-    const parsed = AgentErrorSchema.safeParse(candidate);
+    if (!isProviderRejection(error)) return agentError('provider_rejected', UNTYPED_PROVIDER_FAILURE);
+    const parsed = AgentErrorSchema.safeParse(error.agentError);
     if (parsed.success) return parsed.data;
   } catch {
     // Fall through to the fixed classification below.
@@ -607,6 +656,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   const classifyEffectFailure = options.classifyEffectFailure ?? ((): EffectFailureClass => 'rejected');
   const sessions = new Map<SessionId, Entry>();
   const pending = new Set<Promise<unknown>>();
+  const claims = new Map<CommandId, Claim>();
   let raiseFault: () => void = () => undefined;
   let faultSignal = new Promise<void>((resolve) => {
     raiseFault = resolve;
@@ -834,6 +884,29 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     }
   }
 
+  /**
+   * Retire a settled interaction's route. Its provider reference is freed only
+   * if it still routes to this interaction: after a withdrawal the reference
+   * may already route to a newer request.
+   */
+  function retireRoute(entry: Entry, runId: RunId | undefined, interactionId: InteractionId): void {
+    const run = entry.run;
+    if (run === undefined || run.runId !== runId) return;
+    const target = run.routes.get(interactionId);
+    if (target === undefined) return;
+    run.routes.delete(interactionId);
+    if (run.refs.get(target.providerRef) === interactionId) run.refs.delete(target.providerRef);
+  }
+
+  /** A committed response settlement or withdrawal retires its interaction's route. */
+  function retireSettled(entry: Entry, op: Operation<IngressPayload>): void {
+    if (op.kind === 'effect' && op.effect === 'response' && op.result?.kind === 'response') {
+      retireRoute(entry, op.runId, op.result.command.interactionId);
+    } else if (op.kind === 'body' && op.body.kind === 'event' && op.body.interaction?.kind === 'withdrawal') {
+      retireRoute(entry, op.runId, op.body.interaction.interactionId);
+    }
+  }
+
   // ---- ingress --------------------------------------------------------------
 
   function sinkFor(entry: Entry, source: 'session' | RunSinkFence): ProviderEventSink {
@@ -1024,7 +1097,50 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   type Admission =
     | Readonly<{ kind: 'done'; outcome: IngressCommandOutcome }>
     | Readonly<{ kind: 'pending'; op: EffectOperation<IngressPayload> }>
-    | Readonly<{ kind: 'fresh' }>;
+    | Readonly<{ kind: 'fresh'; claim: Claim }>;
+
+  function takeClaim(entry: Entry, command: AgentCommand, fingerprint: string, acceptedAt: Timestamp): Claim {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const claim: Claim = {
+      sessionId: entry.s.sessionId,
+      fingerprint,
+      acceptedAt,
+      ordinal: undefined,
+      released,
+      release,
+    };
+    claims.set(command.commandId, claim);
+    return claim;
+  }
+
+  function dropClaim(commandId: CommandId, claim: Claim): void {
+    if (claims.get(commandId) !== claim) return;
+    claims.delete(commandId);
+    claim.release();
+  }
+
+  /**
+   * Run a fresh admission's synchronous reservation step. Unless that step bound
+   * the claim to a reserved slot, the claim is released as soon as it returns
+   * (or throws): nothing was reserved.
+   */
+  function withClaim<T>(commandId: CommandId, claim: Claim, reserve: () => T): T {
+    try {
+      return reserve();
+    } finally {
+      if (claim.ordinal === undefined) dropClaim(commandId, claim);
+    }
+  }
+
+  /** A committed command slot releases its claim: its receipt is now visible to a lookup. */
+  function releaseClaim(entry: Entry, op: Operation<IngressPayload>): void {
+    if (op.kind !== 'effect') return;
+    const claim = claims.get(op.identity.commandId);
+    if (claim?.sessionId === entry.s.sessionId && claim.ordinal === op.ordinal) dropClaim(op.identity.commandId, claim);
+  }
 
   function matchPending(command: AgentCommand, op: EffectOperation<IngressPayload>): Admission {
     if (op.identity.fingerprint !== canonicalCommandFingerprint(command)) {
@@ -1034,17 +1150,42 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
   }
 
   /**
-   * The queue is checked before the store: a slot leaves the queue only after
-   * its commit applied, so a command absent from the queue is either already
-   * answerable from the store or was never reserved.
+   * Same-id admission. The queue is checked first: an exact retry shares the
+   * slot, a changed payload conflicts. Otherwise the command id's claim is
+   * consulted: one held for a different payload (another session, or a lookup
+   * in progress) is the live runtime's not-recorded conflict; one held for the
+   * same payload is waited for and admission starts over. Only an unclaimed id
+   * is claimed and looked up in the store. While the claim is held nothing
+   * else can reserve this id, and the claim outlives the reservation until the
+   * receipt commits, so the lookup can never miss a commit that happened while
+   * it was in flight.
    */
-  async function admit(entry: Entry, command: AgentCommand): Promise<Admission> {
-    const queued = pendingCommand(entry, command.commandId);
-    if (queued !== undefined) return matchPending(command, queued);
-    const stored = await store.findReceipt(command.commandId);
-    if (stored !== undefined) return { kind: 'done', outcome: { kind: 'receipt', receipt: dedupe(command, stored) } };
-    const reserved = pendingCommand(entry, command.commandId);
-    return reserved === undefined ? { kind: 'fresh' } : matchPending(command, reserved);
+  async function admit(entry: Entry, command: AgentCommand, acceptedAt: Timestamp): Promise<Admission> {
+    const { commandId } = command;
+    const fingerprint = canonicalCommandFingerprint(command);
+    for (;;) {
+      const queued = pendingCommand(entry, commandId);
+      if (queued !== undefined) return matchPending(command, queued);
+      const held = claims.get(commandId);
+      if (held === undefined) break;
+      if (held.fingerprint !== fingerprint) {
+        return { kind: 'done', outcome: { kind: 'receipt', receipt: conflictReceipt(command, held.acceptedAt) } };
+      }
+      await held.released;
+    }
+    const claim = takeClaim(entry, command, fingerprint, acceptedAt);
+    let stored: Awaited<ReturnType<RuntimeStore['findReceipt']>>;
+    try {
+      stored = await store.findReceipt(commandId);
+    } catch (error) {
+      dropClaim(commandId, claim);
+      throw error;
+    }
+    if (stored !== undefined) {
+      dropClaim(commandId, claim);
+      return { kind: 'done', outcome: { kind: 'receipt', receipt: dedupe(command, stored) } };
+    }
+    return { kind: 'fresh', claim };
   }
 
   function refusal(entry: Entry, command: AgentCommand, reason: RefusalReason): IngressCommandOutcome {
@@ -1128,8 +1269,9 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return {
       deliver: () => {
         if (handle === undefined) {
+          // The runtime's own typed reason, so it is kept rather than classified as untyped.
           return Promise.reject(
-            new AgentRuntimeError(
+            new ProviderRejection(
               agentError('provider_contract_violation', `live run \`${command.runId}\` has no provider handle`),
             ),
           );
@@ -1324,8 +1466,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       );
       return;
     }
-    // Unreachable through the FIFO: a reserved response commits ahead of any withdrawal,
-    // terminal or later response for its interaction. Record the truth instead of throwing.
+    // Unreachable: a reserved response commits ahead of any withdrawal, terminal or later
+    // response for its interaction (FIFO), and a committed settlement retires the route,
+    // so no response for a settled interaction is ever reserved or delivered. Kept as a
+    // defensive fallback that records the truth instead of throwing.
     tx.emit({
       sessionId,
       payload: {
@@ -1541,8 +1685,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     const last = events.at(-1);
     if (last !== undefined) entry.lastSequence = last.sequence;
     if (advanced.publish && events.length > 0) hub.publish(sessionId, events);
+    retireSettled(entry, op);
     syncRun(entry);
     settleWaiters(entry, op, witness.receiptValue);
+    releaseClaim(entry, op);
     noteFault(entry);
     return true;
   }
@@ -1583,8 +1729,10 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       if (last !== undefined) entry.lastSequence = last.sequence;
       // Publish the read-back envelopes once; never append another copy.
       if (result.publish && envelopes.length > 0) hub.publish(entry.s.sessionId, envelopes);
+      retireSettled(entry, op);
       syncRun(entry);
       settleWaiters(entry, op, witness.receiptValue);
+      releaseClaim(entry, op);
       noteFault(entry);
       return true;
     }
@@ -1788,29 +1936,35 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
 
     async submitTurn(sessionId, input) {
       const entry = requireEntry(sessionId);
-      const admission = await admit(entry, input.command);
+      const { command } = input;
+      const admission = await admit(entry, command, input.acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
       if (admission.kind === 'pending') return retryCommand(entry, admission.op, undefined);
-      const reserved = reserveRun(entry, input);
-      if (reserved.kind === 'refused') return refusal(entry, input.command, reserved.reason);
-      if (reserved.kind === 'existing') {
-        const op = pendingCommand(entry, input.command.commandId);
-        if (op === undefined) throw internal(`start ${String(reserved.ordinal)} vanished`);
-        return retryCommand(entry, op, undefined);
-      }
-      // Reserved: the provider is called only now, and its outcome fills this same slot.
-      const { ordinal } = reserved;
-      const request: ProviderRunRequest = { input: input.command.input, sink: reserved.sink, runRef: input.runId };
-      const invocation = invoke(() => input.startRun(request)).then(
-        (handle) => settleStart(entry, ordinal, { kind: 'applied', run: handle }),
-        (error: unknown) => settleStart(entry, ordinal, { kind: 'rejected', error }),
-      );
-      entry.invocations.set(ordinal, invocation);
-      const clear = (): void => {
-        if (entry.invocations.get(ordinal) === invocation) entry.invocations.delete(ordinal);
-      };
-      invocation.then(clear, clear);
-      return slotOutcome(entry, ordinal, invocation, false);
+      const { claim } = admission;
+      return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
+        const reserved = reserveRun(entry, input);
+        if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
+        if (reserved.kind === 'existing') {
+          const op = pendingCommand(entry, command.commandId);
+          if (op === undefined) throw internal(`start ${String(reserved.ordinal)} vanished`);
+          return retryCommand(entry, op, undefined);
+        }
+        // Reserved: the slot holds the claim, the provider is called only now, and its
+        // outcome fills this same slot.
+        const { ordinal } = reserved;
+        claim.ordinal = ordinal;
+        const request: ProviderRunRequest = { input: command.input, sink: reserved.sink, runRef: input.runId };
+        const invocation = invoke(() => input.startRun(request)).then(
+          (handle) => settleStart(entry, ordinal, { kind: 'applied', run: handle }),
+          (error: unknown) => settleStart(entry, ordinal, { kind: 'rejected', error }),
+        );
+        entry.invocations.set(ordinal, invocation);
+        const clear = (): void => {
+          if (entry.invocations.get(ordinal) === invocation) entry.invocations.delete(ordinal);
+        };
+        invocation.then(clear, clear);
+        return slotOutcome(entry, ordinal, invocation, false);
+      });
     },
 
     completeRun,
@@ -1818,7 +1972,7 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     async respondToInteraction(sessionId, input) {
       const entry = requireEntry(sessionId);
       const { command, acceptedAt, deliver } = input;
-      const admission = await admit(entry, command);
+      const admission = await admit(entry, command, acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
       if (admission.kind === 'pending') {
         return retryCommand(
@@ -1827,56 +1981,67 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
           responseCall(entry, command, admission.op.identity.acceptedAt, deliver),
         );
       }
-      const run = entry.run;
-      const target = run?.routes.get(command.interactionId);
-      if (run === undefined || target === undefined) return { kind: 'refused', reason: 'interaction-unrouted' };
-      // The provider withdrew it: no response may reach the provider after that.
-      if (target.withdrawn) return { kind: 'refused', reason: 'interaction-withdrawn' };
-      const reserved = reserveEffect(entry.s, {
-        effect: 'response',
-        identity: identityOf(command, acceptedAt),
-        runId: run.runId,
-        subject: command.interactionId,
+      const { claim } = admission;
+      return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
+        // Settlement ownership is decided here, synchronously, before any provider call:
+        // a settled interaction has no route, a withdrawn one refuses, and a response
+        // still queued for it owns it (`subject-busy`).
+        const run = entry.run;
+        const target = run?.routes.get(command.interactionId);
+        if (run === undefined || target === undefined) return { kind: 'refused', reason: 'interaction-unrouted' };
+        // The provider withdrew it: no response may reach the provider after that.
+        if (target.withdrawn) return { kind: 'refused', reason: 'interaction-withdrawn' };
+        const reserved = reserveEffect(entry.s, {
+          effect: 'response',
+          identity: identityOf(command, acceptedAt),
+          runId: run.runId,
+          subject: command.interactionId,
+        });
+        if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
+        const call = responseCall(entry, command, acceptedAt, deliver);
+        if (reserved.kind === 'existing') return retryCommand(entry, reserved.op, call);
+        if (call === undefined) throw internal(`interaction \`${command.interactionId}\` lost its route`);
+        claim.ordinal = reserved.ordinal;
+        return slotOutcome(entry, reserved.ordinal, startEffect(entry, reserved.ordinal, call), false);
       });
-      if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
-      const call = responseCall(entry, command, acceptedAt, deliver);
-      if (reserved.kind === 'existing') return retryCommand(entry, reserved.op, call);
-      if (call === undefined) throw internal(`interaction \`${command.interactionId}\` lost its route`);
-      return slotOutcome(entry, reserved.ordinal, startEffect(entry, reserved.ordinal, call), false);
     },
 
     async interruptRun(sessionId, input) {
       const entry = requireEntry(sessionId);
       const { command, acceptedAt } = input;
-      const admission = await admit(entry, command);
+      const admission = await admit(entry, command, acceptedAt);
       if (admission.kind === 'done') return admission.outcome;
       if (admission.kind === 'pending') {
         return retryCommand(entry, admission.op, interruptCall(entry, command, admission.op.identity.acceptedAt));
       }
-      const reserved = reserveEffect(entry.s, {
-        effect: 'interrupt',
-        identity: identityOf(command, acceptedAt),
-        runId: command.runId,
-      });
-      if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
-      if (reserved.kind === 'existing') {
-        return retryCommand(entry, reserved.op, interruptCall(entry, command, reserved.op.identity.acceptedAt));
-      }
-      if (!reserved.deliver) {
-        // The run's one interrupt is already in flight or observed: never call the provider again.
-        const owned = structuredClone(command);
-        fillEffect(entry, reserved.ordinal, {
-          kind: 'applied',
-          result: { kind: 'interrupt', command: owned, delivered: false },
+      const { claim } = admission;
+      return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
+        const reserved = reserveEffect(entry.s, {
+          effect: 'interrupt',
+          identity: identityOf(command, acceptedAt),
+          runId: command.runId,
         });
-        return slotOutcome(entry, reserved.ordinal, undefined, false);
-      }
-      return slotOutcome(
-        entry,
-        reserved.ordinal,
-        startEffect(entry, reserved.ordinal, interruptCall(entry, command, acceptedAt)),
-        false,
-      );
+        if (reserved.kind === 'refused') return refusal(entry, command, reserved.reason);
+        if (reserved.kind === 'existing') {
+          return retryCommand(entry, reserved.op, interruptCall(entry, command, reserved.op.identity.acceptedAt));
+        }
+        claim.ordinal = reserved.ordinal;
+        if (!reserved.deliver) {
+          // The run's one interrupt is already in flight or observed: never call the provider again.
+          const owned = structuredClone(command);
+          fillEffect(entry, reserved.ordinal, {
+            kind: 'applied',
+            result: { kind: 'interrupt', command: owned, delivered: false },
+          });
+          return slotOutcome(entry, reserved.ordinal, undefined, false);
+        }
+        return slotOutcome(
+          entry,
+          reserved.ordinal,
+          startEffect(entry, reserved.ordinal, interruptCall(entry, command, acceptedAt)),
+          false,
+        );
+      });
     },
 
     fault,
@@ -1896,11 +2061,15 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       if (entry === undefined) return undefined;
       let waiters = 0;
       for (const list of entry.waiters.values()) waiters += list.length;
+      let held = 0;
+      for (const claim of claims.values()) if (claim.sessionId === sessionId) held += 1;
       return {
         run: entry.run !== undefined,
         routes: entry.run?.routes.size ?? 0,
+        refs: entry.run?.refs.size ?? 0,
         waiters,
         invocations: entry.invocations.size,
+        claims: held,
       };
     },
   };

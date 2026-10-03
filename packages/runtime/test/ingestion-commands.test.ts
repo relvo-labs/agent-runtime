@@ -136,6 +136,9 @@ const withdrawn = (providerRef: string): ProviderEventInput => ({
   payload: { type: 'interaction.withdrawn', providerRef },
 });
 const yes: InteractionResponse = { kind: 'question', answer: 'yes' };
+/** Upstream prose a bare provider `Error` may carry: a credential and a native identifier. */
+const UPSTREAM_SECRET = 'api_key=sk-live-7f3a9c2e0b1d native_thread=thr_0123456789';
+const UNTYPED_PROVIDER_FAILURE = 'provider rejected the operation without a typed reason';
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -146,7 +149,7 @@ type FakeRun = {
   /** Reasons passed to `interrupt()`, in call order. */
   readonly interrupts: (string | undefined)[];
   /** How the next `interrupt()` call settles. */
-  interruptMode: 'resolve' | 'hold' | 'reject' | 'unknown';
+  interruptMode: 'resolve' | 'hold' | 'reject' | 'unknown' | 'secret';
   readonly heldInterrupts: Deferred<undefined>[];
   interruptEntered(count?: number): Promise<void>;
   complete(termination: ProviderRunTermination): Promise<void>;
@@ -179,6 +182,8 @@ function fakeRun(): FakeRun {
             return Promise.reject(new ProviderRejection(agentError('provider_rejected', 'interrupt refused')));
           case 'unknown':
             return Promise.reject(new Error('interrupt transport reset'));
+          case 'secret':
+            return Promise.reject(new Error(`interrupt failed: ${UPSTREAM_SECRET}`));
         }
       },
     },
@@ -231,6 +236,12 @@ function fixture(options: FixtureOptions = {}) {
   const delayedWrites: (() => Promise<unknown>)[] = [];
   let gate: { entered: Deferred<undefined>; open: Deferred<undefined>; fail: boolean } | undefined;
   let commitCalls = 0;
+  /**
+   * Receipt lookups issued while holding are linearized when issued (they read the
+   * store then) and answered only when the test releases them: a delayed read.
+   */
+  let holdingLookups = false;
+  const heldLookups: (() => void)[] = [];
 
   function guarded(tx: StoreTransaction): StoreTransaction {
     return {
@@ -306,7 +317,15 @@ function fixture(options: FixtureOptions = {}) {
     read: (sessionId) => gated(() => base.read(sessionId)),
     readEvents: (sessionId, from, limit) => gated(() => base.readEvents(sessionId, from, limit)),
     readInteraction: (sessionId, interactionId) => base.readInteraction(sessionId, interactionId),
-    findReceipt: (commandId) => gated(() => base.findReceipt(commandId)),
+    findReceipt: (commandId) => {
+      if (!holdingLookups) return gated(() => base.findReceipt(commandId));
+      const answer = base.findReceipt(commandId);
+      return new Promise((resolve, reject) => {
+        heldLookups.push(() => {
+          answer.then(resolve, reject);
+        });
+      });
+    },
     listSessions: () => base.listSessions(),
   };
 
@@ -496,6 +515,7 @@ function fixture(options: FixtureOptions = {}) {
 
   return {
     clock,
+    idFactory,
     base,
     store,
     hub,
@@ -543,6 +563,20 @@ function fixture(options: FixtureOptions = {}) {
       return new Promise<void>((resolve) => {
         ackWaiters.push(resolve);
       });
+    },
+    holdLookups(on: boolean): void {
+      holdingLookups = on;
+    },
+    heldLookupCount: (): number => heldLookups.length,
+    /** Answer held lookup `index` with what the store held when it was issued. */
+    releaseLookup(index: number): void {
+      const release = heldLookups[index];
+      if (release === undefined) throw new Error(`no held lookup ${String(index)}`);
+      heldLookups[index] = () => undefined;
+      release();
+    },
+    releaseLookups(): void {
+      for (const release of heldLookups.splice(0)) release();
     },
     applyThenRejectNext(): void {
       applyThenRejectNext = true;
@@ -730,7 +764,14 @@ describe('S3-A1 start ownership and terminal submission', () => {
       output: 'hello world',
     });
     expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
-    expect(value.driver.bookkeeping(sessionId)).toEqual({ run: false, routes: 0, waiters: 0, invocations: 0 });
+    expect(value.driver.bookkeeping(sessionId)).toEqual({
+      run: false,
+      routes: 0,
+      refs: 0,
+      waiters: 0,
+      invocations: 0,
+      claims: 0,
+    });
   });
 
   it('an illegal success cancels pending interactions and fails the run instead of throwing', async () => {
@@ -857,7 +898,14 @@ describe('S3-A1 start ownership and terminal submission', () => {
     expect(turn.provider.calls).toHaveLength(1);
     expect(value.published.filter((entry) => entry.type === 'run.finished')).toHaveLength(1);
     expect(value.driver.fault(sessionId)).toBeUndefined();
-    expect(value.driver.bookkeeping(sessionId)).toEqual({ run: false, routes: 0, waiters: 0, invocations: 0 });
+    expect(value.driver.bookkeeping(sessionId)).toEqual({
+      run: false,
+      routes: 0,
+      refs: 0,
+      waiters: 0,
+      invocations: 0,
+      claims: 0,
+    });
   });
 
   it('A1: a failed terminal commit retries the identical frozen terminal; its outcome and timestamp are never rebuilt', async () => {
@@ -1169,9 +1217,10 @@ describe('S3-A3 response reservation and settlement', () => {
     const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
     await reply.provider.entered();
     await reply.provider.reject(0, new Error('connection reset'));
+    // Definite, but a bare `Error` carries no typed reason: its prose is not persisted.
     expect(receiptOf(await reply.outcome)).toMatchObject({
       disposition: 'rejected',
-      error: { code: 'provider_rejected', message: 'connection reset' },
+      error: { code: 'provider_rejected', message: UNTYPED_PROVIDER_FAILURE },
     });
   });
 });
@@ -1373,7 +1422,14 @@ describe('S3-A4 reconciliation of request, terminal and receipt-only heads', () 
     expect(value.published.filter((entry) => entry.type === 'run.finished')).toHaveLength(1);
     expect(value.published.filter((entry) => entry.type === 'turn.settled')).toHaveLength(1);
     expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
-    expect(value.driver.bookkeeping(sessionId)).toEqual({ run: false, routes: 0, waiters: 0, invocations: 0 });
+    expect(value.driver.bookkeeping(sessionId)).toEqual({
+      run: false,
+      routes: 0,
+      refs: 0,
+      waiters: 0,
+      invocations: 0,
+      claims: 0,
+    });
   });
 
   it('receipt-only head: apply-then-reject rejects the waiting submit promptly with A, then reconciles once without a second write', async () => {
@@ -1540,8 +1596,292 @@ describe('S3-A9 retirement inside the seam', () => {
     expect(state?.queue).toHaveLength(0);
     expect(state?.counted).toBe(0);
     expect(Object.keys(state ?? {}).sort()).toEqual(shape);
-    expect(value.driver.bookkeeping(sessionId)).toEqual({ run: false, routes: 0, waiters: 0, invocations: 0 });
+    expect(value.driver.bookkeeping(sessionId)).toEqual({
+      run: false,
+      routes: 0,
+      refs: 0,
+      waiters: 0,
+      invocations: 0,
+      claims: 0,
+    });
     expect((await value.history(sessionId)).filter((event) => event.payload.type === 'turn.settled')).toHaveLength(60);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Repair round 1: same-id admission, settlement ownership, untyped provider prose
+// ---------------------------------------------------------------------------
+
+type Raced = Readonly<{ kind: 'outcome'; outcome: IngressCommandOutcome }> | Readonly<{ kind: 'provider-called' }>;
+
+/** Whichever happens first: the command settles, or it reaches the provider. */
+function outcomeOrCall(outcome: Promise<IngressCommandOutcome>, called: Promise<void>): Promise<Raced> {
+  return Promise.race([
+    outcome.then((value): Raced => ({ kind: 'outcome', outcome: value })),
+    called.then((): Raced => ({ kind: 'provider-called' })),
+  ]);
+}
+
+describe('S3R1 same-id admission', () => {
+  it('a receipt lookup held across another invocation’s reserve, commit and retirement never starts the command again', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    value.holdLookups(true);
+    const turn = value.submit(sessionId);
+    const retried = turn.retry();
+    value.holdLookups(false);
+
+    // The first invocation's lookup answers; it reserves, starts, commits and retires.
+    value.releaseLookup(0);
+    await turn.provider.entered();
+    const run = fakeRun();
+    await turn.provider.resolve(0, run.handle);
+    const receipt = receiptOf(await turn.outcome);
+    expect(receipt.disposition).toBe('applied');
+    await run.complete({ outcome: 'succeeded' });
+    await value.driver.settled();
+    expect(value.driver.inspect(sessionId)?.run).toBeUndefined();
+
+    // Any lookup issued before that commit now answers with what it read then (nothing).
+    value.releaseLookups();
+    const second = await outcomeOrCall(retried, turn.provider.entered(2));
+    expect(second).toEqual({
+      kind: 'outcome',
+      outcome: { kind: 'receipt', receipt: { ...receipt, disposition: 'duplicate' } },
+    });
+    expect(turn.provider.calls).toHaveLength(1);
+    await value.driver.settled();
+    const events = await value.history(sessionId);
+    expect(events.filter((event) => event.payload.type === 'run.started')).toHaveLength(1);
+    expect(events.filter((event) => event.payload.type === 'turn.settled')).toHaveLength(1);
+    expect((await value.base.findReceipt(turn.command.commandId))?.receipt).toEqual(receipt);
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ claims: 0, waiters: 0, invocations: 0 });
+  });
+
+  it('the same command id on another session is a not-recorded conflict while the first is unresolved; the first receipt is never overwritten', async () => {
+    const value = fixture();
+    const first = await value.open();
+    const other = await value.open();
+    const turn = value.submit(first.sessionId);
+    await turn.provider.entered();
+
+    const foreignProvider = controllable<[ProviderRunRequest], ProviderRun>(() => undefined);
+    const foreignCommand: SubmitTurnCommand = { ...turn.command, sessionId: other.sessionId };
+    const foreign = value.driver.submitTurn(other.sessionId, {
+      command: foreignCommand,
+      acceptedAt: value.clock.now(),
+      turnId: TurnIdSchema.parse(value.idFactory.next('turn')),
+      runId: RunIdSchema.parse(value.idFactory.next('run')),
+      attempt: 1,
+      startRun: foreignProvider.fn,
+    });
+    const raced = await outcomeOrCall(foreign, foreignProvider.entered());
+    expect(raced.kind).toBe('outcome');
+    if (raced.kind !== 'outcome') throw new Error('the foreign command reached the provider');
+    expect(receiptOf(raced.outcome)).toMatchObject({
+      commandId: turn.command.commandId,
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(foreignProvider.calls).toHaveLength(0);
+    expect(value.driver.inspect(other.sessionId)?.queue).toHaveLength(0);
+
+    await turn.provider.resolve(0, fakeRun().handle);
+    const receipt = receiptOf(await turn.outcome);
+    expect(receipt.disposition).toBe('applied');
+    expect(await value.base.findReceipt(turn.command.commandId)).toEqual({
+      fingerprint: canonicalCommandFingerprint(turn.command),
+      receipt,
+    });
+    expect(value.driver.bookkeeping(first.sessionId)).toMatchObject({ claims: 0 });
+    expect(value.driver.bookkeeping(other.sessionId)).toMatchObject({ claims: 0 });
+  });
+});
+
+describe('S3R1 settlement ownership and route retirement', () => {
+  it('a response admitted on a delayed lookup after another response settled the interaction is refused before delivery', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
+
+    // Both responses were validated while the interaction was pending; the late one's lookup is held.
+    value.holdLookups(true);
+    const late = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    value.holdLookups(false);
+    const first = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    await first.provider.entered();
+    await first.provider.resolve(0, undefined);
+    expect(receiptOf(await first.outcome).disposition).toBe('applied');
+    await value.driver.settled();
+
+    value.releaseLookups();
+    const raced = await outcomeOrCall(late.outcome, late.provider.entered());
+    expect(raced).toEqual({ kind: 'outcome', outcome: { kind: 'refused', reason: 'interaction-unrouted' } });
+    expect(late.provider.calls).toHaveLength(0);
+    await value.driver.settled();
+    const settlements = (await value.history(sessionId)).filter(
+      (event) => event.payload.type === 'interaction.settled',
+    );
+    expect(settlements).toHaveLength(1);
+    expect(settlements[0]?.payload).toMatchObject({ interactionId, settlement: { outcome: 'responded' } });
+    expect(await value.base.findReceipt(late.command.commandId)).toBeUndefined();
+    expect(value.driver.fault(sessionId)).toBeUndefined();
+    expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
+  });
+
+  it('300 settlements within one run leave no routes or references behind at any point', async () => {
+    // Every settlement is checked, so the count only has to exceed one. It stays well
+    // below the reviewer's 1,100: each materializer's `tx.session()` deep-clones the
+    // in-memory record, so one run's settlements cost O(history²) test time.
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    let cursor = (await value.history(sessionId)).at(-1)?.sequence ?? 0;
+    async function tail(): Promise<readonly EventEnvelope[]> {
+      const page = await value.base.readEvents(sessionId, cursor as Sequence, 100);
+      cursor = page.events.at(-1)?.sequence ?? cursor;
+      return page.events;
+    }
+
+    let peakRoutes = 0;
+    let responded = 0;
+    let withdrawals = 0;
+    for (let index = 0; index < 300; index += 1) {
+      const providerRef = `q-${String(index)}`;
+      turn.sink().emit(question(providerRef));
+      await value.driver.settled();
+      const request = (await tail()).find((event) => event.payload.type === 'interaction.requested');
+      if (request?.payload.type !== 'interaction.requested') throw new Error(`request ${String(index)} not stored`);
+      if (index % 2 === 0) {
+        const reply = value.respond(sessionId, value.respondCommand(sessionId, request.payload.interactionId));
+        await reply.provider.entered();
+        await reply.provider.resolve(0, undefined);
+        expect(receiptOf(await reply.outcome).disposition).toBe('applied');
+      } else {
+        turn.sink().emit(withdrawn(providerRef));
+      }
+      await value.driver.settled();
+      for (const event of await tail()) {
+        if (event.payload.type !== 'interaction.settled') continue;
+        if (event.payload.settlement.outcome === 'responded') responded += 1;
+        if (event.payload.settlement.outcome === 'withdrawn') withdrawals += 1;
+      }
+      peakRoutes = Math.max(peakRoutes, value.driver.bookkeeping(sessionId)?.routes ?? 0);
+    }
+
+    expect({ responded, withdrawals }).toEqual({ responded: 150, withdrawals: 150 });
+    expect(peakRoutes).toBe(0);
+    expect(value.driver.bookkeeping(sessionId)).toEqual({
+      run: true,
+      routes: 0,
+      refs: 0,
+      waiters: 0,
+      invocations: 0,
+      claims: 0,
+    });
+    expect(value.driver.inspect(sessionId)?.queue).toHaveLength(0);
+    await turn.run.complete({ outcome: 'succeeded' });
+    await value.driver.settled();
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ run: false, routes: 0, refs: 0 });
+  });
+
+  it('retiring a settled interaction frees its reference only while it still routes to that interaction', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const turn = await value.started(sessionId);
+    const first = await value.requested(sessionId, turn.sink(), 'r');
+    const reply = value.respond(sessionId, value.respondCommand(sessionId, first));
+    await reply.provider.entered();
+
+    // While the response is in flight the provider withdraws `r` and reuses it for a new request.
+    turn.sink().emit(withdrawn('r'));
+    turn.sink().emit(question('r'));
+    await reply.provider.resolve(0, undefined);
+    expect(receiptOf(await reply.outcome).disposition).toBe('applied');
+    await value.driver.settled();
+    const requests = (await value.history(sessionId)).flatMap((event) =>
+      event.payload.type === 'interaction.requested' ? [event.payload.interactionId] : [],
+    );
+    expect(requests).toHaveLength(2);
+    const second = requests[1];
+    expect(second).not.toBe(first);
+
+    // `r` still routes to the second interaction: reuse is a diagnostic and a withdrawal settles it.
+    turn.sink().emit(question('r'));
+    turn.sink().emit(withdrawn('r'));
+    await value.driver.settled();
+    const events = await value.history(sessionId);
+    expect(types(events).slice(-2)).toEqual(['diagnostic', 'interaction.settled']);
+    expect(messages(events).at(-1)).toBe('provider reused active interaction reference `r`');
+    expect(events.at(-1)?.payload).toMatchObject({ interactionId: second, settlement: { outcome: 'withdrawn' } });
+    expect(await value.base.readInteraction(sessionId, first)).toMatchObject({
+      status: 'settled',
+      settlement: { outcome: 'responded' },
+    });
+    expect(value.driver.bookkeeping(sessionId)).toMatchObject({ run: true, routes: 0, refs: 0 });
+  });
+});
+
+describe('S3R1 untyped provider failures', () => {
+  it('a bare provider Error persists a fixed message: no upstream prose in receipts, events or returned outcomes', async () => {
+    const value = fixture();
+    const { sessionId } = await value.open();
+    const commandIds: CommandId[] = [];
+
+    const rejectedTurn = value.submit(sessionId);
+    commandIds.push(rejectedTurn.command.commandId);
+    await rejectedTurn.provider.entered();
+    await rejectedTurn.provider.reject(0, new Error(`startRun failed: ${UPSTREAM_SECRET}`));
+    const startOutcome = await rejectedTurn.outcome;
+
+    const turn = await value.started(sessionId);
+    commandIds.push(turn.command.commandId);
+    const interactionId = await value.requested(sessionId, turn.sink(), 'q-1');
+    const reply = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    commandIds.push(reply.command.commandId);
+    await reply.provider.entered();
+    await reply.provider.reject(0, new Error(UPSTREAM_SECRET));
+    const responseOutcome = await reply.outcome;
+
+    const runtimeTyped = value.respond(sessionId, value.respondCommand(sessionId, interactionId));
+    commandIds.push(runtimeTyped.command.commandId);
+    await runtimeTyped.provider.entered();
+    await runtimeTyped.provider.reject(0, new AgentRuntimeError(agentError('provider_unavailable', UPSTREAM_SECRET)));
+    const runtimeTypedOutcome = await runtimeTyped.outcome;
+
+    turn.run.interruptMode = 'secret';
+    const interruptCommand = value.interruptCommand(sessionId, turn.runId);
+    commandIds.push(interruptCommand.commandId);
+    const interruptOutcome = await value.interrupt(sessionId, interruptCommand);
+
+    for (const outcome of [startOutcome, responseOutcome, runtimeTypedOutcome, interruptOutcome]) {
+      expect(receiptOf(outcome)).toMatchObject({
+        disposition: 'rejected',
+        error: { code: 'provider_rejected', message: UNTYPED_PROVIDER_FAILURE },
+      });
+    }
+
+    // A typed ProviderRejection keeps its deliberately normalized message.
+    turn.run.interruptMode = 'reject';
+    const typed = value.interruptCommand(sessionId, turn.runId);
+    commandIds.push(typed.commandId);
+    expect(receiptOf(await value.interrupt(sessionId, typed))).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'provider_rejected', message: 'interrupt refused' },
+    });
+
+    await value.driver.settled();
+    const persisted = JSON.stringify({
+      outcomes: [startOutcome, responseOutcome, runtimeTypedOutcome, interruptOutcome],
+      receipts: await Promise.all(commandIds.map((id) => value.base.findReceipt(id))),
+      events: await value.history(sessionId),
+      published: value.published,
+    });
+    expect(persisted).toContain(UNTYPED_PROVIDER_FAILURE);
+    expect(persisted).not.toContain('sk-live');
+    expect(persisted).not.toContain('thr_0123456789');
+    expect(value.driver.fault(sessionId)).toBeUndefined();
   });
 });
 
