@@ -38,18 +38,27 @@ async function fixture() {
   const nativeReplies = () => fake.sent.filter((frame) => 'id' in frame && frame.id === 501 && !('method' in frame));
   let failSettlement = false;
   let failedCommits = 0;
+  const revisionsAtFailure: { before: number; after: number }[] = [];
   const store: RuntimeStore = {
     ...base,
     get revision() {
       return base.revision;
     },
+    // The injected failure rejects without ever calling the underlying store, and every
+    // read goes straight to it: a rejected commit never applies, now or later, and a read
+    // after the failure sees every applied commit. That is the strong store contract, so
+    // this wrapper declares it explicitly (issue #43); `revisionsAtFailure` proves it.
+    contract: { version: 1, level: 'strong' },
     commit: (mutate) => {
       if (failSettlement) {
         failSettlement = false;
         // The observable provider effect must precede this injected store failure.
         expect(nativeReplies()).toEqual([{ id: 501, result: { decision: 'accept' } }]);
         failedCommits += 1;
-        return Promise.reject(new Error('injected Codex settlement commit failure'));
+        const before = base.revision;
+        return Promise.reject(new Error('injected Codex settlement commit failure')).finally(() => {
+          revisionsAtFailure.push({ before, after: base.revision });
+        });
       }
       return base.commit(mutate);
     },
@@ -115,6 +124,7 @@ async function fixture() {
       failSettlement = true;
     },
     failedCommits: () => failedCommits,
+    revisionsAtFailure: () => revisionsAtFailure,
   };
 }
 
@@ -129,10 +139,18 @@ describe('concrete Runtime + Codex approval settlement', () => {
       response: { kind: 'approval' as const, decision: 'approved' as const, mode: 'once' as const },
     };
     value.failSettlement();
-    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow(
-      'injected Codex settlement commit failure',
-    );
+    // The proven-unapplied commit is the session's retryable ingestion fault (F); the
+    // store's own text is never surfaced.
+    await expect(value.runtime.respondToInteraction(command)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } },
+    });
     expect(value.failedCommits()).toBe(1);
+    // The rejected commit applied nothing.
+    expect(value.revisionsAtFailure()).toHaveLength(1);
+    expect(value.revisionsAtFailure()[0]?.after).toBe(value.revisionsAtFailure()[0]?.before);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId: value.sessionId, error: { retryable: true, details: { fault: 'failure' } } },
+    ]);
     expect(value.nativeReplies()).toEqual([{ id: 501, result: { decision: 'accept' } }]);
     expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('pending');
     expect(await value.store.findReceipt(command.commandId)).toBeUndefined();
@@ -149,8 +167,11 @@ describe('concrete Runtime + Codex approval settlement', () => {
     });
     await expect(value.runtime.respondToInteraction(command)).resolves.toMatchObject({ disposition: 'duplicate' });
     expect(value.nativeReplies()).toHaveLength(1);
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
     value.fake.push(turnCompleted('completed'));
     await value.runtime.quiesce();
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('succeeded');
+    expect(value.nativeReplies()).toEqual([{ id: 501, result: { decision: 'accept' } }]);
   });
 
   it('rejects a real Runtime late response after interrupt acknowledgement and before terminal notification', async () => {
@@ -164,18 +185,33 @@ describe('concrete Runtime + Codex approval settlement', () => {
       }),
     ).resolves.toMatchObject({ disposition: 'applied' });
     expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('interrupting');
-    await expect(
-      value.runtime.respondToInteraction({
-        commandId: value.next(),
-        type: 'respond_to_interaction',
-        sessionId: value.sessionId,
-        interactionId: value.interactionId,
-        response: { kind: 'approval', decision: 'approved', mode: 'once' },
-      }),
-    ).resolves.toMatchObject({ disposition: 'rejected', error: { code: 'unknown_interaction' } });
+    const late = {
+      commandId: value.next(),
+      type: 'respond_to_interaction' as const,
+      sessionId: value.sessionId,
+      interactionId: value.interactionId,
+      response: { kind: 'approval' as const, decision: 'approved' as const, mode: 'once' as const },
+    };
+    // The interrupt fence refuses the late response before any provider call. The refusal
+    // may change without any change to the command, so it is returned, never recorded.
+    await expect(value.runtime.respondToInteraction(late)).rejects.toMatchObject({
+      error: { code: 'illegal_state_transition', retryable: true, details: { reason: 'run-not-active' } },
+    });
+    expect(await value.store.findReceipt(late.commandId)).toBeUndefined();
+    // The only native reply is the adapter's own decline from the interrupt acknowledgement.
     expect(value.nativeReplies()).toEqual([{ id: 501, result: { decision: 'decline' } }]);
     value.fake.push(turnCompleted('interrupted'));
     await value.runtime.quiesce();
     expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('interrupted');
+    // After the terminal, the exact retry gets the store's truthful, recorded answer and
+    // still never reaches the provider.
+    // The terminal settled the pending interaction (cancelled), so that is the answer.
+    expect(await value.runtime.respondToInteraction(late)).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'interaction_already_settled' },
+    });
+    expect(await value.store.findReceipt(late.commandId)).toMatchObject({ receipt: { disposition: 'rejected' } });
+    expect(value.nativeReplies()).toEqual([{ id: 501, result: { decision: 'decline' } }]);
+    expect((await value.runtime.getSession(value.sessionId))?.interactions[0]?.status).toBe('settled');
   });
 });

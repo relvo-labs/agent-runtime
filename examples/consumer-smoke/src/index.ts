@@ -1,5 +1,6 @@
 import { EXECUTOR_CONFORMANCE_CASES, type AgentExecutor } from '@relvo-labs/agent-executor';
 import {
+  AgentRuntimeError,
   WIRE_VERSION,
   createCounterIdFactory,
   createFixedClock,
@@ -10,6 +11,7 @@ import {
   QuestionSetResponseSchema,
   type CommandReceipt,
   type InteractionResponse,
+  type InterruptRunCommandInput,
   type QuestionAnswer,
   type QuestionItem,
   type QuestionSetRequest,
@@ -81,7 +83,14 @@ import {
   type CodexTransportParams,
   type CodexWireError,
 } from '@relvo-labs/agent-provider-codex';
-import { createAgentRuntime, type AgentRuntime, type ProviderIngestionFault } from '@relvo-labs/agent-runtime';
+import {
+  createAgentRuntime,
+  createInMemoryStore,
+  type AgentRuntime,
+  type ProviderIngestionFault,
+  type RuntimeStore,
+  type RuntimeStoreContract,
+} from '@relvo-labs/agent-runtime';
 import { createLocalWorkspaceProvider, validateWorkspaceLease, type WorkspaceLease } from '@relvo-labs/agent-workspace';
 import { READ_ONLY_GIT_COMMANDS, assertReadOnly, type GitRunner } from '@relvo-labs/agent-workspace-git';
 
@@ -98,6 +107,89 @@ function inspectProviderIngress(value: AgentRuntime): readonly ProviderIngestion
   return faults;
 }
 void inspectProviderIngress;
+
+/**
+ * Issue #43: a host recovers a recoverable ingestion fault with the required
+ * `retryProviderIngestion`. `error.details.fault` names the kind; only an F-only
+ * entry is retryable, and a rejected retry carries the remaining fault.
+ */
+async function recoverProviderIngress(value: AgentRuntime, sessionId: SessionId): Promise<boolean> {
+  const fault: ProviderIngestionFault | undefined = value
+    .getProviderIngestionFaults()
+    .find((entry) => entry.sessionId === sessionId);
+  if (fault === undefined) return true;
+  const stage: 'event' | 'completion' = fault.stage;
+  const count: number = fault.failureCount;
+  void stage;
+  void count;
+  if (!fault.error.retryable) return false;
+  const single: Promise<void> = value.retryProviderIngestion(sessionId);
+  const everySession: Promise<void> = value.retryProviderIngestion();
+  try {
+    await single;
+    await everySession;
+    return true;
+  } catch {
+    return false;
+  }
+}
+void recoverProviderIngress;
+
+/** The method is required: a structural runtime without it no longer type-checks. */
+type RuntimeWithoutRetry = Omit<AgentRuntime, 'retryProviderIngestion'>;
+function requireFullRuntime(partial: RuntimeWithoutRetry): void {
+  // @ts-expect-error -- `retryProviderIngestion` is a required member of `AgentRuntime`.
+  const full: AgentRuntime = partial;
+  void full;
+}
+void requireFullRuntime;
+
+/**
+ * Issue #43, decision B: to learn one interrupt's outcome, retry that exact command (same
+ * ID and payload). A new command ID chooses its own outcome when it is admitted, so it is
+ * not a way to observe an earlier interrupt. A close that reports a retryable error (for
+ * example `details.pending: 'persistence'`) is retried with the same command as well.
+ */
+async function interruptOnce(value: AgentRuntime, command: InterruptRunCommandInput): Promise<boolean | undefined> {
+  let receipt: CommandReceipt;
+  try {
+    receipt = await value.interruptRun(command);
+  } catch (error) {
+    if (!(error instanceof AgentRuntimeError) || !error.error.retryable) throw error;
+    receipt = await value.interruptRun(command);
+  }
+  return receipt.result?.type === 'run_interrupt_requested' ? receipt.result.delivered : undefined;
+}
+void interruptOnce;
+
+/**
+ * A custom store adapter declares the guarantees it keeps. Only the version 1
+ * `strong` level lets the runtime reconcile and retry a rejected commit; the
+ * declaration is the adapter's promise, not something the runtime can verify.
+ */
+const strongContract: RuntimeStoreContract = { version: 1, level: 'strong' };
+const baselineContract: RuntimeStoreContract = { version: 1, level: 'baseline' };
+function declareContract(store: RuntimeStore, contract: RuntimeStoreContract): RuntimeStore {
+  return {
+    contract,
+    get revision() {
+      return store.revision;
+    },
+    commit: (mutate) => store.commit(mutate),
+    read: (sessionId) => store.read(sessionId),
+    readEvents: (sessionId, fromSequence, limit) => store.readEvents(sessionId, fromSequence, limit),
+    readInteraction: (sessionId, interactionId) => store.readInteraction(sessionId, interactionId),
+    findReceipt: (commandId) => store.findReceipt(commandId),
+    listSessions: () => store.listSessions(),
+  };
+}
+const declaredStore: RuntimeStore = declareContract(createInMemoryStore({ clock, idFactory }), strongContract);
+const declaredRuntime: AgentRuntime = createAgentRuntime({ workspaces, store: declaredStore, clock, idFactory });
+// @ts-expect-error -- only `baseline` and `strong` are declarable levels.
+const unknownLevel: RuntimeStoreContract = { version: 1, level: 'linearizable' };
+void baselineContract;
+void declaredRuntime;
+void unknownLevel;
 const descriptor = defineProviderDescriptor({
   providerId: 'consumer-fixture',
   providerVersion: '0.1.0',

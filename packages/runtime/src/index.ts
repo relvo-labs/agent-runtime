@@ -15,6 +15,7 @@ export {
 export {
   createInMemoryStore,
   type RuntimeStore,
+  type RuntimeStoreContract,
   type StoreTransaction,
   type CommitResult,
   type SessionRecord,

@@ -37,11 +37,14 @@ export type { ProviderRecoveryRecord } from '@relvo-labs/agent-protocol';
  * `createSession()` or `startRun()` returns. Runtime parses, clones, and freezes
  * each value during this call, then stages the first 256 captured results in
  * order. It commits them only after the owning `session.opened` or `run.started`
- * event and records an explicit warning diagnostic if the deterministic tail
- * exceeds that bound. Mutating or reusing `input` after `emit` cannot rewrite
- * an emission or change whether it was valid. Cyclic/non-plain JavaScript input
- * becomes a typed provider-contract diagnostic; it is never staged as an event
- * value, and `emit` remains non-throwing.
+ * event. Emissions beyond that bound, or beyond the session's 1,023 unpersisted
+ * operations, are refused and mark the session's history permanently incomplete
+ * (and the run is interrupted); nothing past the bound is retained. Mutating or
+ * reusing `input` after `emit` cannot rewrite an emission or change whether it
+ * was valid. Cyclic/non-plain JavaScript input becomes a typed provider-contract
+ * diagnostic; it is never staged as an event value, and `emit` remains
+ * non-throwing. A sink whose run has finished, or whose session has closed, is
+ * stale: its emissions are discarded.
  */
 export type ProviderEventSink = {
   emit(input: ProviderEventInput): void;
@@ -115,7 +118,12 @@ export type ProviderRun = {
    *
    * Must be idempotent, and must be safe to call after the run has already
    * terminated (in which case it does nothing). A provider whose descriptor
-   * says `interrupt.mode === 'unsupported'` may reject here.
+   * says `interrupt.mode === 'unsupported'` should reject with a
+   * `ProviderRejection`. If this call fails with anything other than a
+   * `ProviderRejection`, the outcome is unknown: the owning `interrupt_run`
+   * command's exact retry calls `interrupt()` again for the same run, and the
+   * runtime's session close may also call it (`'session closing'`), so a
+   * repeated call must not have a second effect.
    */
   interrupt(reason?: string): Promise<void>;
 };
@@ -126,6 +134,15 @@ export type ProviderSession = {
    * Begin a run. The provider must not start more than the descriptor allows.
    * Emitting synchronously through `request.sink` is valid; Runtime preserves
    * those emissions behind the owning run-start event.
+   *
+   * Idempotency (hard obligation). If this call fails with anything other than
+   * a `ProviderRejection`, Runtime treats the outcome as unknown: the provider
+   * may already have started the run. Only an exact retry of the same
+   * `submit_turn` calls `startRun` again, with the same `runRef`, the same input
+   * and the same sink. An adapter must recognize a `runRef` it may already have
+   * started and return (or resume) that run rather than start a second one;
+   * output emitted during either attempt stays staged, in order, behind the one
+   * run start.
    */
   startRun(request: ProviderRunRequest): Promise<ProviderRun>;
 
@@ -134,7 +151,8 @@ export type ProviderSession = {
    * supplied on the corresponding `interaction.requested` payload.
    *
    * Re-delivery of an already-applied response must be a no-op, not a second
-   * application.
+   * application. This includes the exact command retry that follows a failure
+   * other than a `ProviderRejection`, whose outcome Runtime treats as unknown.
    */
   respondToInteraction(providerRef: string, response: InteractionResponse): Promise<void>;
 
@@ -181,9 +199,17 @@ export type AgentProvider = {
 /**
  * Thrown by a provider to reject an operation with a typed reason.
  *
- * A provider that throws a bare `Error` still works — the runtime maps it to
- * `provider_rejected` — but loses the ability to say *why* in a way a consumer
- * can branch on.
+ * Only a `ProviderRejection` is a definite rejection: Runtime records a
+ * rejected receipt carrying this `agentError`, the effect is considered not
+ * applied, and a later command with a new ID may try again (an exact retry of
+ * the rejected command replays its receipt). Any other failure from `startRun`,
+ * `respondToInteraction` or `ProviderRun.interrupt` (a bare `Error`, a
+ * transport or native failure, any thrown value) is an unknown outcome: nothing
+ * is recorded, the command fails with a retryable `provider_unavailable` and a
+ * fixed message (upstream text is never persisted or returned), the run's
+ * terminal waits behind it, and only an exact retry of that command delivers
+ * the same effect again. Throw a `ProviderRejection` whenever the provider
+ * knows the operation did not take effect.
  */
 export class ProviderRejection extends Error {
   readonly agentError: AgentError;
