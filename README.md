@@ -26,16 +26,16 @@ untouched by release.
 
 ## Packages
 
-| Package                             | Responsibility                                                  |
-| ----------------------------------- | --------------------------------------------------------------- |
-| `@relvo-labs/agent-protocol`        | Zod wire schemas, inferred types, generated JSON Schema         |
-| `@relvo-labs/agent-executor`        | Consumer contract and executor conformance kit                  |
-| `@relvo-labs/agent-provider`        | Neutral provider SPI and deterministic test provider            |
-| `@relvo-labs/agent-runtime`         | Composition root, in-memory store, lifecycle and subscriptions  |
-| `@relvo-labs/agent-workspace`       | Workspace leases and guarded local implementation               |
-| `@relvo-labs/agent-workspace-git`   | Git workspace boundary with an injected command seam            |
-| `@relvo-labs/agent-provider-codex`  | Codex adapter over the official app-server stdio JSONL protocol |
-| `@relvo-labs/agent-provider-claude` | Claude adapter over the official Claude Agent SDK query API     |
+| Package                             | Responsibility                                            | README                                                                                           |
+| ----------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `@relvo-labs/agent-protocol`        | Wire schemas, inferred types and JSON Schema              | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/protocol/README.md)        |
+| `@relvo-labs/agent-executor`        | Consumer contract and executor conformance kit            | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/executor/README.md)        |
+| `@relvo-labs/agent-provider`        | Neutral provider SPI and scripted test provider           | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider/README.md)        |
+| `@relvo-labs/agent-runtime`         | Composition, in-memory store, lifecycle and subscriptions | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/runtime/README.md)         |
+| `@relvo-labs/agent-workspace`       | Workspace leases and guarded local directories            | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/workspace/README.md)       |
+| `@relvo-labs/agent-workspace-git`   | Git provisioning through an injected command runner       | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/workspace-git/README.md)   |
+| `@relvo-labs/agent-provider-codex`  | Codex app-server stdio JSONL adapter                      | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider-codex/README.md)  |
+| `@relvo-labs/agent-provider-claude` | Claude Agent SDK query adapter                            | [Read](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider-claude/README.md) |
 
 ## Try it: reference app
 
