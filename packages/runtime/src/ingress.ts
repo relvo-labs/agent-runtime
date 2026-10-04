@@ -123,6 +123,7 @@ import {
   reserveEffect,
   reserveStart,
   retire,
+  runPhase,
   settleEffect,
   type BodyOperation,
   type CleanupPhase,
@@ -1939,6 +1940,31 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
     return undefined;
   }
 
+  /**
+   * Why a fresh `interrupt_run` command ID cannot be admitted now although the
+   * reducer would reserve it: the session holds an ingestion fault, A or F
+   * (decision B: an ingestion fault produces the fault result and no new
+   * reservation). Checked synchronously right before `reserveEffect`, and only
+   * where the reducer would otherwise reserve: its own refusals keep their
+   * precedence (session state, close, O, and `run-not-active` for a run that is
+   * not current, not started or whose terminal is placed), so this guard adds
+   * A/F refusal ahead of the reservation and the capacity check alone. Exact
+   * retries and admitted followers never reach it.
+   */
+  function freshInterruptRefusal(
+    entry: Entry,
+    command: Extract<AgentCommand, { type: 'interrupt_run' }>,
+  ): RefusalReason | undefined {
+    const s = entry.s;
+    // An identity already queued is resolved by `reserveEffect` (shared slot or conflict).
+    if (pendingCommand(entry, command.commandId) !== undefined) return undefined;
+    if (s.state !== 'open' || s.close !== undefined || s.faults.overflow !== undefined) return undefined;
+    const phase = runPhase(s);
+    if (s.run?.runId !== command.runId || (phase !== 'R' && phase !== 'E')) return undefined;
+    if (s.faults.ambiguous !== undefined || s.faults.failure !== undefined) return 'head-blocked';
+    return undefined;
+  }
+
   type EffectCall = Readonly<{
     deliver: () => Promise<void>;
     applied: () => IngressPayload;
@@ -3295,6 +3321,12 @@ export function createIngressDriver(options: IngressDriverOptions): IngressDrive
       }
       const { claim } = admission;
       return withClaim(command.commandId, claim, (): IngressCommandOutcome | Promise<IngressCommandOutcome> => {
+        // Fresh admission only: held, queued and stored identities were resolved above. An
+        // ingestion fault (A or F) present now, after every await of this admission, refuses
+        // the fresh interrupt with the session's fault: no reservation, no provider call, and
+        // `withClaim` releases the unbound claim. O is refused by `reserveEffect` itself.
+        const blocked = freshInterruptRefusal(entry, command);
+        if (blocked !== undefined) return { kind: 'refused', reason: blocked };
         const reserved = reserveEffect(entry.s, {
           effect: 'interrupt',
           identity: identityOf(command, acceptedAt),
