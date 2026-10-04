@@ -9,4 +9,4 @@
 '@relvo-labs/agent-workspace-git': patch
 ---
 
-Expand package READMEs with installation, checked TypeScript examples, public API overviews and documented limits; documentation only, with no behavior change.
+Expand package READMEs with installation, TypeScript examples, public API overviews and documented limits; documentation only, with no behavior change.

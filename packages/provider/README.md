@@ -72,7 +72,7 @@ for command receipts, runtime-stamped events and workspace cleanup around this d
 | `canInterruptRun`, `interruptPreservesSession`           | Check interrupt availability and session survival.                                     |
 | `canRaiseApproval`, `canAskQuestionSet`                  | Check approval mode and multi-question capability/count.                               |
 | `canAcceptWorkspace`, `checkWireCompatibility`           | Check ownership acceptance and exact wire compatibility.                               |
-| `CapabilityCheck`                                        | Success or a typed capability error, discriminated by `ok`.                            |
+| `CapabilityCheck`                                        | Success or a typed `AgentError`, discriminated by `ok`.                                |
 
 The `/testing` subpath exports `createScriptedProvider`, `ScriptStep`,
 `ScriptedController` and `ScriptedProviderOptions`. Scripts support deltas, tool

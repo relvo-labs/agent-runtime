@@ -63,8 +63,8 @@ it on close or failed-open rollback. Interrupting a run does not release its lea
 | `BorrowedWorkspaceLease`, `ManagedWorkspaceLease`, `WorkspaceLeaseFor` | Ownership-specific lease types and spec-to-lease type mapping.                           |
 | `createLocalWorkspaceProvider`, `LocalWorkspaceProviderOptions`        | Local acquisition with base directory, clock, ID factory and optional test removal seam. |
 | `validateWorkspaceLease(spec, lease)`                                  | Async descriptor/live-handle validation, including existing-path canonical realpath.     |
-| `checkRemovable(request)`                                              | Return a removal refusal or `undefined`.                                                 |
-| `assertRemovable(request)`                                             | Throw a typed ownership error on a refusal.                                              |
+| `checkRemovable(request)`                                              | Resolves to a removal refusal or `undefined`.                                            |
+| `assertRemovable(request)`                                             | Rejects with a typed `workspace_ownership_violation` on a refusal.                       |
 | `RemovalRequest`, `RemovalRefusal`                                     | Inputs and diagnostics for removal checks.                                               |
 | `isStrictlyInside(parent, child)`                                      | Segment-aware strict path containment.                                                   |
 | `resolveRealPath(path)`                                                | Resolve symlinks; lexical resolution only when the path is absent.                       |

@@ -48,7 +48,8 @@ exists. The host passes a validated command to an executor and checks its receip
 ## API overview
 
 All names below are exported from the package root. Schema names validate data;
-the listed types describe parsed output unless explicitly named `Input`.
+the listed types describe parsed output, except the `*CommandInput`,
+`ProviderDescriptorInput` and `SubscriptionRequestInput` caller-input types.
 
 ### Version and schema identity
 

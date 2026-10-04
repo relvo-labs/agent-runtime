@@ -74,8 +74,12 @@ try {
     await subscription.close();
   }
 } finally {
-  await runtime.shutdown();
-  await provider.releaseAbandonedConnections(); // adapter-owned failed-handshake cleanup
+  // Either call can reject while cleanup is still pending; retry it rather than ignore it.
+  try {
+    await runtime.shutdown();
+  } finally {
+    await provider.releaseAbandonedConnections(); // adapter-owned failed-handshake cleanup
+  }
 }
 ```
 
