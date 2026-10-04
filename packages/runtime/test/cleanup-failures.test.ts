@@ -200,7 +200,12 @@ async function openAndStart(value: CleanupFixture): Promise<SessionId> {
 
 async function rollbackFixture(
   releaseFailures: number,
-  options: { readonly failOpenCommit?: boolean; readonly disposeFailures?: number } = {},
+  options: {
+    readonly failOpenCommit?: boolean;
+    readonly disposeFailures?: number;
+    /** Declare the strong store contract on the wrapper (it never applies a rejected commit). */
+    readonly declareStrong?: boolean;
+  } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), 'relvo-open-rollback-test-'));
   roots.push(root);
@@ -289,6 +294,7 @@ async function rollbackFixture(
   const baseStore = createInMemoryStore({ clock, idFactory: ids });
   let rejectNextCommit = options.failOpenCommit === true;
   const store: RuntimeStore = {
+    ...(options.declareStrong === true ? { contract: { version: 1, level: 'strong' } as const } : {}),
     get revision() {
       return baseStore.revision;
     },
@@ -362,29 +368,69 @@ describe('open rollback cleanup failures', () => {
     expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 3 });
   });
 
-  it('best-effort retries both provider disposal and lease release after an open commit failure', async () => {
-    const value = await rollbackFixture(1, { failOpenCommit: true, disposeFailures: 1 });
+  it('retries a recoverable open commit failure unchanged instead of rolling the session back', async () => {
+    const value = await rollbackFixture(0, { failOpenCommit: true, declareStrong: true });
     const command = {
-      commandId: CommandIdSchema.parse('open-rollback-both-phases'),
+      commandId: CommandIdSchema.parse('open-commit-transient'),
       type: 'open_session' as const,
       providerId: 'rollback-test',
       workspace: { kind: 'existing' as const, path: value.borrowed },
     };
 
     await expect(value.runtime.openSession(command)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } },
+    });
+    await expect(value.runtime.openSession({ ...command, providerOptions: { changed: true } })).resolves.toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 0 });
+    await expect(value.runtime.openSession(command)).resolves.toMatchObject({
+      disposition: 'applied',
+      result: { type: 'session_opened' },
+    });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 0 });
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 1, releaseAttempts: 1 });
+  });
+
+  it('cleans up an open whose commit outcome is unknown, disposing before releasing, without certifying it', async () => {
+    const value = await rollbackFixture(1, { failOpenCommit: true, disposeFailures: 1 });
+    const command = {
+      commandId: CommandIdSchema.parse('open-commit-ambiguous'),
+      type: 'open_session' as const,
+      providerId: 'rollback-test',
+      workspace: { kind: 'existing' as const, path: value.borrowed },
+    };
+    // The wrapper declares no store contract: its rejection may have applied (permanent A).
+    await expect(value.runtime.openSession(command)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: false, details: { fault: 'ambiguous', permanent: true } },
+    });
+    await expect(value.runtime.openSession(command)).rejects.toMatchObject({ error: { retryable: false } });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 0, releaseAttempts: 0 });
+
+    // Shutdown 1: disposal fails, so the lease is not released.
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({
       error: {
         code: 'provider_unavailable',
-        details: { failures: [{ phase: 'provider_dispose' }, { phase: 'workspace_release' }] },
+        details: { failures: [{ error: { details: { failures: [{ phase: 'provider_dispose' }] } } }] },
       },
     });
-    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 1, releaseAttempts: 1 });
-    await expect(value.runtime.openSession(command)).resolves.toMatchObject({ disposition: 'rejected' });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 1, releaseAttempts: 0 });
+    // Shutdown 2: disposal succeeds, release fails.
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { code: 'workspace_unavailable' } });
+    expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 2, releaseAttempts: 1 });
+    // Shutdown 3: release succeeds; history stays uncertified, so shutdown still cannot succeed.
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: false },
+    });
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { retryable: false } });
     expect(value.counts()).toEqual({ acquireAttempts: 1, createAttempts: 1, disposeAttempts: 2, releaseAttempts: 2 });
   });
 });
 
 describe('close cleanup failures', () => {
-  it('preserves the first close interruption when another command completes cleanup', async () => {
+  it('refuses another close id while the first is unresolved and keeps the first close interruption', async () => {
     const value = await cleanupFixture(1, 0);
     const sessionId = await openAndStart(value);
     const first = {
@@ -396,10 +442,11 @@ describe('close cleanup failures', () => {
     const second = { ...first, commandId: value.next() };
     await expect(value.runtime.closeSession(first)).rejects.toMatchObject({ error: { code: 'provider_unavailable' } });
     expect(retainedCloseCountForTesting(value.runtime)).toBe(1);
-    expect(await value.runtime.closeSession(second)).toMatchObject({
-      disposition: 'applied',
-      result: { interruptedActiveRun: false },
+    // A second close id cannot take over the unresolved close; nothing is recorded for it.
+    await expect(value.runtime.closeSession(second)).rejects.toMatchObject({
+      error: { code: 'illegal_state_transition', retryable: true, details: { reason: 'close-in-progress' } },
     });
+    expect(value.control.disposeAttempts).toBe(1);
     const recovered = await value.runtime.closeSession(first);
     expect(recovered).toMatchObject({ disposition: 'applied', result: { interruptedActiveRun: true } });
     expect(retainedCloseCountForTesting(value.runtime)).toBe(0);
@@ -407,14 +454,33 @@ describe('close cleanup failures', () => {
       disposition: 'duplicate',
       result: { interruptedActiveRun: true },
     });
+    // The other id now closes an already closed session: an applied no-op that interrupted nothing.
+    expect(await value.runtime.closeSession(second)).toMatchObject({
+      disposition: 'applied',
+      result: { interruptedActiveRun: false },
+    });
   });
+  // Release is attempted only after a confirmed disposal, and a retry repeats only the
+  // phases that failed (issue #43): `attempts` are the cumulative dispose/release counts
+  // after each failed attempt, and `final` after the successful one.
   it.each([
-    ['dispose-only', 1, 0, 'provider_unavailable', ['provider_dispose']],
-    ['release-only', 0, 1, 'workspace_unavailable', ['workspace_release']],
-    ['simultaneous', 1, 1, 'provider_unavailable', ['provider_dispose', 'workspace_release']],
+    ['dispose-only', 1, 0, 'provider_unavailable', ['provider_dispose'], [[1, 0]], [2, 1]],
+    ['release-only', 0, 1, 'workspace_unavailable', ['workspace_release'], [[1, 1]], [1, 2]],
+    [
+      'dispose-then-release',
+      1,
+      1,
+      'provider_unavailable',
+      ['provider_dispose'],
+      [
+        [1, 0],
+        [2, 1],
+      ],
+      [2, 2],
+    ],
   ] as const)(
     'keeps a %s failure retryable without claiming closure',
-    async (_name, disposeFailures, releaseFailures, code, phases) => {
+    async (_name, disposeFailures, releaseFailures, code, phases, attempts, final) => {
       const value = await cleanupFixture(disposeFailures, releaseFailures);
       const sessionId = await openAndStart(value);
       const command = {
@@ -438,24 +504,29 @@ describe('close cleanup failures', () => {
       expect(isAgentRuntimeError(first)).toBe(true);
       if (!isAgentRuntimeError(first)) throw new Error('cleanup failure was not typed');
       expect(first.cause).toBeInstanceOf(AggregateError);
-      expect(value.control.disposeAttempts).toBe(1);
-      expect(value.control.releaseAttempts).toBe(1);
-      expect((await value.runtime.getSession(sessionId))?.session.state).toBe('closing');
-      const afterFailure = await value.runtime.readEvents(sessionId, 0 as never);
-      expect(afterFailure.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(0);
+      for (const [index, [disposes, releases]] of attempts.entries()) {
+        if (index > 0) {
+          await expect(value.runtime.closeSession(command)).rejects.toMatchObject({ error: { retryable: true } });
+        }
+        expect(value.control.disposeAttempts).toBe(disposes);
+        expect(value.control.releaseAttempts).toBe(releases);
+        expect((await value.runtime.getSession(sessionId))?.session.state).toBe('closing');
+        const afterFailure = await value.runtime.readEvents(sessionId, 0 as never);
+        expect(afterFailure.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(0);
+      }
 
       const retried = await value.runtime.closeSession(command);
       expect(retried).toMatchObject({
         disposition: 'applied',
         result: { type: 'session_closed', interruptedActiveRun: true },
       });
-      expect(value.control.disposeAttempts).toBe(2);
-      expect(value.control.releaseAttempts).toBe(2);
+      expect(value.control.disposeAttempts).toBe(final[0]);
+      expect(value.control.releaseAttempts).toBe(final[1]);
       const duplicate = await value.runtime.closeSession(command);
       expect(duplicate.disposition).toBe('duplicate');
       expect(duplicate.result).toMatchObject({ type: 'session_closed', interruptedActiveRun: true });
-      expect(value.control.disposeAttempts).toBe(2);
-      expect(value.control.releaseAttempts).toBe(2);
+      expect(value.control.disposeAttempts).toBe(final[0]);
+      expect(value.control.releaseAttempts).toBe(final[1]);
 
       const events = await value.runtime.readEvents(sessionId, 0 as never);
       expect(events.events.filter((event) => event.payload.type === 'run.finished')).toHaveLength(1);
@@ -469,6 +540,12 @@ describe('close cleanup failures', () => {
         commandAttempts: 0,
         interactionRoutes: 0,
         withdrawals: 0,
+        runs: 0,
+        waiters: 0,
+        invocations: 0,
+        lifecycleClaims: 0,
+        retiredMarkers: 0,
+        liveSessions: 0,
       });
     },
   );
@@ -504,7 +581,8 @@ describe('close cleanup failures', () => {
     expect(events.events.filter((event) => event.payload.type === 'session.closed')).toHaveLength(1);
     expect(value.control.interruptAttempts).toBe(2);
     expect(value.control.disposeAttempts).toBe(2);
-    expect(value.control.releaseAttempts).toBe(2);
+    // Release was not attempted while disposal had failed.
+    expect(value.control.releaseAttempts).toBe(1);
   });
 
   it('reserves the failed close fingerprint and rejects a changed retry before cleanup', async () => {
@@ -525,8 +603,12 @@ describe('close cleanup failures', () => {
       error: { code: 'command_id_conflict' },
     });
     expect(value.control.disposeAttempts).toBe(1);
-    expect(value.control.releaseAttempts).toBe(1);
+    expect(value.control.releaseAttempts).toBe(0);
 
+    // Disposal now succeeds; the release fails once.
+    await expect(value.runtime.closeSession(command)).rejects.toMatchObject({
+      error: { code: 'workspace_unavailable' },
+    });
     await expect(value.runtime.closeSession(command)).resolves.toMatchObject({ disposition: 'applied' });
     expect(value.control.disposeAttempts).toBe(2);
     expect(value.control.releaseAttempts).toBe(2);
@@ -555,7 +637,8 @@ describe('shutdown cleanup failures', () => {
       reason: { error: { code: 'provider_unavailable', retryable: true } },
     });
     expect(value.control.disposeAttempts).toBe(1);
-    expect(value.control.releaseAttempts).toBe(1);
+    // Release is not attempted while disposal has failed.
+    expect(value.control.releaseAttempts).toBe(0);
 
     const terminalEvent = iterator.next();
     const beforeRetry = await value.runtime.readEvents(sessionId, 0 as never);
@@ -572,9 +655,14 @@ describe('shutdown cleanup failures', () => {
         (error: unknown) => error,
       );
 
+    // Retry 1: disposal succeeds, the release fails once; admission stays closed.
     const retry = value.runtime.shutdown();
     const isNewAttempt = retry !== first;
-    await retry;
+    await expect(retry).rejects.toMatchObject({ error: { code: 'workspace_unavailable', retryable: true } });
+    expect(value.control.disposeAttempts).toBe(2);
+    expect(value.control.releaseAttempts).toBe(1);
+    // Retry 2 repeats only the release.
+    await value.runtime.shutdown();
     expect(rejectedAdmission).toMatchObject({ error: { code: 'session_closed' } });
     expect(isNewAttempt).toBe(true);
     expect(value.control.disposeAttempts).toBe(2);
@@ -588,6 +676,12 @@ describe('shutdown cleanup failures', () => {
       commandAttempts: 0,
       interactionRoutes: 0,
       withdrawals: 0,
+      runs: 0,
+      waiters: 0,
+      invocations: 0,
+      lifecycleClaims: 0,
+      retiredMarkers: 0,
+      liveSessions: 0,
     });
   });
 });

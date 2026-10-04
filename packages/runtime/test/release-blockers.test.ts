@@ -351,7 +351,7 @@ describe('shutdown boundary', () => {
     expect(control.disposed).toBe(1);
   });
 
-  it('drains a command admitted before shutdown and then closes its session', async () => {
+  it('does not wait on a start admitted before shutdown, then closes its session once the start settles', async () => {
     const { provider, control } = controlledProvider({ holdStart: true });
     const value = await fixture(provider);
     const sessionId = await open(value);
@@ -362,11 +362,21 @@ describe('shutdown boundary', () => {
       input: { parts: [{ type: 'text', text: 'queued before shutdown' }] },
     });
     await control.startEntered.promise;
-    const shuttingDown = value.runtime.shutdown();
+    // Shutdown fences the session and returns a retryable failure instead of waiting
+    // for the unresolved provider start (issue #43).
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({
+      error: { code: 'provider_unavailable', retryable: true },
+    });
+    expect(control.disposed).toBe(0);
+    // The late start commits ahead of `closing`; its run is then interrupted, the
+    // provider disposed and the workspace released by the fenced close.
     control.start.resolve(undefined);
     expect((await submitted).disposition).toBe('applied');
-    await shuttingDown;
-    expect((await value.runtime.getSession(sessionId))?.session.state).toBe('closed');
+    await value.runtime.shutdown();
+    expect(control.disposed).toBe(1);
+    const snapshot = await value.runtime.getSession(sessionId);
+    expect(snapshot?.session.state).toBe('closed');
+    expect(snapshot?.runs[0]?.state).toBe('interrupted');
   });
 
   it('does not await a provider completion that remains pending after close fallback', async () => {

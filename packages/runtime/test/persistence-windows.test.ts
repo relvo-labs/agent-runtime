@@ -18,6 +18,7 @@ import {
   type SessionId,
 } from '@relvo-labs/agent-protocol';
 import {
+  ProviderRejection,
   defineProviderDescriptor,
   type AgentProvider,
   type ProviderEventSink,
@@ -39,6 +40,13 @@ function deferred<T>(): Deferred<T> {
 
 const roots: string[] = [];
 const runtimes: AgentRuntime[] = [];
+
+/**
+ * A command whose slot commit was rejected before applying returns the session's retryable
+ * F fault (issue #43): the store's own error text is never surfaced, and the exact command
+ * retry resubmits the unchanged head.
+ */
+const RETRYABLE_HEAD_FAILURE = { error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } } };
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.shutdown().catch(() => undefined)));
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -84,7 +92,11 @@ async function fixture(
   let holdNextRead = false;
   let eventPageReads = 0;
   let onEventPage: ((sessionId: SessionId) => Promise<void>) | undefined;
+  // This wrapper never applies a commit whose promise it rejects ('before' rejects without
+  // calling the store; 'after' throws inside the transaction, which discards it) and reads
+  // through to the built-in store, so it explicitly declares the strong contract (issue #43).
   const store: RuntimeStore = {
+    contract: { version: 1, level: 'strong' },
     get revision() {
       return base.revision;
     },
@@ -186,21 +198,27 @@ async function fixture(
           runSinks.push(request.sink);
           startEntered.resolve(undefined);
           if (options.holdStart) await startGate.promise;
-          if (options.rejectStart) return Promise.reject(new Error('provider rejected start'));
+          if (options.rejectStart) {
+            return Promise.reject(new ProviderRejection(agentError('provider_rejected', 'provider rejected start')));
+          }
           const runCompletion = starts === 1 ? completion : deferred<ProviderRunTermination>();
           return {
             completion: runCompletion.promise,
             interrupt: async () => {
               interrupts += 1;
               interruptEntered.resolve(undefined);
-              if (options.rejectInterrupt) throw new Error('provider rejected interrupt');
+              if (options.rejectInterrupt) {
+                throw new ProviderRejection(agentError('provider_rejected', 'provider rejected interrupt'));
+              }
               if (options.holdInterrupt) await interruptGate.promise;
             },
           };
         },
         respondToInteraction: () => {
           responses += 1;
-          if (options.rejectResponse) return Promise.reject(new Error('provider rejected response'));
+          if (options.rejectResponse) {
+            return Promise.reject(new ProviderRejection(agentError('provider_rejected', 'provider rejected response')));
+          }
           return Promise.resolve();
         },
         dispose: async () => {
@@ -436,7 +454,7 @@ describe('provider ingestion visibility and history races', () => {
     expect(value.counts().interrupts).toBe(0);
   });
 
-  it('records a bounded visible fault after a provider event commit fails', async () => {
+  it('records a bounded visible fault after a provider event commit fails, then recovers it on retry', async () => {
     const value = await fixture();
     await start(value);
     value.failNextCommit();
@@ -444,7 +462,7 @@ describe('provider ingestion visibility and history races', () => {
     await value.commitFailed.promise;
     expect(typeof value.runtime.getProviderIngestionFaults).toBe('function');
     value.emitText('another event');
-    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    await expect(value.runtime.quiesce()).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
       {
         sessionId: value.sessionId,
@@ -457,22 +475,35 @@ describe('provider ingestion visibility and history races', () => {
     });
     const replay = value.runtime.subscribe({ sessionId: value.sessionId, fromSequence: 0 })[Symbol.asyncIterator]();
     await expect(replay.next()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
-    const close = await value.runtime.closeSession({
+    const closeCommand = {
       commandId: value.next(),
-      type: 'close_session',
+      type: 'close_session' as const,
       sessionId: value.sessionId,
-      ifRunActive: 'interrupt',
-    });
-    expect(close).toMatchObject({ disposition: 'applied', result: { type: 'session_closed' } });
-    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+      ifRunActive: 'interrupt' as const,
+    };
+    // Every cleanup effect runs, but no close receipt can be committed ahead of the failed head.
+    await expect(value.runtime.closeSession(closeCommand)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
+    expect(value.counts()).toMatchObject({ interrupts: 1, disposes: 1, releases: 1 });
     expect(value.runtime.getProviderIngestionFaults()).toHaveLength(1);
     await expect(value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
       error: { code: 'store_unavailable' },
     });
+    // The exact close retry resubmits the unchanged head; nothing is cleaned up twice.
+    const close = await value.runtime.closeSession(closeCommand);
+    expect(close).toMatchObject({
+      disposition: 'applied',
+      result: { type: 'session_closed', interruptedActiveRun: true },
+    });
+    expect(value.counts()).toMatchObject({ interrupts: 1, disposes: 1, releases: 1 });
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+    const page = await value.runtime.readEvents(value.sessionId, SequenceSchema.parse(0));
+    expect(
+      page.events.flatMap((event) => (event.payload.type === 'run.message_delta' ? [event.payload.text] : [])),
+    ).toEqual(['lost event', 'another event']);
   });
 
   it.each([
-    ['long message', new Error('x'.repeat(3000)), 'store_unavailable'],
+    ['long message', new Error('x'.repeat(3000))],
     [
       'large details',
       new AgentRuntimeError(
@@ -480,21 +511,27 @@ describe('provider ingestion visibility and history races', () => {
           details: { payload: 'x'.repeat(100_000) },
         }),
       ),
-      'provider_unavailable',
     ],
-  ] as const)('records a bounded ingestion fault for %s without rejecting supervision', async (_name, cause, code) => {
+  ] as const)('records a bounded ingestion fault for %s without rejecting supervision', async (_name, cause) => {
     const value = await fixture();
     await start(value);
     value.failNextCommit('before', 0, cause);
     value.emitText('lost event');
     await value.commitFailed.promise;
     value.completion.resolve({ outcome: 'succeeded' });
-    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { code } });
+    await expect(value.runtime.quiesce()).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     const [fault] = value.runtime.getProviderIngestionFaults();
     expect(fault).toMatchObject({ sessionId: value.sessionId, stage: 'event', failureCount: 1 });
-    expect(fault?.error.code).toBe(code);
+    // The public fault is the runtime's fixed classification; the store's error is never copied.
+    expect(fault?.error.code).toBe('store_unavailable');
+    expect(fault?.error.message).not.toContain('xxx');
+    expect(fault?.error.message).not.toContain('commit failed');
     expect(fault?.error.message.length).toBeLessThanOrEqual(2000);
     expect(JSON.stringify(fault).length).toBeLessThan(2500);
+    // Supervision kept the completion: once the head is retried, the run terminal commits.
+    await value.runtime.retryProviderIngestion(value.sessionId);
+    await value.runtime.quiesce();
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('succeeded');
   });
 
   it('records a lost terminal commit without inventing a terminal projection', async () => {
@@ -534,17 +571,31 @@ describe('provider ingestion visibility and history races', () => {
     expect((await value.runtime.getSession(value.sessionId))?.interactions).toEqual([]);
   });
 
-  it('counts repeated ingestion failures in one per-session fault record', async () => {
+  it('counts repeated failures of the same head in one per-session fault record', async () => {
     const value = await fixture();
     await start(value);
     value.failNextCommit();
-    value.emitText('first lost event');
+    value.emitText('first event');
+    value.emitText('second event');
+    await value.commitFailed.promise;
+    await expect(value.runtime.quiesce()).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId: value.sessionId, stage: 'event', failureCount: 1 },
+    ]);
+    // A retry resubmits the same head; it fails again, so the one record counts 2.
     value.failNextCommit();
-    value.emitText('second lost event');
-    await value.runtime.shutdown();
+    await expect(value.runtime.retryProviderIngestion(value.sessionId)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
       { sessionId: value.sessionId, stage: 'event', failureCount: 2 },
     ]);
+    // Shutdown resumes the proven-absent head, drains, closes, and leaves no fault.
+    await value.runtime.shutdown();
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+    expect(
+      (await value.committedEvents()).events.flatMap((event) =>
+        event.payload.type === 'run.message_delta' ? [event.payload.text] : [],
+      ),
+    ).toEqual(['first event', 'second event']);
   });
   it('retries submit_turn persistence with the same identities and no second provider start', async () => {
     const value = await fixture();
@@ -556,7 +607,7 @@ describe('provider ingestion visibility and history races', () => {
       input: { parts: [{ type: 'text' as const, text: 'retained' }] },
     };
     value.failNextCommit();
-    await expect(value.runtime.submitTurn(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.submitTurn(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     const conflict = await value.runtime.submitTurn({
       ...command,
       input: { parts: [{ type: 'text', text: 'changed' }] },
@@ -577,7 +628,7 @@ describe('provider ingestion visibility and history races', () => {
         sessionId: value.sessionId,
         input: { parts: [{ type: 'text', text: 'cleanup retained run' }] },
       }),
-    ).rejects.toThrow('injected transient');
+    ).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(value.runtime.shutdown()).resolves.toBeUndefined();
     expect(value.counts()).toMatchObject({ starts: 1, interrupts: 1, disposes: 1 });
     expect((await value.runtime.getSession(value.sessionId))?.session.state).toBe('closed');
@@ -592,7 +643,7 @@ describe('provider ingestion visibility and history races', () => {
       input: { parts: [{ type: 'text' as const, text: 'rejected start' }] },
     };
     value.failNextCommit();
-    await expect(value.runtime.submitTurn(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.submitTurn(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(value.runtime.submitTurn(command)).resolves.toMatchObject({
       disposition: 'rejected',
       error: { code: 'provider_rejected' },
@@ -612,7 +663,7 @@ describe('provider ingestion visibility and history races', () => {
       response: { kind: 'question' as const, answer: 'yes' },
     };
     value.failNextCommit();
-    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.respondToInteraction(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(
       value.runtime.respondToInteraction({ ...command, response: { kind: 'question', answer: 'no' } }),
     ).resolves.toMatchObject({ error: { code: 'command_id_conflict' } });
@@ -633,11 +684,13 @@ describe('provider ingestion visibility and history races', () => {
     };
 
     value.failNextCommit();
-    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.respondToInteraction(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     expect(value.counts().responses).toBe(1);
 
+    // The completion is observed, but its terminal waits behind the delivered response's slot.
     value.completion.resolve({ outcome: 'succeeded' });
-    await value.runtime.quiesce();
+    await expect(value.runtime.quiesce()).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
+    expect((await value.runtime.getSession(value.sessionId))?.runs[0]?.state).toBe('awaiting_interaction');
 
     await expect(
       value.runtime.respondToInteraction({ ...command, response: { kind: 'question', answer: 'changed' } }),
@@ -646,6 +699,7 @@ describe('provider ingestion visibility and history races', () => {
       disposition: 'applied',
       result: { type: 'interaction_settled', interactionId },
     });
+    await value.runtime.quiesce();
 
     const snapshot = await value.runtime.getSession(value.sessionId);
     expect(snapshot?.interactions[0]).toMatchObject({
@@ -671,7 +725,7 @@ describe('provider ingestion visibility and history races', () => {
       response: { kind: 'question' as const, answer: 'yes' },
     };
     value.failNextCommit();
-    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.respondToInteraction(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(value.runtime.respondToInteraction(command)).resolves.toMatchObject({ disposition: 'rejected' });
     expect(value.counts().responses).toBe(1);
   });
@@ -687,7 +741,7 @@ describe('provider ingestion visibility and history races', () => {
       reason: 'one',
     };
     value.failNextCommit();
-    await expect(value.runtime.interruptRun(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.interruptRun(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(value.runtime.interruptRun({ ...command, reason: 'changed' })).resolves.toMatchObject({
       error: { code: 'command_id_conflict' },
     });
@@ -706,7 +760,7 @@ describe('provider ingestion visibility and history races', () => {
         sessionId: value.sessionId,
         runId,
       }),
-    ).rejects.toThrow('injected transient');
+    ).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await value.runtime.shutdown();
     expect(value.counts()).toMatchObject({ interrupts: 1, disposes: 1 });
   });
@@ -716,7 +770,7 @@ describe('provider ingestion visibility and history races', () => {
     const runId = await start(value);
     const command = { commandId: value.next(), type: 'interrupt_run' as const, sessionId: value.sessionId, runId };
     value.failNextCommit();
-    await expect(value.runtime.interruptRun(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.interruptRun(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     await expect(value.runtime.interruptRun(command)).resolves.toMatchObject({ disposition: 'rejected' });
     expect(value.counts().interrupts).toBe(1);
   });
@@ -731,13 +785,20 @@ describe('provider ingestion visibility and history races', () => {
       runId,
     });
     await value.interruptEntered.promise;
-    const ingested = value.nextCommit();
+    // The fence is installed synchronously, before the provider interrupt settles: the
+    // request is demoted at acceptance and ordered behind the interrupt's reserved slot.
     value.emitInteraction();
-    await ingested;
     expect((await value.runtime.getSession(value.sessionId))?.interactions).toEqual([]);
     value.interruptGate.resolve(undefined);
     await interrupting;
-    const events = await value.runtime.readEvents(value.sessionId, 0 as never);
+    let events = await value.runtime.readEvents(value.sessionId, 0 as never);
+    for (
+      let attempt = 0;
+      attempt < 50 && !events.events.some((event) => event.payload.type === 'diagnostic');
+      attempt += 1
+    ) {
+      events = await value.runtime.readEvents(value.sessionId, 0 as never);
+    }
     expect(events.events.some((event) => event.payload.type === 'interaction.requested')).toBe(false);
     expect(
       events.events.some(
@@ -800,6 +861,7 @@ describe('invalid command identity', () => {
       input: { parts: [] },
     };
     value.failNextCommit();
+    // A validation rejection has no session FIFO: its receipt-only commit fails with the store's own error.
     await expect(value.runtime.submitTurn(invalid as never)).rejects.toThrow('injected transient');
     await expect(
       value.runtime.submitTurn({
@@ -905,12 +967,12 @@ describe('provider interaction withdrawal', () => {
 
     // The answer reached the provider; only its persistence failed.
     value.failNextCommit();
-    await expect(value.runtime.respondToInteraction(command)).rejects.toThrow('injected transient');
+    await expect(value.runtime.respondToInteraction(command)).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     expect(value.counts().responses).toBe(1);
 
-    const ingested = value.nextCommit();
+    // The withdrawal is ordered behind the delivered response's failed slot: nothing commits.
     value.emitWithdrawal();
-    await ingested;
+    await expect(value.runtime.quiesce()).rejects.toMatchObject(RETRYABLE_HEAD_FAILURE);
     const duringRetention = await value.runtime.getSession(value.sessionId);
     expect(duringRetention?.interactions[0]?.status).toBe('pending');
 

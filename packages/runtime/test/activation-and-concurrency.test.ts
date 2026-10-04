@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   CommandIdSchema,
+  SequenceSchema,
   type CommandId,
+  type EventEnvelope,
   type ProviderEventInput,
   type SessionId,
   createCounterIdFactory,
@@ -39,6 +41,8 @@ function deferred<T>(): Deferred<T> {
 type RuntimeFixture = {
   readonly runtime: AgentRuntime;
   readonly borrowedWorkspacePath: string;
+  /** The authoritative log, read past the runtime's history guards. */
+  history(sessionId: SessionId): Promise<readonly EventEnvelope[]>;
   nextCommandId(): CommandId;
   waitForEvent(type: string, count?: number): Promise<void>;
 };
@@ -91,6 +95,7 @@ async function runtimeFixture(provider: AgentProvider): Promise<RuntimeFixture> 
   return {
     runtime,
     borrowedWorkspacePath,
+    history: async (sessionId) => (await baseStore.readEvents(sessionId, SequenceSchema.parse(0), 4096)).events,
     nextCommandId: () => CommandIdSchema.parse(`activation-${String(++command).padStart(8, '0')}`),
     waitForEvent: (type, count = 1) =>
       (eventCounts.get(type) ?? 0) >= count
@@ -195,7 +200,10 @@ describe('provider event activation', () => {
     ).toEqual(['first synchronous delta', 'second synchronous delta']);
   });
 
-  it('bounds pre-activation staging and emits an explicit overflow diagnostic', async () => {
+  // Issue #43 replaced the former warning-only tail: crossing the pre-activation bound
+  // refuses the excess and marks history permanently incomplete (O) instead of letting
+  // replay look complete after a warning diagnostic.
+  it('bounds pre-activation staging and marks history permanently incomplete instead of a warning tail', async () => {
     const runEvents = Array.from({ length: 300 }, (_, index): ProviderEventInput => ({
       payload: { type: 'run.message_delta', text: `synchronous delta ${String(index + 1)}` },
     }));
@@ -209,15 +217,21 @@ describe('provider event activation', () => {
       input: { parts: [{ type: 'text', text: 'overflow staging' }] },
     });
 
-    const page = await value.runtime.readEvents(sessionId, 0 as never, 1000);
-    const deltas = page.events.filter((event) => event.payload.type === 'run.message_delta');
-    const diagnostics = page.events.filter((event) => event.payload.type === 'diagnostic');
+    const events = await value.history(sessionId);
+    const deltas = events.filter((event) => event.payload.type === 'run.message_delta');
     expect(deltas).toHaveLength(256);
     expect(deltas[0]?.payload).toMatchObject({ text: 'synchronous delta 1' });
     expect(deltas.at(-1)?.payload).toMatchObject({ text: 'synchronous delta 256' });
-    expect(diagnostics.at(-1)?.payload).toMatchObject({
-      level: 'warning',
-      message: expect.stringContaining('44 provider events exceeded the 256-event pre-activation buffer'),
+    // No warning tail is appended; the gap is a permanent, queryable overflow instead.
+    expect(events.filter((event) => event.payload.type === 'diagnostic')).toEqual([]);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      {
+        sessionId,
+        error: { code: 'store_unavailable', retryable: false, details: { fault: 'overflow', permanent: true } },
+      },
+    ]);
+    await expect(value.runtime.readEvents(sessionId, 0 as never, 1000)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: false },
     });
   });
 
@@ -473,6 +487,10 @@ describe('provider event activation', () => {
 
     completion.resolve({ outcome: 'succeeded' });
     await value.runtime.quiesce();
+    const beforeLateEmission = (await value.runtime.readEvents(sessionId, 0 as never)).events.length;
+    // After the terminal committed the run is retired: its sink is stale, and a late
+    // request is discarded before it is counted (issue #43), so it cannot revive the
+    // run, open an interaction or grow history.
     runSink?.emit({
       payload: {
         type: 'interaction.requested',
@@ -480,16 +498,17 @@ describe('provider event activation', () => {
         request: { kind: 'question', prompt: 'Even later?', multiSelect: false },
       },
     });
-    await value.waitForEvent('diagnostic', 2);
+    await value.runtime.quiesce();
     const terminalSnapshot = await value.runtime.getSession(sessionId);
     const terminalPage = await value.runtime.readEvents(sessionId, 0 as never);
     expect(terminalSnapshot?.runs[0]?.state).toBe('succeeded');
     expect(terminalSnapshot?.interactions).toEqual([]);
+    expect(terminalPage.events).toHaveLength(beforeLateEmission);
     expect(
       terminalPage.events.filter(
         (event) => event.payload.type === 'diagnostic' && event.payload.message.includes('interaction.requested'),
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
   });
 });
 
