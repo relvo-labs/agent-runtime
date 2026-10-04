@@ -32,15 +32,23 @@ an exact retry of that command delivers the same effect again. That re-delivery 
 the provider SPI requires idempotent `startRun` (same `runRef`), response and interrupt
 handling.
 
-An exact retry of a definitely rejected command replays its rejected receipt. A new
-command ID after a definite interrupt rejection is a new interrupt and calls the provider
-again. While a run's one interrupt is in flight, or its outcome is unknown and still
-owned by its command, any other `interrupt_run` waits for and mirrors that outcome. It
-never calls the provider; only the owning command's exact retry does. This is decided when
-the command is invoked, before any runtime queue: an `interrupt_run` invoked while another
-command's interrupt was in flight mirrors that interrupt's outcome even if it settled, as
-a definite rejection, before this command was admitted. Only an `interrupt_run` invoked
-after the rejection calls the provider again.
+An exact retry of a definitely rejected command replays its rejected receipt.
+
+An `interrupt_run` with a new command ID chooses its outcome at its own admission, after
+the commands queued ahead of it and its command lookup, not when it is invoked
+(maintainer decision 2026-10-04). If an interrupt slot can still be reserved for the
+nonterminal run, the command mirrors the run's one interrupt while that interrupt is in
+flight, or its outcome is unknown and still owned by its command, or its success was
+already observed. It waits for that outcome and never calls the provider; only the owning
+command's exact retry does. A definite rejection observed before admission leaves no
+shared interrupt, so an `interrupt_run` with a new command ID admitted after the definite
+rejection is a new interrupt and calls the provider again while the run remains
+interruptible. A run that the store already shows as terminal at admission gets the
+applied no-op `delivered: false`. A terminal that is placed or submitted but not yet
+established as applied, a close in progress, or an ingestion fault returns the existing
+transient or fault error and reserves nothing. An admitted command keeps its chosen
+outcome through later completion and persistence recovery. A command that only waited in
+the runtime's queues is promised no outcome from the time it was invoked.
 
 If a slot's commit fails, the command returns the session's ingestion fault: retryable
 when the commit is proven not to have applied, non-retryable when its outcome is unknown.
