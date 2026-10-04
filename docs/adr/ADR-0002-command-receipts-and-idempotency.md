@@ -50,6 +50,17 @@ transient or fault error and reserves nothing. An admitted command keeps its cho
 outcome through later completion and persistence recovery. A command that only waited in
 the runtime's queues is promised no outcome from the time it was invoked.
 
+Every accepted `interrupt_run` outcome is persisted through its session's ingestion queue,
+never as a separate receipt-only write while the session is live. The `delivered: false`
+no-op is an ordinary counted slot: its admission checks the session state, faults and
+capacity in the same synchronous step that queues it and binds its command claim, and its
+receipt commits in order, after the run's terminal and any other earlier slot. Its commit
+outcome is reconciled like any other head (A, F, read-back), and a refusal at capacity is
+the retryable `capacity` error, not an overflow. A command ID the runtime still holds is
+resolved before the store's receipt is consulted: a changed payload conflicts and the exact
+retry reaches its slot and that slot's fault, even if an ambiguous commit already left a
+receipt in the store.
+
 If a slot's commit fails, the command returns the session's ingestion fault: retryable
 when the commit is proven not to have applied, non-retryable when its outcome is unknown.
 An exact retry of the command resubmits the identical frozen bundle without calling the

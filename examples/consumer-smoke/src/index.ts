@@ -1,5 +1,6 @@
 import { EXECUTOR_CONFORMANCE_CASES, type AgentExecutor } from '@relvo-labs/agent-executor';
 import {
+  AgentRuntimeError,
   WIRE_VERSION,
   createCounterIdFactory,
   createFixedClock,
@@ -10,6 +11,7 @@ import {
   QuestionSetResponseSchema,
   type CommandReceipt,
   type InteractionResponse,
+  type InterruptRunCommandInput,
   type QuestionAnswer,
   type QuestionItem,
   type QuestionSetRequest,
@@ -141,6 +143,24 @@ function requireFullRuntime(partial: RuntimeWithoutRetry): void {
   void full;
 }
 void requireFullRuntime;
+
+/**
+ * Issue #43, decision B: to learn one interrupt's outcome, retry that exact command (same
+ * ID and payload). A new command ID chooses its own outcome when it is admitted, so it is
+ * not a way to observe an earlier interrupt. A close that reports a retryable error (for
+ * example `details.pending: 'persistence'`) is retried with the same command as well.
+ */
+async function interruptOnce(value: AgentRuntime, command: InterruptRunCommandInput): Promise<boolean | undefined> {
+  let receipt: CommandReceipt;
+  try {
+    receipt = await value.interruptRun(command);
+  } catch (error) {
+    if (!(error instanceof AgentRuntimeError) || !error.error.retryable) throw error;
+    receipt = await value.interruptRun(command);
+  }
+  return receipt.result?.type === 'run_interrupt_requested' ? receipt.result.delivered : undefined;
+}
+void interruptOnce;
 
 /**
  * A custom store adapter declares the guarantees it keeps. Only the version 1

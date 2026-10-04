@@ -1580,8 +1580,8 @@ describe('S4 review F1: shutdown fences new work but admits exact owner recovery
   });
 });
 
-describe('S4 review F2: interrupt outcome sharing is decided at invocation, before any queue', () => {
-  it('a new-ID interrupt invoked during an in-flight interrupt mirrors its definite rejection; a later one calls again', async () => {
+describe('S4 review F2: same-ID sharing is decided at invocation; a new ID at its admission (decision B)', () => {
+  it('a new-ID interrupt queued during an in-flight interrupt is admitted after its definite rejection and calls again', async () => {
     const value = await harness({ interruptMode: 'hold' });
     const sessionId = await value.open();
     const { runId } = await value.startRun(sessionId);
@@ -1598,17 +1598,17 @@ describe('S4 review F2: interrupt outcome sharing is decided at invocation, befo
 
     const refused = { disposition: 'rejected', error: { code: 'provider_rejected', message: 'definite rejection' } };
     expect(await first).toMatchObject(refused);
-    expect(await following).toMatchObject(refused);
-    expect(run.interrupts).toHaveLength(1);
-    expect(await receiptOf(value, follower.commandId)).toMatchObject(refused);
-    expect(await value.runtime.interruptRun(follower)).toMatchObject(refused);
-    expect(run.interrupts).toHaveLength(1);
+    // Decision B: the follower is admitted only after the owner's call returned. The definite
+    // rejection left no shared interrupt and the run is still active, so it is a new interrupt.
+    const delivered = { disposition: 'applied', result: { type: 'run_interrupt_requested', delivered: true } };
+    expect(await following).toMatchObject(delivered);
+    expect(run.interrupts).toHaveLength(2);
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(delivered);
+    expect(await value.runtime.interruptRun(follower)).toMatchObject({ disposition: 'duplicate' });
+    expect(run.interrupts).toHaveLength(2);
 
-    // Decision A is unchanged: an interrupt invoked after the rejection calls the provider again.
-    expect(await value.runtime.interruptRun({ ...owner, commandId: value.next('interrupt') })).toMatchObject({
-      disposition: 'applied',
-      result: { delivered: true },
-    });
+    // The observed success is shared: a later new ID mirrors it without another provider call.
+    expect(await value.runtime.interruptRun({ ...owner, commandId: value.next('interrupt') })).toMatchObject(delivered);
     expect(run.interrupts).toHaveLength(2);
   });
 
@@ -1831,6 +1831,1401 @@ describe('S4 review F4: a retired run sink inspects nothing while its session st
     await value.runtime.closeSession(value.closeCommand(sessionId));
     current.request.sink.emit(trap.value);
     sessionSink.emit(trap.value);
+    expect(trap.inspections()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5, maintainer decision B (2026-10-04): a new `interrupt_run` command ID
+// chooses its outcome at admission; every accepted interrupt receipt (the
+// post-terminal `delivered: false` no-op included) is an ordinary counted
+// slot in the session FIFO; close and shutdown return promptly while
+// persistence is still in flight.
+// ---------------------------------------------------------------------------
+
+function runOf(value: Harness, index = 0): RunControl {
+  const run = value.runs[index];
+  if (run === undefined) throw new Error(`no run ${String(index)}`);
+  return run;
+}
+
+function interruptOf(value: Harness, sessionId: SessionId, runId: RunId) {
+  return { commandId: value.next('interrupt'), type: 'interrupt_run' as const, sessionId, runId };
+}
+
+/** Start a run and complete it; resolves once its terminal committed. */
+async function finishedRun(value: Harness, sessionId: SessionId): Promise<RunId> {
+  const { runId } = await value.startRun(sessionId);
+  value.runs.at(-1)?.completion.resolve({ outcome: 'succeeded' });
+  await value.runtime.quiesce();
+  return runId;
+}
+
+const PENDING_PERSISTENCE = { code: 'store_unavailable', retryable: true, details: { pending: 'persistence' } };
+const NOOP = { disposition: 'applied', result: { type: 'run_interrupt_requested', delivered: false } };
+const DELIVERED = { disposition: 'applied', result: { type: 'run_interrupt_requested', delivered: true } };
+
+/** What a probe reads in a transaction; never throws (a session may not exist yet). */
+function probeOf(tx: StoreTransaction, probe: (tx: StoreTransaction) => unknown): string {
+  try {
+    const read = probe(tx);
+    return read === undefined ? 'undefined' : JSON.stringify(read);
+  } catch {
+    return 'unavailable';
+  }
+}
+
+type WriteHooks = {
+  /** Inside the transaction, after its callback: throwing here aborts it before it applies. */
+  readonly inside?: (write: number) => void;
+  /** After the store applied it: throw (apply-then-reject) or wait (held acknowledgement). */
+  readonly applied?: (write: number) => Promise<void> | void;
+};
+
+/**
+ * Target the transactions that change `probe` (for example, that record one command's
+ * receipt) by inspecting the transaction itself before and after its callback, so a
+ * receipt-only body whose commit returns no value is targeted too.
+ */
+function onWrite(value: Harness, probe: (tx: StoreTransaction) => unknown, hooks: WriteHooks): { writes(): number } {
+  const store = value.control.store;
+  const commit = store.commit.bind(store);
+  let writes = 0;
+  store.commit = <T>(mutate: (tx: StoreTransaction) => T) => {
+    let write = 0;
+    return commit((tx) => {
+      const before = probeOf(tx, probe);
+      const result = mutate(tx);
+      if (probeOf(tx, probe) !== before) {
+        writes += 1;
+        write = writes;
+        hooks.inside?.(write);
+      }
+      return result;
+    }).then(async (result) => {
+      if (write > 0) await hooks.applied?.(write);
+      return result;
+    });
+  };
+  return { writes: () => writes };
+}
+
+const receiptProbe =
+  (commandId: CommandId) =>
+  (tx: StoreTransaction): unknown =>
+    tx.findReceipt(commandId)?.fingerprint;
+
+/** Hold the acknowledgement of the first transaction that changes `probe`, after it applied. */
+function holdWrite(value: Harness, probe: (tx: StoreTransaction) => unknown) {
+  const applied = deferred<undefined>();
+  const gate = deferred<undefined>();
+  onWrite(value, probe, {
+    applied: async (write) => {
+      if (write !== 1) return;
+      applied.resolve(undefined);
+      await gate.promise;
+    },
+  });
+  return { applied: applied.promise, release: () => gate.resolve(undefined) };
+}
+
+/** Hold the `nth` store lookup of `commandId`'s receipt until released. */
+function gateLookup(value: Harness, commandId: CommandId, nth: number) {
+  const store = value.control.store;
+  const find = store.findReceipt.bind(store);
+  const entered = deferred<undefined>();
+  const gate = deferred<undefined>();
+  let calls = 0;
+  store.findReceipt = async (id) => {
+    if (id === commandId) {
+      calls += 1;
+      if (calls === nth) {
+        entered.resolve(undefined);
+        await gate.promise;
+      }
+    }
+    return find(id);
+  };
+  return { entered: entered.promise, release: () => gate.resolve(undefined), calls: () => calls };
+}
+
+// ---- reviewer probe catalogue (S4 7, S4R1 3, S4R2 5, S4R3 3) ----------------
+
+describe('S5 catalogue: independent S4 schedule probes', () => {
+  it('S4-1 shutdown still permits the owner to resolve an unknown interrupt', async () => {
+    const value = await harness({ interruptMode: 'reject-untyped' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const interrupt = interruptOf(value, sessionId, runId);
+    await expect(value.runtime.interruptRun(interrupt)).rejects.toMatchObject({
+      error: { code: 'provider_unavailable' },
+    });
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { retryable: true } });
+    runOf(value).interruptMode = 'resolve';
+    await expect(value.runtime.interruptRun(interrupt)).resolves.toMatchObject({ disposition: 'applied' });
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('S4-2 a new-ID follower admitted after the owner definite rejection calls the provider again (B)', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const following = value.runtime.interruptRun({ ...owner, commandId: value.next('interrupt') });
+    await microtasks(100);
+    run.interruptMode = 'resolve';
+    run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+    expect(await first).toMatchObject({ disposition: 'rejected' });
+    expect(await following).toMatchObject(DELIVERED);
+    expect(run.interrupts).toHaveLength(2);
+  });
+
+  it('S4-3 same-ID concurrency shares an unknown interrupt outcome without redelivery', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const interrupt = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(interrupt);
+    first.catch(() => undefined);
+    await until(() => run.heldInterrupts.length === 1);
+    const concurrent = value.runtime.interruptRun(interrupt);
+    concurrent.catch(() => undefined);
+    await microtasks(100);
+    run.interruptMode = 'resolve';
+    run.heldInterrupts[0]?.reject(new Error('transport'));
+    await expect(first).rejects.toMatchObject({ error: { code: 'provider_unavailable' } });
+    const result = await concurrent.then(
+      (receipt) => receipt.disposition,
+      () => 'unknown',
+    );
+    expect({ calls: run.interrupts.length, result }).toEqual({ calls: 1, result: 'unknown' });
+  });
+
+  it('S4-4 close during a pending user interrupt returns, then completes after settlement', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const first = value.runtime.interruptRun(interruptOf(value, sessionId, runId));
+    await until(() => run.heldInterrupts.length === 1);
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    expect(await settlesPromptly(closing)).toBe('rejected');
+    await expect(closing).rejects.toMatchObject({ error: { retryable: true, details: { pending: 'interrupt' } } });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    run.heldInterrupts[0]?.resolve(undefined);
+    await first;
+    await value.runtime.closeSession(close);
+  });
+
+  it('S4-5 an unverified applied-then-rejected close cannot bypass A via the public receipt fast path', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const gate = value.holdDispose();
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    closing.catch(() => undefined);
+    await until(() => value.counts().disposes === 1);
+    await microtasks(100);
+    expect((await value.base.read(sessionId))?.session.state).toBe('closing');
+    value.control.failNext('apply-then-reject');
+    gate.resolve(undefined);
+    await expect(closing).rejects.toMatchObject({ error: { code: 'store_unavailable', retryable: false } });
+    expect(value.runtime.getProviderIngestionFaults()[0]?.error.details).toMatchObject({ fault: 'ambiguous' });
+    expect((await value.base.read(sessionId))?.session.state).toBe('closed');
+    await expect(value.runtime.closeSession(close)).rejects.toMatchObject({
+      error: { code: 'store_unavailable', retryable: false },
+    });
+  });
+
+  it('S4-6 a declared strong closed bundle reconciles once without repeating cleanup', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const gate = value.holdDispose();
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    closing.catch(() => undefined);
+    await until(() => value.counts().disposes === 1);
+    await microtasks(100);
+    value.control.failNext('apply-then-reject');
+    gate.resolve(undefined);
+    await closing.catch(() => undefined);
+    await until(() => value.runtime.getProviderIngestionFaults().length === 0);
+    expect(await value.runtime.closeSession(close)).toMatchObject({ disposition: 'duplicate' });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    expect((await value.types(sessionId)).filter((kind) => kind === 'session.closed')).toHaveLength(1);
+  });
+
+  it('S4-7 retired run sinks discard hostile values while their session remains open', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    await value.startRun(sessionId);
+    const run = runOf(value);
+    run.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    const trap = reflectionTrap();
+    run.request.sink.emit(trap.value);
+    expect(trap.inspections()).toBe(0);
+  });
+});
+
+describe('S5 catalogue: independent S4R1 delta schedules', () => {
+  it.each(['success', 'rejection'] as const)(
+    'S4R1 a new-ID interrupt queued across the owner %s and the run completion is admitted after the terminal applied: delivered false (B)',
+    async (outcome) => {
+      const value = await harness({ interruptMode: 'hold' });
+      const sessionId = await value.open();
+      const { runId } = await value.startRun(sessionId);
+      const run = runOf(value);
+      const owner = interruptOf(value, sessionId, runId);
+      const first = value.runtime.interruptRun(owner);
+      await until(() => run.heldInterrupts.length === 1);
+      const following = value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') });
+      following.catch(() => undefined);
+      // Completion is observed while the owner's interrupt is still held.
+      run.completion.resolve({ outcome: outcome === 'success' ? 'interrupted' : 'succeeded' });
+      await microtasks(100);
+      if (outcome === 'success') run.heldInterrupts[0]?.resolve(undefined);
+      else run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+      expect((await first).disposition).toBe(outcome === 'success' ? 'applied' : 'rejected');
+      expect(await following).toMatchObject(NOOP);
+      expect(run.interrupts).toHaveLength(1);
+    },
+  );
+
+  it('S4R1 a dispatched concurrent start retry shares unknown, then the owner recovers during shutdown', async () => {
+    const value = await harness({ holdStarts: true });
+    const sessionId = await value.open();
+    const { command, submitting } = await value.submitHeld(sessionId);
+    const concurrent = value.runtime.dispatch(command);
+    concurrent.catch(() => undefined);
+    value.starts[0]?.result.reject(new Error('unknown'));
+    await expect(submitting).rejects.toMatchObject({ error: { code: 'provider_unavailable' } });
+    await expect(concurrent).rejects.toMatchObject({ error: { code: 'provider_unavailable' } });
+    expect(value.starts).toHaveLength(1);
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { retryable: true } });
+    const retry = value.runtime.dispatch(command);
+    retry.catch(() => undefined);
+    await until(() => value.starts.length === 2);
+    value.resolveStart(1);
+    expect(await retry).toMatchObject({ disposition: 'applied' });
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(value.counts()).toMatchObject({ starts: 2, disposes: 1, releases: 1 });
+  });
+});
+
+/**
+ * Hold interrupt A, queue new-ID B, complete the run while A is held, settle A
+ * (`outcome`); B's receipt transaction is aborted inside its callback `times`
+ * times, so a strong store never applies it (F).
+ */
+async function followerWithFailedReceipt(outcome: 'success' | 'rejection', times = 1) {
+  const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+  const sessionId = await value.open();
+  const { runId } = await value.startRun(sessionId);
+  const run = runOf(value);
+  const owner = interruptOf(value, sessionId, runId);
+  const first = value.runtime.interruptRun(owner);
+  await until(() => run.heldInterrupts.length === 1);
+  const follower = { ...owner, commandId: value.next('interrupt') };
+  const following = value.runtime.dispatch(follower);
+  following.catch(() => undefined);
+  const injected = onWrite(value, receiptProbe(follower.commandId), {
+    inside: (write) => {
+      if (write <= times) throw new Error('injected receipt rollback before applying');
+    },
+  });
+  run.completion.resolve({ outcome: outcome === 'success' ? 'interrupted' : 'succeeded' });
+  await microtasks(100);
+  run.interruptMode = 'resolve';
+  if (outcome === 'success') run.heldInterrupts[0]?.resolve(undefined);
+  else run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+  const owned =
+    outcome === 'success'
+      ? DELIVERED
+      : { disposition: 'rejected', error: { code: 'provider_rejected', message: 'definite rejection' } };
+  expect(await first).toMatchObject(owned);
+  // B: admitted after the terminal applied, the follower is the `delivered: false` no-op,
+  // whose receipt slot failed before applying. Its caller returns at A, before any
+  // reconciliation read; the strong store's read-back then proves the receipt absent: F.
+  expect((await rejection(following)).error).toMatchObject({
+    code: 'store_unavailable',
+    details: { fault: 'ambiguous' },
+  });
+  await until(() => value.runtime.getProviderIngestionFaults()[0]?.error.retryable === true);
+  expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+    { sessionId, error: { code: 'store_unavailable', retryable: true, details: { fault: 'failure' } } },
+  ]);
+  expect(injected.writes()).toBe(1);
+  expect(await receiptOf(value, follower.commandId)).toBeUndefined();
+  // The F head blocks quiesce (and replay) until it is recovered.
+  await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { retryable: true } });
+  expect(await value.types(sessionId)).toContain(
+    outcome === 'success' ? 'run.finished:interrupted' : 'run.finished:succeeded',
+  );
+  return { value, sessionId, run, owner, follower, injected };
+}
+
+describe('S5 catalogue: independent S4R2 receipt recovery, commit point and retained identity', () => {
+  it.each(['success', 'rejection'] as const)(
+    'S4R2 a late follower after the owner %s freezes delivered false through its failed receipt (B)',
+    async (outcome) => {
+      const { value, run, follower } = await followerWithFailedReceipt(outcome);
+      expect(await value.runtime.dispatch(follower)).toMatchObject(NOOP);
+      expect(run.interrupts).toHaveLength(1);
+    },
+  );
+
+  it('S4R2 a new interrupt after the terminal applied gets delivered false once its held acknowledgement is released', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    value.control.holdAcks(true);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await value.control.ackHeld(); // The owner receipt applied; the terminal is not yet submitted.
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+    value.control.releaseAcks(); // The owner ack lets the terminal submit; its ack is held too.
+    await first;
+    for (let read = 0; read < 200; read += 1) {
+      if ((await value.types(sessionId)).includes('run.finished:interrupted')) break;
+    }
+    expect(await value.types(sessionId)).toContain('run.finished:interrupted');
+    await value.control.ackHeld();
+    value.control.holdAcks(false); // Only the terminal acknowledgement stays held.
+    const answer = value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') });
+    // B: its receipt is an ordinary slot behind the held terminal; release that terminal first.
+    expect(await settlesPromptly(answer)).toBe('pending');
+    value.control.releaseAcks();
+    expect(await answer).toMatchObject(NOOP);
+    await value.runtime.quiesce();
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it.each(['changed-payload', 'shutdown'] as const)(
+    'S4R2 a failed follower receipt retains its identity for %s',
+    async (action) => {
+      const { value, follower } = await followerWithFailedReceipt('success');
+      if (action === 'changed-payload') {
+        expect(await value.runtime.dispatch({ ...follower, reason: 'changed' })).toMatchObject({
+          disposition: 'rejected',
+          error: { code: 'command_id_conflict' },
+        });
+        expect(await receiptOf(value, follower.commandId)).toBeUndefined();
+      } else {
+        // Shutdown resubmits the proven-absent head once, as an exact close retry does.
+        await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+        expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+      }
+    },
+  );
+});
+
+describe('S5 catalogue: independent S4R3 boundary probes and shutdown accounting', () => {
+  it('S4R3 a follower whose lookup is held across a rolled-back then retried terminal follows admission: delivered false (B)', async () => {
+    const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const rolledBack = deferred<undefined>();
+    const reportRejection = deferred<undefined>();
+    let aborted = false;
+    const terminalApplied = (tx: StoreTransaction): boolean =>
+      tx.session(sessionId).runs.get(runId)?.termination !== undefined;
+    const store = value.control.store;
+    const commit = store.commit.bind(store);
+    store.commit = <T>(mutate: (tx: StoreTransaction) => T) => {
+      let terminal = false;
+      return commit((tx) => {
+        const result = mutate(tx);
+        if (!aborted && terminalApplied(tx)) {
+          aborted = true;
+          terminal = true;
+          throw new Error('terminal rolled back after its callback');
+        }
+        return result;
+      }).catch(async (error: unknown) => {
+        if (terminal) {
+          rolledBack.resolve(undefined);
+          await reportRejection.promise;
+        }
+        throw error;
+      });
+    };
+    const lookup = gateLookup(value, follower.commandId, 1);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await first;
+    await rolledBack.promise;
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+    const following = value.runtime.dispatch(follower);
+    following.catch(() => undefined);
+    await lookup.entered;
+    reportRejection.resolve(undefined);
+    await until(() => value.runtime.getProviderIngestionFaults()[0]?.error.retryable === true);
+    await value.runtime.retryProviderIngestion(sessionId);
+    expect(await value.types(sessionId)).toContain('run.finished:interrupted');
+    lookup.release();
+    expect(await following).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('S4R3 an undeclared follower receipt that applies then rejects leaves A and is not retried by shutdown', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.dispatch(follower);
+    following.catch(() => undefined);
+    const writes = onWrite(value, receiptProbe(follower.commandId), {
+      applied: (write) => {
+        if (write === 1) throw new Error('receipt applied before its acknowledgement failed');
+      },
+    });
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await first;
+    const error = await rejection(following);
+    expect(error.error).toMatchObject({ code: 'store_unavailable', retryable: false });
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([{ sessionId, error: { retryable: false } }]);
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { retryable: false } });
+    expect(writes.writes()).toBe(1);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('S4R3 shutdown returns promptly while an applied follower receipt acknowledgement is held; a later shutdown succeeds', async () => {
+    const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.dispatch(follower);
+    following.catch(() => undefined);
+    const held = holdWrite(value, receiptProbe(follower.commandId));
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await first;
+    await held.applied;
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+    const shutdown = value.runtime.shutdown();
+    shutdown.catch(() => undefined);
+    expect(await settlesPromptly(shutdown)).toBe('rejected');
+    expect((await rejection(shutdown)).error).toMatchObject({
+      code: 'store_unavailable',
+      retryable: true,
+      details: { failures: [{ sessionId, error: PENDING_PERSISTENCE }] },
+    });
+    expect((await value.base.read(sessionId))?.session.state).not.toBe('closed');
+    held.release();
+    expect(await following).toMatchObject(NOOP);
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+  });
+});
+
+// ---- writer repair 2/3 groups (from backup/43-s4r2-34d1aea, backup/43-s4r3-82f2304) ----
+
+describe('S5 writer repair 2 groups: run retirement and admission (decision B)', () => {
+  it.each(['success', 'rejection'] as const)(
+    'a new-ID follower queued during the owner %s is admitted after the run retired: delivered false',
+    async (outcome) => {
+      const value = await harness({ interruptMode: 'hold' });
+      const sessionId = await value.open();
+      const { runId } = await value.startRun(sessionId);
+      const run = runOf(value);
+      const owner = interruptOf(value, sessionId, runId);
+      const first = value.runtime.interruptRun(owner);
+      await until(() => run.heldInterrupts.length === 1);
+      const follower = { ...owner, commandId: value.next('interrupt') };
+      const following = value.runtime.dispatch(follower);
+      following.catch(() => undefined);
+      run.completion.resolve({ outcome: outcome === 'success' ? 'interrupted' : 'succeeded' });
+      await microtasks(100);
+      run.interruptMode = 'resolve';
+      if (outcome === 'success') run.heldInterrupts[0]?.resolve(undefined);
+      else run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+
+      expect(await first).toMatchObject(
+        outcome === 'success'
+          ? DELIVERED
+          : { disposition: 'rejected', error: { code: 'provider_rejected', message: 'definite rejection' } },
+      );
+      expect(await following).toMatchObject(NOOP);
+      expect(run.interrupts).toHaveLength(1);
+      await value.runtime.quiesce();
+      expect(await value.types(sessionId)).toContain(
+        outcome === 'success' ? 'run.finished:interrupted' : 'run.finished:succeeded',
+      );
+      expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+      expect(await value.runtime.dispatch(follower)).toMatchObject({
+        disposition: 'duplicate',
+        result: { delivered: false },
+      });
+      expect(await value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') })).toMatchObject(NOOP);
+      expect(run.interrupts).toHaveLength(1);
+    },
+  );
+
+  it('a follower invoked while the owner success acknowledgement is held is admitted after the terminal: delivered false', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    value.control.holdAcks(true);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await value.control.ackHeld();
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.dispatch(follower);
+    following.catch(() => undefined);
+    value.control.holdAcks(false);
+    value.control.releaseAcks();
+
+    expect(await first).toMatchObject(DELIVERED);
+    expect(await following).toMatchObject(NOOP);
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+    await value.runtime.quiesce();
+    expect(await value.types(sessionId)).toContain('run.finished:interrupted');
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('a follower admitted while the terminal is placed but failed (F) gets the transient ending refusal, then false', async () => {
+    const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    const follower = { ...owner, commandId: value.next('interrupt') };
+    const following = value.runtime.dispatch(follower);
+    following.catch(() => undefined);
+    run.completion.resolve({ outcome: 'succeeded' });
+    await microtasks(100);
+    value.control.holdAcks(true);
+    run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+    await value.control.ackHeld();
+    value.control.holdAcks(false);
+    value.control.failNext('before');
+    value.control.releaseAcks();
+
+    expect(await first).toMatchObject({ disposition: 'rejected', error: { message: 'definite rejection' } });
+    expect((await rejection(following)).error).toMatchObject({
+      code: 'illegal_state_transition',
+      retryable: true,
+      details: { reason: 'run-not-active' },
+    });
+    expect(await receiptOf(value, follower.commandId)).toBeUndefined();
+    expect(run.interrupts).toHaveLength(1);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([{ sessionId, error: { retryable: true } }]);
+    expect(await value.types(sessionId)).not.toContain('run.finished:succeeded');
+
+    await value.runtime.retryProviderIngestion(sessionId);
+    expect(await value.types(sessionId)).toContain('run.finished:succeeded');
+    expect(await value.runtime.dispatch(follower)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it.each(['success', 'rejection'] as const)(
+    'a concurrent exact interrupt retry keeps the owner %s after the run retired',
+    async (outcome) => {
+      const value = await harness({ interruptMode: 'hold' });
+      const sessionId = await value.open();
+      const { runId } = await value.startRun(sessionId);
+      const run = runOf(value);
+      const owner = interruptOf(value, sessionId, runId);
+      const first = value.runtime.interruptRun(owner);
+      await until(() => run.heldInterrupts.length === 1);
+      const concurrent = value.runtime.dispatch(owner);
+      concurrent.catch(() => undefined);
+      run.completion.resolve({ outcome: outcome === 'success' ? 'interrupted' : 'succeeded' });
+      await microtasks(100);
+      run.interruptMode = 'resolve';
+      if (outcome === 'success') run.heldInterrupts[0]?.resolve(undefined);
+      else run.heldInterrupts[0]?.reject(new ProviderRejection(agentError('provider_rejected', 'definite rejection')));
+
+      if (outcome === 'success') {
+        expect(await first).toMatchObject(DELIVERED);
+        expect(await concurrent).toMatchObject({ disposition: 'duplicate', result: { delivered: true } });
+      } else {
+        const refused = {
+          disposition: 'rejected',
+          error: { code: 'provider_rejected', message: 'definite rejection' },
+        };
+        expect(await first).toMatchObject(refused);
+        expect(await concurrent).toMatchObject(refused);
+      }
+      await value.runtime.quiesce();
+      expect(await value.types(sessionId)).toContain(
+        outcome === 'success' ? 'run.finished:interrupted' : 'run.finished:succeeded',
+      );
+      expect(run.interrupts).toHaveLength(1);
+    },
+  );
+
+  it.each(['delivered', 'rejected'] as const)(
+    'a concurrent exact response retry keeps a %s outcome after the run retired',
+    async (outcome) => {
+      const value = await harness({ holdResponses: true });
+      const sessionId = await value.open();
+      await value.startRun(sessionId);
+      const run = runOf(value);
+      run.request.sink.emit(question('q-1'));
+      const interactionId = await value.interactionId(sessionId);
+      const respond = {
+        commandId: value.next('respond'),
+        type: 'respond_to_interaction' as const,
+        sessionId,
+        interactionId,
+        response: yes,
+      };
+      const first = value.runtime.respondToInteraction(respond);
+      await until(() => value.responses.length === 1);
+      const concurrent = value.runtime.dispatch(respond);
+      concurrent.catch(() => undefined);
+      run.completion.resolve({ outcome: 'succeeded' });
+      await microtasks(100);
+      if (outcome === 'delivered') value.responses[0]?.result.resolve(undefined);
+      else value.responses[0]?.result.reject(new ProviderRejection(agentError('provider_rejected', 'not now')));
+
+      if (outcome === 'delivered') {
+        expect(await first).toMatchObject({ disposition: 'applied' });
+        expect(await concurrent).toMatchObject({ disposition: 'duplicate' });
+      } else {
+        const refused = { disposition: 'rejected', error: { code: 'provider_rejected', message: 'not now' } };
+        expect(await first).toMatchObject(refused);
+        expect(await concurrent).toMatchObject(refused);
+      }
+      await value.runtime.quiesce();
+      expect(await value.types(sessionId)).toContain(
+        outcome === 'delivered' ? 'run.finished:succeeded' : 'run.finished:failed',
+      );
+      expect(value.responses).toHaveLength(1);
+    },
+  );
+});
+
+describe('S5 writer repair 3 groups: receipt failure and terminal application (decision B)', () => {
+  it.each(['success', 'rejection'] as const)(
+    'a late follower after the owner %s keeps its delivered false outcome for the exact retry',
+    async (outcome) => {
+      const { value, run, follower } = await followerWithFailedReceipt(outcome);
+      expect(await value.runtime.dispatch(follower)).toMatchObject(NOOP);
+      expect(run.interrupts).toHaveLength(1);
+      expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+      expect(await value.runtime.dispatch(follower)).toMatchObject({
+        disposition: 'duplicate',
+        result: { delivered: false },
+      });
+      expect(coordinationEntryCountForTesting(value.runtime)).toMatchObject({ commandAttempts: 0 });
+      expect(run.interrupts).toHaveLength(1);
+    },
+  );
+
+  it('a changed payload under the held follower id conflicts, unrecorded, and the exact retry still finishes it', async () => {
+    const { value, run, follower } = await followerWithFailedReceipt('success');
+    expect(await value.runtime.dispatch({ ...follower, reason: 'changed' })).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    expect(await receiptOf(value, follower.commandId)).toBeUndefined();
+    expect(await value.runtime.dispatch(follower)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('shutdown resubmits the failed follower receipt once and then succeeds', async () => {
+    const { value, run, follower } = await followerWithFailedReceipt('success');
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('shutdown reports a still-failing follower receipt retryably and succeeds once it is recorded', async () => {
+    const { value, run, follower, injected } = await followerWithFailedReceipt('rejection', 2);
+    const failed = await rejection(value.runtime.shutdown());
+    expect(failed.error).toMatchObject({ code: 'store_unavailable', retryable: true });
+    expect(injected.writes()).toBe(2);
+    expect(await receiptOf(value, follower.commandId)).toBeUndefined();
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('a new interrupt after the terminal applied gets delivered false once its held acknowledgement is released', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    value.control.holdAcks(true);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await value.control.ackHeld();
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+    value.control.releaseAcks();
+    expect(await first).toMatchObject(DELIVERED);
+    for (let read = 0; read < 200; read += 1) {
+      if ((await value.types(sessionId)).includes('run.finished:interrupted')) break;
+    }
+    await value.control.ackHeld();
+    value.control.holdAcks(false);
+    const answer = value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') });
+    expect(await settlesPromptly(answer)).toBe('pending');
+    value.control.releaseAcks();
+    expect(await answer).toMatchObject(NOOP);
+    await value.runtime.quiesce();
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('interrupts invoked before and after the terminal applied are both admitted after it: delivered false', async () => {
+    const value = await harness({ interruptMode: 'hold' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    value.control.holdAcks(true);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await value.control.ackHeld();
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+    const before = value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') });
+    before.catch(() => undefined);
+    value.control.releaseAcks();
+    expect(await first).toMatchObject(DELIVERED);
+    for (let read = 0; read < 200; read += 1) {
+      if ((await value.types(sessionId)).includes('run.finished:interrupted')) break;
+    }
+    const after = value.runtime.dispatch({ ...owner, commandId: value.next('interrupt') });
+    after.catch(() => undefined);
+    value.control.holdAcks(false);
+    value.control.releaseAcks();
+    expect(await before).toMatchObject(NOOP);
+    expect(await after).toMatchObject(NOOP);
+    await value.runtime.quiesce();
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('while a terminal proven not applied is blocked (F), a fresh interrupt is refused transiently; false once it applies', async () => {
+    const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    let aborted = 0;
+    onWrite(value, (tx) => tx.session(sessionId).runs.get(runId)?.termination !== undefined, {
+      inside: () => {
+        aborted += 1;
+        if (aborted === 1) throw new Error('injected terminal rollback before applying');
+      },
+    });
+    const owner = interruptOf(value, sessionId, runId);
+    const first = value.runtime.interruptRun(owner);
+    await until(() => run.heldInterrupts.length === 1);
+    run.completion.resolve({ outcome: 'interrupted' });
+    await microtasks(100);
+    run.heldInterrupts[0]?.resolve(undefined);
+    expect(await first).toMatchObject(DELIVERED);
+    await until(() => value.runtime.getProviderIngestionFaults().length === 1);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([{ sessionId, error: { retryable: true } }]);
+    expect(await value.types(sessionId)).not.toContain('run.finished:interrupted');
+
+    const fresh = { ...owner, commandId: value.next('interrupt') };
+    expect((await rejection(value.runtime.dispatch(fresh))).error).toMatchObject({
+      code: 'illegal_state_transition',
+      retryable: true,
+      details: { reason: 'run-not-active' },
+    });
+    expect(await receiptOf(value, fresh.commandId)).toBeUndefined();
+    await value.runtime.retryProviderIngestion(sessionId);
+    expect(await value.types(sessionId)).toContain('run.finished:interrupted');
+    expect(await value.runtime.dispatch(fresh)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(1);
+  });
+});
+
+// ---- D03–D08 acceptance coverage ------------------------------------------------
+
+describe('S5 D03 admission decides a new-ID outcome', () => {
+  it('D03 in flight at admission: a fresh ID mirrors the owner call that is still in flight, without a call', async () => {
+    const value = await harness({ interruptMode: 'hold', declaration: STRONG });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    // A recoverable head failure makes the owner's command return while its provider call is held.
+    value.control.failNext('before');
+    run.request.sink.emit(delta('blocked once'));
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { retryable: true } });
+    const owner = interruptOf(value, sessionId, runId);
+    expect((await rejection(value.runtime.interruptRun(owner))).error).toMatchObject({
+      code: 'store_unavailable',
+      details: { fault: 'failure' },
+    });
+    expect(run.heldInterrupts).toHaveLength(1);
+    const follower = interruptOf(value, sessionId, runId);
+    expect((await rejection(value.runtime.interruptRun(follower))).error).toMatchObject({
+      code: 'store_unavailable',
+      details: { fault: 'failure' },
+    });
+    expect(run.interrupts).toHaveLength(1);
+    run.heldInterrupts[0]?.resolve(undefined);
+    await value.runtime.retryProviderIngestion(sessionId);
+    expect(await receiptOf(value, follower.commandId)).toMatchObject(DELIVERED);
+    expect(await value.runtime.interruptRun(follower)).toMatchObject({
+      disposition: 'duplicate',
+      result: { delivered: true },
+    });
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('D03 observed success at admission: a fresh ID mirrors it without a call while the run is active', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+    expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+    expect(run.interrupts).toHaveLength(1);
+  });
+
+  it('D03 placed terminal behind a held head: a fresh ID is refused transiently, unrecorded; false once applied', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    value.control.holdAcks(true);
+    run.request.sink.emit(delta('held'));
+    await value.control.ackHeld();
+    run.completion.resolve({ outcome: 'succeeded' });
+    await run.completion.promise;
+    await microtasks(20);
+    value.control.holdAcks(false);
+    const fresh = interruptOf(value, sessionId, runId);
+    expect((await rejection(value.runtime.interruptRun(fresh))).error).toMatchObject({
+      code: 'illegal_state_transition',
+      retryable: true,
+      details: { reason: 'run-not-active' },
+    });
+    expect(await receiptOf(value, fresh.commandId)).toBeUndefined();
+    value.control.releaseAcks();
+    await value.runtime.quiesce();
+    expect(await value.runtime.interruptRun(fresh)).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(0);
+  });
+
+  it('D03 lookup held across the terminal: admission rechecks the run and answers delivered false, never a call', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const fresh = interruptOf(value, sessionId, runId);
+    // The first lookup is the runtime's; the second is the driver's admission lookup.
+    const lookup = gateLookup(value, fresh.commandId, 2);
+    const answer = value.runtime.interruptRun(fresh);
+    answer.catch(() => undefined);
+    await lookup.entered;
+    run.completion.resolve({ outcome: 'succeeded' });
+    await value.runtime.quiesce();
+    expect(await value.types(sessionId)).toContain('run.finished:succeeded');
+    lookup.release();
+    expect(await answer).toMatchObject(NOOP);
+    expect(run.interrupts).toHaveLength(0);
+    expect(coordinationEntryCountForTesting(value.runtime)).toMatchObject({ commandAttempts: 0 });
+  });
+
+  it.each(['terminal', 'active'] as const)(
+    'D03/D08 lookup held across a close (%s run): the unbound claim is refused unrecorded, and no orphan blocks close',
+    async (state) => {
+      const value = await harness();
+      const sessionId = await value.open();
+      const runId =
+        state === 'terminal' ? await finishedRun(value, sessionId) : (await value.startRun(sessionId)).runId;
+      const fresh = interruptOf(value, sessionId, runId);
+      const lookup = gateLookup(value, fresh.commandId, 2);
+      const answer = value.runtime.interruptRun(fresh);
+      answer.catch(() => undefined);
+      await lookup.entered;
+      const dispose = value.holdDispose();
+      const close = value.closeCommand(sessionId);
+      const closing = value.runtime.closeSession(close);
+      closing.catch(() => undefined);
+      await until(() => value.counts().disposes === 1);
+      lookup.release();
+      expect((await rejection(answer)).error).toMatchObject({
+        code: 'illegal_state_transition',
+        retryable: true,
+        details: { reason: 'closing' },
+      });
+      dispose.resolve(undefined);
+      expect(await closing).toMatchObject({ disposition: 'applied', result: { type: 'session_closed' } });
+      expect(await receiptOf(value, fresh.commandId)).toBeUndefined();
+      expect(coordinationEntryCountForTesting(value.runtime)).toMatchObject({ commandAttempts: 0 });
+    },
+  );
+});
+
+describe('S5 D04 identity', () => {
+  it('an admitted follower exact retry never delivers; only the owner exact retry does', async () => {
+    const value = await harness({ interruptMode: 'reject-untyped' });
+    const sessionId = await value.open();
+    const { runId } = await value.startRun(sessionId);
+    const run = runOf(value);
+    const owner = interruptOf(value, sessionId, runId);
+    const follower = interruptOf(value, sessionId, runId);
+    for (const command of [owner, follower, follower, follower]) {
+      expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+        code: 'provider_unavailable',
+        message: UNKNOWN_OUTCOME,
+      });
+    }
+    expect(run.interrupts).toHaveLength(1);
+    run.interruptMode = 'resolve';
+    expect(await value.runtime.interruptRun(owner)).toMatchObject(DELIVERED);
+    expect(run.interrupts).toHaveLength(2);
+    expect(await value.runtime.interruptRun(follower)).toMatchObject({ result: { delivered: true } });
+    expect(run.interrupts).toHaveLength(2);
+  });
+
+  it('a held no-op receipt keeps its first acceptance; a changed payload, another session and shutdown all conflict', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    const noop = interruptOf(value, sessionId, runId);
+    const writes = onWrite(value, receiptProbe(noop.commandId), {
+      inside: (write) => {
+        if (write <= 2) throw new Error('injected receipt rollback before applying');
+      },
+    });
+    // The caller returns at A, before reconciliation; the read-back proves the receipt absent (F).
+    expect((await rejection(value.runtime.interruptRun(noop))).error).toMatchObject({
+      details: { fault: 'ambiguous' },
+    });
+    await until(() => value.runtime.getProviderIngestionFaults()[0]?.error.retryable === true);
+    const conflict = await value.runtime.interruptRun({ ...noop, reason: 'changed' });
+    expect(conflict).toMatchObject({ disposition: 'rejected', error: { code: 'command_id_conflict' } });
+
+    // Another session cannot take the held command ID either. (Its run is not finished through
+    // `quiesce`, which rejects while this session's F is held on purpose: the identity check
+    // comes before any run lookup anyway.)
+    const other = await value.open();
+    const otherRun = (await value.startRun(other)).runId;
+    expect(await value.runtime.interruptRun({ ...noop, sessionId: other, runId: otherRun })).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    // Shutdown resubmits the proven-absent head once; it fails again, so shutdown is retryable.
+    expect((await rejection(value.runtime.shutdown())).error).toMatchObject({
+      code: 'store_unavailable',
+      retryable: true,
+    });
+    expect(writes.writes()).toBe(2);
+    // While shutting down, the held identity is still admitted and still answered with the conflict.
+    expect(await value.runtime.interruptRun({ ...noop, reason: 'changed again' })).toMatchObject({
+      disposition: 'rejected',
+      error: { code: 'command_id_conflict' },
+    });
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    const recorded = await receiptOf(value, noop.commandId);
+    expect(recorded).toMatchObject(NOOP);
+    expect(writes.writes()).toBe(3);
+    // The first acceptance time (also carried by the conflict) is kept, earlier than the later open.
+    expect(recorded?.acceptedAt).toBe(conflict.acceptedAt);
+    const opened = (await value.base.read(other))?.session.createdAt;
+    expect(opened !== undefined && recorded !== undefined && recorded.acceptedAt < opened).toBe(true);
+    expect(await receiptOf(value, conflict.commandId)).toMatchObject(NOOP);
+  });
+});
+
+describe('S5 D05 an undeclared store never lets an accepted interrupt receipt bypass A', () => {
+  it.each([
+    ['no-op body', 'apply-then-reject'],
+    ['no-op body', 'delayed-write'],
+    ['follower effect', 'apply-then-reject'],
+    ['follower effect', 'delayed-write'],
+  ] as const)('%s with %s: permanent A, blocked reads, one submission, failed shutdown', async (kind, mode) => {
+    const value = await harness();
+    const sessionId = await value.open();
+    let runId: RunId;
+    if (kind === 'no-op body') {
+      runId = await finishedRun(value, sessionId);
+    } else {
+      runId = (await value.startRun(sessionId)).runId;
+      expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+    }
+    const command = interruptOf(value, sessionId, runId);
+    const commits = value.control.commits();
+    value.control.failNext(mode);
+    const failed = await rejection(value.runtime.interruptRun(command));
+    expect(failed.error).toMatchObject({
+      code: 'store_unavailable',
+      retryable: false,
+      details: { fault: 'ambiguous' },
+    });
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId, error: { retryable: false, details: { fault: 'ambiguous', permanent: true } } },
+    ]);
+    expect(value.control.commits()).toBe(commits + 1);
+    await value.control.applyDelayedWrites();
+    // The store now holds the receipt; the runtime does not trust it.
+    expect(await receiptOf(value, command.commandId)).toMatchObject({ disposition: 'applied' });
+    expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+      retryable: false,
+      details: { fault: 'ambiguous' },
+    });
+    expect(await value.runtime.interruptRun({ ...command, reason: 'changed' })).toMatchObject({
+      error: { code: 'command_id_conflict' },
+    });
+    const fresh = interruptOf(value, sessionId, runId);
+    expect((await rejection(value.runtime.interruptRun(fresh))).error).toMatchObject({ retryable: false });
+    expect(await receiptOf(value, fresh.commandId)).toBeUndefined();
+    await expect(value.runtime.readEvents(sessionId, SequenceSchema.parse(0))).rejects.toMatchObject({
+      error: { code: 'store_unavailable' },
+    });
+    const replay = value.runtime.subscribe({ sessionId, fromSequence: 0 })[Symbol.asyncIterator]();
+    await expect(replay.next()).rejects.toMatchObject({ error: { code: 'store_unavailable' } });
+    await expect(value.runtime.quiesce()).rejects.toMatchObject({ error: { retryable: false } });
+    await expect(value.runtime.shutdown()).rejects.toMatchObject({ error: { retryable: false } });
+    await expect(value.runtime.retryProviderIngestion(sessionId)).rejects.toMatchObject({
+      error: { retryable: false },
+    });
+    // Exactly one submission: no retry, shutdown or ingestion retry resubmitted the head.
+    expect(value.control.commits()).toBe(commits + 1);
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+  });
+
+  it('a strong declaration withdrawn while the reconciliation read is held leaves A permanent', async () => {
+    const declaration = { version: 1, level: 'strong' };
+    const value = await harness({ declaration: { value: declaration } });
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    const command = interruptOf(value, sessionId, runId);
+    // Runtime lookup, driver admission lookup, then the reconciliation read.
+    const lookup = gateLookup(value, command.commandId, 3);
+    value.control.failNext('apply-then-reject');
+    const failed = value.runtime.interruptRun(command);
+    failed.catch(() => undefined);
+    await lookup.entered;
+    // A is already visible, and the command returned, while the read is held.
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([{ sessionId, error: { retryable: false } }]);
+    expect(await settlesPromptly(failed)).toBe('rejected');
+    declaration.level = 'baseline';
+    lookup.release();
+    // `quiesce` rejects at once on a fault; wait (bounded microtasks) for the read-back to finish.
+    await until(() => value.runtime.getProviderIngestionFaults()[0]?.error.details?.permanent === true);
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId, error: { details: { fault: 'ambiguous', permanent: true } } },
+    ]);
+    expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({ retryable: false });
+  });
+});
+
+describe('S5 D06 a strong store recovers accepted interrupt receipts once', () => {
+  it.each(['exact retry', 'ingestion retry'] as const)(
+    'a pre-apply no-op receipt failure is F; %s commits it once without a provider effect',
+    async (path) => {
+      const value = await harness({ declaration: STRONG });
+      const sessionId = await value.open();
+      const runId = await finishedRun(value, sessionId);
+      const command = interruptOf(value, sessionId, runId);
+      const writes = onWrite(value, receiptProbe(command.commandId), {});
+      value.control.failNext('before');
+      expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+        code: 'store_unavailable',
+        retryable: true,
+        details: { fault: 'failure' },
+      });
+      if (path === 'exact retry') {
+        expect(await value.runtime.interruptRun(command)).toMatchObject(NOOP);
+      } else {
+        await value.runtime.retryProviderIngestion(sessionId);
+        expect(await value.runtime.interruptRun(command)).toMatchObject({
+          disposition: 'duplicate',
+          result: { delivered: false },
+        });
+      }
+      expect(writes.writes()).toBe(1);
+      expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+      expect(runOf(value).interrupts).toHaveLength(0);
+    },
+  );
+
+  it('an applied-then-rejected no-op receipt reconciles once and answers its exact retry', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    const command = interruptOf(value, sessionId, runId);
+    const writes = onWrite(value, receiptProbe(command.commandId), {
+      applied: (write) => {
+        if (write === 1) throw new Error('acknowledgement lost after applying');
+      },
+    });
+    // The caller returns at A, before the reconciliation read; the read-back proves it applied.
+    expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+      code: 'store_unavailable',
+      details: { fault: 'ambiguous' },
+    });
+    await until(() => value.runtime.getProviderIngestionFaults().length === 0);
+    expect(writes.writes()).toBe(1);
+    expect(await receiptOf(value, command.commandId)).toMatchObject(NOOP);
+    expect(await value.runtime.interruptRun(command)).toMatchObject({
+      disposition: 'duplicate',
+      result: { delivered: false },
+    });
+    // Reconciled once: never resubmitted.
+    expect(writes.writes()).toBe(1);
+  });
+
+  it('a held reconciliation read keeps A visible, and close returns promptly with it before the read resolves', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    const command = interruptOf(value, sessionId, runId);
+    const lookup = gateLookup(value, command.commandId, 3);
+    value.control.failNext('apply-then-reject');
+    const answer = value.runtime.interruptRun(command);
+    answer.catch(() => undefined);
+    await lookup.entered;
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    expect(await settlesPromptly(closing)).toBe('rejected');
+    expect((await rejection(closing)).error).toMatchObject({
+      code: 'store_unavailable',
+      retryable: false,
+      details: { fault: 'ambiguous' },
+    });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    lookup.release();
+    await until(() => value.runtime.getProviderIngestionFaults().length === 0);
+    // The reconciled head was the no-op; `closing` and `session.closed` follow it, so the exact
+    // close retry reaches its own (possibly still queued) closed slot (ADR-0002).
+    expect(await value.runtime.closeSession(close)).toMatchObject({ result: { type: 'session_closed' } });
+    expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+    expect((await value.types(sessionId)).filter((kind) => kind === 'session.closed')).toHaveLength(1);
+    expect(await value.runtime.interruptRun(command)).toMatchObject({ disposition: 'duplicate' });
+  });
+});
+
+describe('S5 D07 close and shutdown return promptly while persistence is in flight', () => {
+  it.each(['owner', 'follower', 'no-op', 'terminal', 'close'] as const)(
+    'a held %s acknowledgement: close returns retryably at once, the other session closes, the exact retry succeeds',
+    async (kind) => {
+      const value = await harness();
+      const sessionId = await value.open();
+      const other = await value.open();
+      const { runId } = await value.startRun(sessionId);
+      const run = runOf(value);
+      let pending: Promise<CommandReceipt> | undefined;
+      let held: { applied: Promise<undefined>; release(): void };
+      if (kind === 'owner' || kind === 'follower') {
+        if (kind === 'follower') {
+          expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+        }
+        const command = interruptOf(value, sessionId, runId);
+        held = holdWrite(value, receiptProbe(command.commandId));
+        pending = value.runtime.interruptRun(command);
+      } else if (kind === 'no-op') {
+        run.completion.resolve({ outcome: 'succeeded' });
+        await value.runtime.quiesce();
+        const command = interruptOf(value, sessionId, runId);
+        held = holdWrite(value, receiptProbe(command.commandId));
+        pending = value.runtime.interruptRun(command);
+      } else if (kind === 'terminal') {
+        held = holdWrite(value, (tx) => tx.session(sessionId).runs.get(runId)?.termination !== undefined);
+        run.completion.resolve({ outcome: 'succeeded' });
+      } else {
+        held = holdWrite(value, (tx) => tx.session(sessionId).session.state === 'closed');
+      }
+      pending?.catch(() => undefined);
+      if (kind !== 'close') await held.applied;
+
+      const close = value.closeCommand(sessionId);
+      const closing = value.runtime.closeSession(close);
+      expect(await settlesPromptly(closing)).toBe('rejected');
+      expect((await rejection(closing)).error).toMatchObject({
+        ...PENDING_PERSISTENCE,
+        details: { sessionId, pending: 'persistence' },
+      });
+      expect(value.counts()).toMatchObject({ disposes: 1, releases: 1 });
+      if (kind !== 'close') {
+        // Nothing certifies the close ahead of the held head.
+        expect((await value.base.read(sessionId))?.session.state).not.toBe('closed');
+        expect(await receiptOf(value, close.commandId)).toBeUndefined();
+      }
+      // Another session is not blocked by it.
+      expect(await value.runtime.closeSession(value.closeCommand(other))).toMatchObject({ disposition: 'applied' });
+      expect(value.counts()).toMatchObject({ disposes: 2, releases: 2 });
+
+      held.release();
+      if (pending !== undefined) {
+        expect(await pending).toMatchObject(kind === 'no-op' ? NOOP : DELIVERED);
+      }
+      const retried = await value.runtime.closeSession(close);
+      expect(retried).toMatchObject({ result: { type: 'session_closed' } });
+      expect(value.counts()).toMatchObject({ disposes: 2, releases: 2 });
+      const kinds = await value.types(sessionId);
+      expect(kinds.at(-1)).toBe('session.closed');
+      expect(kinds.filter((type) => type === 'session.closed')).toHaveLength(1);
+      await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    },
+  );
+
+  it('a retry started by shutdown whose acknowledgement is held makes shutdown return; a later shutdown succeeds', async () => {
+    const value = await harness({ declaration: STRONG });
+    const sessionId = await value.open();
+    const healthy = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    const command = interruptOf(value, sessionId, runId);
+    const gate = deferred<undefined>();
+    const resubmitted = deferred<undefined>();
+    const writes = onWrite(value, receiptProbe(command.commandId), {
+      inside: (write) => {
+        if (write === 1) throw new Error('injected receipt rollback before applying');
+      },
+      applied: async (write) => {
+        if (write !== 2) return;
+        resubmitted.resolve(undefined);
+        await gate.promise;
+      },
+    });
+    // The caller returns at A, before reconciliation; the read-back proves the receipt absent (F).
+    expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+      details: { fault: 'ambiguous' },
+    });
+    await until(() => value.runtime.getProviderIngestionFaults()[0]?.error.retryable === true);
+    const shutdown = value.runtime.shutdown();
+    shutdown.catch(() => undefined);
+    expect(await settlesPromptly(shutdown)).toBe('rejected');
+    expect((await rejection(shutdown)).error).toMatchObject({
+      code: 'store_unavailable',
+      retryable: true,
+      details: { failures: [{ sessionId, error: PENDING_PERSISTENCE }] },
+    });
+    await resubmitted.promise;
+    expect(writes.writes()).toBe(2);
+    expect((await value.base.read(healthy))?.session.state).toBe('closed');
+    expect((await value.base.read(sessionId))?.session.state).not.toBe('closed');
+    gate.resolve(undefined);
+    await expect(value.runtime.shutdown()).resolves.toBeUndefined();
+    expect(await receiptOf(value, command.commandId)).toMatchObject(NOOP);
+    expect(writes.writes()).toBe(2);
+    expect(value.counts()).toMatchObject({ disposes: 2, releases: 2 });
+  });
+});
+
+describe('S5 D08 capacity, ordering and retirement of interrupt receipts', () => {
+  it('a no-op refused at the 1,023-operation bound is retryable capacity, sets no O, and later succeeds', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    value.control.holdAcks(true);
+    const sink = value.sessionSink();
+    sink.emit(note('head'));
+    await value.control.ackHeld();
+    for (let index = 1; index < 1023; index += 1) sink.emit(note(`note ${String(index)}`));
+    const command = interruptOf(value, sessionId, runId);
+    expect((await rejection(value.runtime.interruptRun(command))).error).toMatchObject({
+      code: 'store_unavailable',
+      details: { reason: 'capacity' },
+    });
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+    value.control.holdAcks(false);
+    value.control.releaseAcks();
+    await value.runtime.quiesce();
+    expect(await value.runtime.interruptRun(command)).toMatchObject(NOOP);
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+  });
+
+  it('an admitted no-op takes exactly the last free slot and is drained ahead of a later close', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    const runId = await finishedRun(value, sessionId);
+    value.control.holdAcks(true);
+    const sink = value.sessionSink();
+    sink.emit(note('head'));
+    await value.control.ackHeld();
+    for (let index = 1; index < 1022; index += 1) sink.emit(note(`note ${String(index)}`));
+    const noop = value.runtime.interruptRun(interruptOf(value, sessionId, runId));
+    noop.catch(() => undefined);
+    // Admitted: its caller now waits on its own slot. The next provider output finds the session full.
+    await until(() => coordinationEntryCountForTesting(value.runtime).waiters === 1);
+    expect(value.runtime.getProviderIngestionFaults()).toEqual([]);
+    sink.emit(note('one too many'));
+    expect(value.runtime.getProviderIngestionFaults()).toMatchObject([
+      { sessionId, error: { details: { fault: 'overflow' } } },
+    ]);
+    const close = value.closeCommand(sessionId);
+    const closing = value.runtime.closeSession(close);
+    expect(await settlesPromptly(closing)).toBe('rejected');
+    value.control.holdAcks(false);
+    value.control.releaseAcks();
+    const receipt = await noop;
+    expect(receipt).toMatchObject(NOOP);
+    expect(await value.runtime.closeSession(close)).toMatchObject({ result: { type: 'session_closed' } });
+    const history = await value.history(sessionId);
+    const closingEvent = history.find(
+      (event) => event.payload.type === 'session.state_changed' && event.payload.to === 'closing',
+    );
+    expect(
+      receipt.sequence !== undefined && closingEvent !== undefined && receipt.sequence < closingEvent.sequence,
+    ).toBe(true);
+  });
+
+  it('many turns with owner, follower and no-op interrupts leave constant bookkeeping and inert sinks', async () => {
+    const value = await harness();
+    const sessionId = await value.open();
+    for (let turn = 0; turn < 5; turn += 1) {
+      const { runId } = await value.startRun(sessionId);
+      expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+      expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(DELIVERED);
+      runOf(value, turn).completion.resolve({ outcome: 'interrupted' });
+      await value.runtime.quiesce();
+      expect(await value.runtime.interruptRun(interruptOf(value, sessionId, runId))).toMatchObject(NOOP);
+    }
+    expect(coordinationEntryCountForTesting(value.runtime)).toMatchObject({
+      commands: 0,
+      sessions: 0,
+      pendingSubmits: 0,
+      commandAttempts: 0,
+      interactionRoutes: 0,
+      runs: 0,
+      waiters: 0,
+      invocations: 0,
+      lifecycleClaims: 0,
+    });
+    const trap = reflectionTrap();
+    for (const run of value.runs) run.request.sink.emit(trap.value);
     expect(trap.inspections()).toBe(0);
   });
 });

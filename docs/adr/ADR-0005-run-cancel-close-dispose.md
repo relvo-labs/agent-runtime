@@ -83,6 +83,19 @@ owns a session whose `session.closed` commit is unconfirmed, a close is answered
 ownership, not by the store's receipt or closed state: under A the exact retry and any other
 close ID fail closed with the non-retryable fault, and no cleanup effect is repeated.
 
+Close never awaits an unsettled store commit either (issue #43, accepted with decision B on
+2026-10-04). Once cleanup is done, the attempt starts only the submission the queue allows
+(an exact retry or shutdown resubmits a proven-unapplied head), lets ready continuations
+run for a bounded number of scheduling turns while the session's head keeps advancing, then
+inspects state instead of waiting. A confirmed `session.closed` returns the receipt; A
+returns its non-retryable fault and F its retryable one. If a commit ahead of
+`session.closed` (or `session.closed` itself) is still unacknowledged, the attempt returns a
+retryable `store_unavailable` with `details.pending: 'persistence'`. No timeout declares a
+commit applied, absent or failed: the ordinary head continues on its own, and a later close
+or shutdown confirms the result without repeating any cleanup effect. With a store whose
+commits settle asynchronously, a close or shutdown may therefore need a retry where it
+previously waited.
+
 Runtime shutdown is memoized per attempt. Its first call synchronously closes mutation
 admission to new work and fences every live session with shutdown's internal close. A
 command ID that still holds an unresolved identity, such as an `interrupt_run` with an
@@ -90,7 +103,8 @@ unknown outcome, is still admitted for its owner's exact retry: only that retry 
 resolve it, and shutdown cannot succeed until it is resolved. That close neither
 looks up nor records a caller receipt, so a caller cannot reserve a synthetic ID and
 suppress cleanup. It resumes a proven-unapplied (F) head, retries retained open rollbacks,
-and never waits on an unresolved provider promise. A blocked session is reported
+and never waits on an unresolved provider promise or an unsettled store commit (the same
+persistence-readiness rule as close). A blocked session is reported
 (sorted, retryable unless A) while the other sessions close. Shutdown succeeds only after
 every session's cleanup and history commits; it then closes subscriptions. A failed
 attempt keeps admission closed, leaves subscriptions open, and lets the next `shutdown()`

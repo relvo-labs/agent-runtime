@@ -20,12 +20,18 @@ Provider-neutral runtime with an injected store, workspace provider, and provide
   - the run's terminal waits behind it;
   - only an exact retry of that command (same ID and payload) calls the provider again.
 
-  An exact retry of a definitely rejected command replays its rejected receipt; a new command ID after a definite interrupt rejection interrupts again.
+  An exact retry of a definitely rejected command replays its rejected receipt; an `interrupt_run` with a new command ID admitted after a definite interrupt rejection interrupts again.
 
 - **Interactions.** A request becomes answerable only after its event commits; the store answers for a settled interaction (`interaction_already_settled`). A provider withdrawal is ordered after a response already delivered, so it never displaces that response. A provider reference is free again once its interaction settles: a later request that reuses it opens a new interaction, while reusing a still-pending reference becomes a diagnostic.
 - **Interrupts.** `interrupt_run` rejects an unknown run ID or a run ID from another session with `unknown_run`. A run that is already terminal gives an applied no-op with `delivered: false`.
 
-  An `interrupt_run` that arrives while the run's interrupt is in flight waits for that one shared interrupt and mirrors its outcome (delivered, the same rejection, or unknown). It never calls the provider itself. This is decided when it is invoked, before any queue, so it mirrors a definite rejection even if it is admitted after that rejection; only an interrupt invoked after the rejection calls the provider again. Likewise, an exact retry invoked while the original's provider call is in flight shares that call's outcome and never delivers again.
+  An `interrupt_run` with a new command ID chooses its outcome when it is **admitted** (after the commands queued ahead of it in its session and its receipt lookup), not when it is invoked:
+  - if the run can still take an interrupt, the command waits for the run's one interrupt that is in flight, unknown or already observed successful, and mirrors it (delivered, the same rejection, or unknown); it never calls the provider itself;
+  - a definite rejection observed before admission leaves no shared interrupt, so the new command interrupts again;
+  - a run the store already shows as terminal gives the applied no-op `delivered: false`. That receipt is an ordinary slot in the session's queue: the command returns once every earlier slot, the run's terminal included, is persisted, and it can fail with the session's A or F fault;
+  - while the run's terminal is queued but not yet persisted, while a close is in progress, or while the session has a fault, the command gets the retryable (or fault) error and nothing is recorded.
+
+  An exact retry invoked while the original's provider call is in flight still shares that call's outcome and never delivers again. **Breaking behaviour:** a second command ID no longer inherits an earlier interrupt's outcome from the moment it was invoked, and a `delivered: false` no-op waits behind earlier queued history instead of being recorded at once.
 
   If the owning command's outcome is unknown, only that command's exact retry calls `interrupt()` again, and the run's terminal waits until it does. A request emitted after interruption began becomes a diagnostic; a callback from an already finished run is discarded.
 
@@ -37,6 +43,8 @@ Provider-neutral runtime with an injected store, workspace provider, and provide
   A late start that succeeds commits ahead of `closing`, then is interrupted and disposed. One that is rejected leaves only its rejected receipt.
 
   `ifRunActive: 'reject'` rejects while a run is active or starting. Another close ID is refused, retryably and without a receipt, while one close is unresolved.
+
+  Close and shutdown never wait on an unsettled store commit either. Once cleanup is done, if `session.closed` or any history ahead of it is still unacknowledged by the store, they return a retryable `store_unavailable` with `details.pending: 'persistence'`; the commit continues on its own, and a later close or `shutdown()` confirms it without repeating cleanup. With a store whose commits settle asynchronously, this can mean a retry where a close used to wait (**breaking behaviour**). Under A they return the non-retryable fault.
 
   The close receipt and `session.closed` commit only after the accepted history, the run terminal and the real cleanup. `interruptedActiveRun` accumulates across exact retries. A close receipt attests cleanup, not complete history: an O session closes successfully and stays uncertified. While the runtime still owns a session whose `session.closed` commit is unconfirmed, a close never answers from the store's receipt or closed state: under A, the exact retry and any other close ID fail with the non-retryable fault.
 
