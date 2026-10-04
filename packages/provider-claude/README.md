@@ -6,27 +6,17 @@ between `@relvo-labs/agent-provider` and the official Claude Agent SDK's structu
 
 The runtime never imports this package; a host composes it.
 
-```ts
-import { createAgentRuntime } from '@relvo-labs/agent-runtime';
-import { createClaudeProvider } from '@relvo-labs/agent-provider-claude';
+## Install
 
-const runtime = createAgentRuntime({
-  workspaces,
-  providers: [createClaudeProvider({ model: 'claude-sonnet-4-6' })],
-});
+ESM-only; Node `^22.18.0 || ^24.11.0 || ^26.0.0`. For the runtime quick start:
 
-await runtime.openSession({ type: 'open_session', commandId, providerId: 'claude', workspace });
-await runtime.submitTurn({
-  type: 'submit_turn',
-  commandId,
-  sessionId,
-  input: { parts: [{ type: 'text', text: 'hello' }] },
-});
+```bash
+pnpm add @relvo-labs/agent-provider-claude @relvo-labs/agent-runtime @relvo-labs/agent-workspace @relvo-labs/agent-protocol @anthropic-ai/claude-agent-sdk@0.3.260
+# or
+npm install @relvo-labs/agent-provider-claude @relvo-labs/agent-runtime @relvo-labs/agent-workspace @relvo-labs/agent-protocol @anthropic-ai/claude-agent-sdk@0.3.260
 ```
 
-`type` is required on every command — it is what makes `AgentExecutor#dispatch` and each typed method agree on shape, and it is easy to drop by hand as the snippet above shows. `commandId` is a caller-generated, unique string (see `@relvo-labs/agent-protocol`'s `CommandIdSchema`); `sessionId` is the `openSession` receipt's own result, not invented; `workspace` is a `WorkspaceSpec` your host constructs (see `@relvo-labs/agent-workspace`). This snippet illustrates composition — it is not, on its own, a runnable program. For a complete, executable walkthrough that actually runs this exact sequence end to end (including workspace acquisition, a real subscription, receipts vs. completion, and cleanup), see [`examples/reference-app`](../../examples/reference-app/README.md).
-
-## Installing the SDK
+### Optional SDK peer
 
 `@anthropic-ai/claude-agent-sdk` is an **optional peer dependency**, resolved at runtime
 by the adapter's default binding. Install it in the host application:
@@ -49,6 +39,71 @@ force the download on every consumer, including those that inject their own bind
 
 Without it, `createSession` rejects with a retryable `provider_unavailable` error naming
 the package. Nothing else in the adapter changes.
+
+## Quick start
+
+Configure authentication in the host using the provider's own setup. This example
+opens a managed scratch workspace, submits one text turn, observes its terminal
+event and shuts down. It is not run against a live model by the credential-free
+gate. A rejected receipt or promise must be handled by the host.
+
+```ts
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CommandIdSchema, createCounterIdFactory, createSystemClock } from '@relvo-labs/agent-protocol';
+import { createClaudeProvider } from '@relvo-labs/agent-provider-claude';
+import { createAgentRuntime } from '@relvo-labs/agent-runtime';
+import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
+
+const clock = createSystemClock();
+const idFactory = createCounterIdFactory();
+const workspaces = createLocalWorkspaceProvider({
+  baseDirectory: join(tmpdir(), 'relvo-claude-example'),
+  clock,
+  idFactory,
+});
+const provider = createClaudeProvider({ model: 'claude-sonnet-4-6', permissionMode: 'plan' });
+const runtime = createAgentRuntime({ workspaces, providers: [provider], clock, idFactory });
+try {
+  const opened = await runtime.openSession({
+    type: 'open_session',
+    commandId: CommandIdSchema.parse('example-open-1'),
+    providerId: 'claude',
+    workspace: { kind: 'managed' },
+  });
+  if (opened.disposition === 'rejected' || opened.result?.type !== 'session_opened') {
+    throw new Error(opened.error?.code ?? 'Session did not open');
+  }
+  const sessionId = opened.result.sessionId;
+  const accepted = await runtime.submitTurn({
+    type: 'submit_turn',
+    commandId: CommandIdSchema.parse('example-turn-1'),
+    sessionId,
+    input: { parts: [{ type: 'text', text: 'Say hello.' }] },
+  });
+  if (accepted.disposition === 'rejected') throw new Error(accepted.error?.code ?? 'Turn rejected');
+  const subscription = runtime.subscribe({ sessionId, fromSequence: 0 });
+  try {
+    for await (const message of subscription) {
+      if (message.type === 'overflow') throw new Error(`Resume from ${message.resumeCursor}`);
+      if (message.type === 'closed') break;
+      if (message.type !== 'event') continue;
+      if (message.event.payload.type === 'run.message_delta') console.log(message.event.payload.text);
+      if (message.event.payload.type === 'run.finished') {
+        console.log(message.event.payload.termination);
+        break;
+      }
+    }
+  } finally {
+    await subscription.close();
+  }
+} finally {
+  await runtime.shutdown();
+}
+```
+
+For a complete HTTP/SSE host, see the
+[reference app](https://github.com/relvo-labs/agent-runtime/blob/main/examples/reference-app/README.md).
 
 ## Maturity
 
@@ -177,7 +232,7 @@ rests on this adapter running one turn per session at a time plus the stream bin
 prompt is raised for the active run only while nothing contradicts it, and is denied
 outright when another turn owns the wire, when the active run has already produced its
 terminal frame, or when there is no active run. Approval is a host decision surface, not a
-runtime sandbox: see `docs/adr/ADR-0009-provider-trust-boundary.md`.
+runtime sandbox: see [docs/adr/ADR-0009-provider-trust-boundary.md](https://github.com/relvo-labs/agent-runtime/blob/main/docs/adr/ADR-0009-provider-trust-boundary.md).
 
 ### Interrupt semantics
 
@@ -314,12 +369,22 @@ satisfies it without a cast, and a test can pass a deterministic implementation 
 which is how this package's own suite runs with no credentials and no network:
 
 ```ts
+import { createClaudeProvider } from '@relvo-labs/agent-provider-claude';
+
 const provider = createClaudeProvider({
-  query: () => ({
+  query: ({ prompt }) => ({
     async *[Symbol.asyncIterator]() {
-      yield { type: 'result', subtype: 'success', is_error: false };
+      // Reply per message; a session's input stream stays open across turns.
+      for await (const message of prompt) {
+        yield {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          ...(message.uuid === undefined ? {} : { user_message_uuid: message.uuid }),
+        };
+      }
     },
-    interrupt: () => Promise.resolve(undefined),
+    interrupt: () => Promise.resolve({ still_queued: [] }),
   }),
 });
 ```
@@ -331,5 +396,5 @@ carry an optional `canUseTool`. An implementation that annotated its own paramet
 narrower literal has to widen it; one that infers the type, as the snippet above does,
 needs no change.
 
-See [`docs/provider-development.md`](../../docs/provider-development.md) for the SPI rules
+See [provider development](https://github.com/relvo-labs/agent-runtime/blob/main/docs/provider-development.md) for the SPI rules
 this adapter follows.

@@ -1,5 +1,141 @@
 # `@relvo-labs/agent-runtime`
 
+The in-process composition root for provider-neutral agent execution. It combines
+`agent-protocol`, the `agent-executor` consumer contract, the neutral provider SPI
+and workspace leases into commands, projections and replay-then-live subscriptions.
+The host supplies concrete adapters; the runtime never imports them. Use this
+package to embed execution, or depend on
+[`agent-executor`](https://github.com/relvo-labs/agent-runtime/blob/main/packages/executor/README.md)
+when your code only needs the consumer interface.
+
+## Install
+
+ESM-only; Node `^22.18.0 || ^24.11.0 || ^26.0.0`. No peer dependencies.
+The example directly imports protocol, workspace and the provider test subpath,
+so install those siblings alongside runtime. Executor is a runtime dependency.
+
+```bash
+pnpm add @relvo-labs/agent-runtime @relvo-labs/agent-protocol @relvo-labs/agent-workspace @relvo-labs/agent-provider
+# or
+npm install @relvo-labs/agent-runtime @relvo-labs/agent-protocol @relvo-labs/agent-workspace @relvo-labs/agent-provider
+```
+
+## Quick start
+
+This example needs no credentials and executes no model call. It follows the
+[reference app](https://github.com/relvo-labs/agent-runtime/blob/main/examples/reference-app/src/runtime-factory.ts):
+advance the scripted provider, then wait for the runtime's separate persistence
+work with `quiesce()`. Command receipts acknowledge commands; they do not certify
+that a run has finished.
+
+```ts
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CommandIdSchema, SequenceSchema, createCounterIdFactory, createSystemClock } from '@relvo-labs/agent-protocol';
+import { createScriptedProvider } from '@relvo-labs/agent-provider/testing';
+import { createAgentRuntime, createInMemoryStore } from '@relvo-labs/agent-runtime';
+import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
+
+const clock = createSystemClock();
+const idFactory = createCounterIdFactory();
+const workspaces = createLocalWorkspaceProvider({
+  baseDirectory: join(tmpdir(), 'relvo-runtime-example'),
+  clock,
+  idFactory,
+});
+const { provider, controller } = createScriptedProvider({
+  defaultScript: [{ kind: 'delta', text: 'hello' }, { kind: 'succeed' }],
+});
+const runtime = createAgentRuntime({
+  workspaces,
+  providers: [provider],
+  store: createInMemoryStore({ clock, idFactory }),
+  clock,
+  idFactory,
+});
+try {
+  const opened = await runtime.openSession({
+    type: 'open_session',
+    commandId: CommandIdSchema.parse('example-open-1'),
+    providerId: 'scripted',
+    workspace: { kind: 'managed' },
+  });
+  if (opened.disposition === 'rejected' || opened.result?.type !== 'session_opened') {
+    throw new Error(opened.error?.code ?? 'Session did not open');
+  }
+  const sessionId = opened.result.sessionId;
+  const accepted = await runtime.submitTurn({
+    type: 'submit_turn',
+    commandId: CommandIdSchema.parse('example-turn-1'),
+    sessionId,
+    input: { parts: [{ type: 'text', text: 'hello' }] },
+  });
+  if (accepted.disposition === 'rejected') throw new Error(accepted.error?.code ?? 'Turn rejected');
+  await controller.drain();
+  await runtime.quiesce();
+  console.log((await runtime.getSession(sessionId))?.runs[0]?.state); // succeeded
+  const page = await runtime.readEvents(sessionId, SequenceSchema.parse(0));
+  console.log(page.events.map((event) => event.payload.type));
+  const closed = await runtime.closeSession({
+    type: 'close_session',
+    commandId: CommandIdSchema.parse('example-close-1'),
+    sessionId,
+    ifRunActive: 'interrupt',
+  });
+  if (closed.disposition === 'rejected') throw new Error(closed.error?.code ?? 'Close rejected');
+} finally {
+  await runtime.shutdown();
+}
+```
+
+For model execution, register a [Claude](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider-claude/README.md)
+or [Codex](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider-codex/README.md)
+adapter instead. Those adapters have deterministic compatibility evidence, with
+no live-model acceptance evidence in this repository. The canonical gate is
+credential-free. This SDK is pre-1.0 and supplies no HTTP transport, scheduler,
+tenancy, RBAC or distributed execution service.
+
+## API overview
+
+| Export                                                               | Purpose                                                                                 |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `createAgentRuntime`, `AgentRuntimeOptions`                          | Compose required workspaces with optional providers, store, clock and ID factory.       |
+| `AgentRuntime`                                                       | Executor plus provider registration, `quiesce()`, fault inspection and ingestion retry. |
+| `ProviderIngestionFault`                                             | Session/run, stage, typed error and failure count for blocked ingestion.                |
+| `createInMemoryStore`, `InMemoryStoreOptions`                        | Atomic, isolated process-local event/projection/receipt store.                          |
+| `RuntimeStore`, `RuntimeStoreContract`                               | Custom store seam and self-declared baseline/strong guarantees.                         |
+| `StoreTransaction`, `CommitResult`, `EmitInput`                      | Transaction mutation, emitted events and commit revision.                               |
+| `SessionRecord`, `ReceiptRecord`                                     | Store-side projection/log and canonical command receipt records.                        |
+| `createProviderRegistry`, `ProviderRegistry`                         | Parse, wire-check and freeze registered descriptors.                                    |
+| `createSubscriptionHub`, `SubscriptionHub`, `SubscriptionHubOptions` | Replay/live delivery over a store with bounded subscriber buffers.                      |
+| `applyEvent`                                                         | Fold an envelope into a `SessionRecord`, rejecting invalid transitions.                 |
+| `AgentExecutor`, `EventSubscription`                                 | Re-exported consumer contract and async subscription types.                             |
+
+The executor supplies `openSession`, `submitTurn`, `interruptRun`,
+`respondToInteraction`, `closeSession`, `dispatch`, `getSession`, `readEvents`,
+`listProviders`, `subscribe` and `shutdown`. Runtime adds `registerProvider`,
+`quiesce`, `getProviderIngestionFaults` and `retryProviderIngestion`.
+`quiesce()` waits for accepted internal work; it does not drive a model or resolve
+an outstanding interaction. `/package.json` is the only additional export path.
+
+## Error handling and faults
+
+Check `receipt.disposition === 'rejected'` and its `error`; also handle promise
+rejections with protocol `AgentRuntimeError` and its `.error` (`code`, `retryable`,
+`details`). A retryable exception is not a completed receipt: retry the exact
+command ID and payload. Inspect `getProviderIngestionFaults()` before claiming
+history is complete; only F faults can be resubmitted through
+`retryProviderIngestion`. The reviewed specification below describes A/O/F faults,
+unknown provider outcomes and cleanup retries in detail.
+
+## Related packages and reading
+
+- [Protocol](https://github.com/relvo-labs/agent-runtime/blob/main/packages/protocol/README.md), [provider SPI](https://github.com/relvo-labs/agent-runtime/blob/main/packages/provider/README.md) and [workspace leases](https://github.com/relvo-labs/agent-runtime/blob/main/packages/workspace/README.md).
+- [Atomic event/projection store (ADR-0004)](https://github.com/relvo-labs/agent-runtime/blob/main/docs/adr/ADR-0004-atomic-event-projection-store.md), [cleanup lifecycle (ADR-0005)](https://github.com/relvo-labs/agent-runtime/blob/main/docs/adr/ADR-0005-run-cancel-close-dispose.md) and [provider activation (ADR-0016)](https://github.com/relvo-labs/agent-runtime/blob/main/docs/adr/ADR-0016-provider-event-activation.md).
+- [Foundation architecture](https://github.com/relvo-labs/agent-runtime/blob/main/docs/architecture/foundation-v0.4.md) and [versioning](https://github.com/relvo-labs/agent-runtime/blob/main/docs/versioning.md).
+
+## Behavior specification
+
 Provider-neutral runtime with an injected store, workspace provider, and provider SPI. The in-memory store commits events and projections together. Command IDs make exact command retries idempotent within one runtime instance. Everything below is process-local: the in-memory store loses all data on crash or restart, nothing is crash-durable, and no provider or workspace effect is exactly-once. Durable effect intent and crash reconciliation are tracked in issue #6.
 
 ## Implemented lifecycle behavior

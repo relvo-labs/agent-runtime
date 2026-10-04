@@ -4,6 +4,84 @@ A Codex adapter for the neutral provider SPI in `@relvo-labs/agent-provider`.
 
 It drives the official **Codex app-server** protocol over structured stdio JSONL: no PTY, no shell command string, no terminal scraping, no ANSI parsing. Provider-native identifiers — thread ids, turn ids, item ids, request ids, the child process — stay inside this package and never appear in an emitted event.
 
+## Install
+
+ESM-only; Node `^22.18.0 || ^24.11.0 || ^26.0.0`. No peer dependency or bundled
+Codex executable. Supply a host-installed `codex` on `PATH` (or an `executable`
+path) from the reviewed version window below. For the runtime quick start:
+
+```bash
+pnpm add @relvo-labs/agent-provider-codex @relvo-labs/agent-runtime @relvo-labs/agent-workspace @relvo-labs/agent-protocol
+# or
+npm install @relvo-labs/agent-provider-codex @relvo-labs/agent-runtime @relvo-labs/agent-workspace @relvo-labs/agent-protocol
+```
+
+## Quick start
+
+Configure authentication in the host using the provider's own setup. This example
+opens a managed scratch workspace, submits one text turn, observes its terminal
+event and shuts down. It is not run against a live model by the credential-free
+gate. A rejected receipt or promise must be handled by the host.
+
+```ts
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CommandIdSchema, createCounterIdFactory, createSystemClock } from '@relvo-labs/agent-protocol';
+import { createCodexProvider } from '@relvo-labs/agent-provider-codex';
+import { createAgentRuntime } from '@relvo-labs/agent-runtime';
+import { createLocalWorkspaceProvider } from '@relvo-labs/agent-workspace';
+
+const clock = createSystemClock();
+const idFactory = createCounterIdFactory();
+const workspaces = createLocalWorkspaceProvider({
+  baseDirectory: join(tmpdir(), 'relvo-codex-example'),
+  clock,
+  idFactory,
+});
+const provider = createCodexProvider({ sandboxMode: 'read-only' });
+const runtime = createAgentRuntime({ workspaces, providers: [provider], clock, idFactory });
+try {
+  const opened = await runtime.openSession({
+    type: 'open_session',
+    commandId: CommandIdSchema.parse('example-open-1'),
+    providerId: 'codex',
+    workspace: { kind: 'managed' },
+  });
+  if (opened.disposition === 'rejected' || opened.result?.type !== 'session_opened') {
+    throw new Error(opened.error?.code ?? 'Session did not open');
+  }
+  const sessionId = opened.result.sessionId;
+  const accepted = await runtime.submitTurn({
+    type: 'submit_turn',
+    commandId: CommandIdSchema.parse('example-turn-1'),
+    sessionId,
+    input: { parts: [{ type: 'text', text: 'Say hello.' }] },
+  });
+  if (accepted.disposition === 'rejected') throw new Error(accepted.error?.code ?? 'Turn rejected');
+  const subscription = runtime.subscribe({ sessionId, fromSequence: 0 });
+  try {
+    for await (const message of subscription) {
+      if (message.type === 'overflow') throw new Error(`Resume from ${message.resumeCursor}`);
+      if (message.type === 'closed') break;
+      if (message.type !== 'event') continue;
+      if (message.event.payload.type === 'run.message_delta') console.log(message.event.payload.text);
+      if (message.event.payload.type === 'run.finished') {
+        console.log(message.event.payload.termination);
+        break;
+      }
+    }
+  } finally {
+    await subscription.close();
+  }
+} finally {
+  await runtime.shutdown();
+  await provider.releaseAbandonedConnections(); // adapter-owned failed-handshake cleanup
+}
+```
+
+For a complete HTTP/SSE host, see the
+[reference app](https://github.com/relvo-labs/agent-runtime/blob/main/examples/reference-app/README.md).
+
 ## Maturity
 
 **Pre-1.0, and deliberately narrow.** This package went from an explicit scaffold to a live adapter in the text-run vertical slice. Read the capability table below as the complete list of what it does, not as a starting point.
@@ -56,32 +134,21 @@ Do not read "compatible" as "verified against a live model". Those are different
 | Workspace                      | Required. One thread is bound to the acquired lease root for the whole session.                                                                                                                 |
 | Side-effect-free execution     | **Not claimed.** `sandboxMode` does not isolate configured MCP servers, hooks or plugins; see below.                                                                                            |
 
-## Usage
-
-```ts
-import { createAgentRuntime } from '@relvo-labs/agent-runtime';
-import { createCodexProvider } from '@relvo-labs/agent-provider-codex';
-
-// Spawns `codex app-server --stdio` with an argv vector and no shell.
-const codex = createCodexProvider({
-  executable: '/opt/codex/bin/codex', // host configuration; defaults to `codex` on PATH
-  sandboxMode: 'read-only',
-});
-
-const runtime = createAgentRuntime({ workspaces, providers: [codex] });
-```
+## Custom transports
 
 Inject your own connection instead — for a host-managed process, or for a deterministic test — by supplying `transport`:
 
 ```ts
-import { createCodexProvider, type CodexTransport } from '@relvo-labs/agent-provider-codex';
+import { createCodexProvider, type CodexTransportFactory } from '@relvo-labs/agent-provider-codex';
 
-const codex = createCodexProvider({ transport: ({ cwd }) => myTransportFor(cwd) });
+export function withHostTransport(transport: CodexTransportFactory) {
+  return createCodexProvider({ transport });
+}
 ```
 
 ### Execution policy — and what it does _not_ isolate
 
-`sandboxMode` defaults to `read-only`. It is **Codex's own** execution policy, enforced by the app-server — not a sandbox this runtime imposes, and not a restriction on the in-process adapter (see `docs/adr/ADR-0009-provider-trust-boundary.md`).
+`sandboxMode` defaults to `read-only`. It is **Codex's own** execution policy, enforced by the app-server — not a sandbox this runtime imposes, and not a restriction on the in-process adapter (see [docs/adr/ADR-0009-provider-trust-boundary.md](https://github.com/relvo-labs/agent-runtime/blob/main/docs/adr/ADR-0009-provider-trust-boundary.md)).
 
 > **A read-only policy is not an isolation boundary, and this adapter makes no side-effect-free claim.**
 >
@@ -96,6 +163,8 @@ Choosing `workspace-write` or `danger-full-access` alongside a `cwd` also causes
 Off by default. `createCodexProvider({ approvals: 'bridge' })` turns it on, which changes exactly three things: `thread/start` sends `approvalPolicy: 'on-request'` instead of `'never'`, the descriptor declares `interaction.approval = { supported: true, modes: ['once', 'session'], blocking: true }`, and one server-initiated method is answered by a host instead of declined.
 
 ```ts
+import { createCodexProvider } from '@relvo-labs/agent-provider-codex';
+
 const codex = createCodexProvider({ approvals: 'bridge', sandboxMode: 'workspace-write' });
 ```
 
@@ -251,6 +320,8 @@ A `turn/start` that is _rejected_ by the server admitted nothing, so the session
 `createSession()` returns no session when the handshake fails, so there is nothing for a caller to dispose. The adapter tears the half-open connection down itself; if that _also_ fails, the connection would be unreachable, so it is retained on the provider instead and the rejection says so (`providerCode: 'handshake_cleanup_pending'`). `provider.releaseAbandonedConnections()` retries every retained connection — attempt-all, never fail-fast — and `provider.abandonedConnectionCount` reports how many are still outstanding. Both live on the concrete `CodexProvider`; the neutral SPI is unchanged.
 
 ```ts
+import { createCodexProvider } from '@relvo-labs/agent-provider-codex';
+
 const provider = createCodexProvider();
 // …later, or in a host's shutdown path:
 if (provider.abandonedConnectionCount > 0) await provider.releaseAbandonedConnections();
@@ -266,4 +337,4 @@ The session also remembers the turn ids it has already settled, so a retired tur
 pnpm --filter @relvo-labs/agent-provider-codex test
 ```
 
-Credential-free and network-free. See `docs/provider-development.md` for the adapter contract.
+Credential-free and network-free. See [docs/provider-development.md](https://github.com/relvo-labs/agent-runtime/blob/main/docs/provider-development.md) for the adapter contract.
