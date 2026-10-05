@@ -59,9 +59,11 @@ Install the exact pnpm version declared by `packageManager` before running these
 Corepack is not required. Node `^22.18.0`, `^24.11.0`, and `^26.0.0` are supported and
 exercised in CI. Node 20 and Node 27+ are not supported.
 
-All eight public packages have immutable `0.2.0` and `0.3.0` releases; a 2026-09-27
-registry observation found `latest=0.3.0` for each. Neither published version may be
-republished or named in another dispatch. Provider `0.4.0` is not yet published.
+All eight public packages have immutable `0.2.0` and `0.3.0` releases, and the Claude and
+Codex adapters also have an immutable `0.4.0`; a 2026-10-04 registry observation found
+`latest=0.4.0` for the two adapters and `latest=0.3.0` for the other six. No published
+version may be republished or named in another dispatch. Version `0.5.0` of all eight
+packages is prepared but not published.
 Publication is manual, explicitly scoped and approved
 per run through [`.github/workflows/release.yml`](.github/workflows/release.yml); see the
 [release runbook](docs/release.md) for what it proves before anything reaches the registry
