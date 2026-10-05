@@ -285,8 +285,8 @@ completed preparation and release, not a current approval or a dispatch plan.
 
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
-   `.changeset/` held no pending intent after that preparation. It does now contain new
-   provider compatibility intent, which must be consumed before any future dispatch.
+   `.changeset/` held no pending intent after that preparation. Later intents were consumed
+   by the 0.4.0 and 0.5.0 version-only preparations.
    `@relvo-labs/reference-app` is private, was
    deliberately left at `0.0.0`, and is never published. No other manifest field moved:
    the version-only proof compares every workspace manifest against the baseline and

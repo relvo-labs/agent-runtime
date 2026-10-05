@@ -57,10 +57,12 @@ Provider events, command effects, run terminals, close and shutdown now go throu
 ordered ingestion queue per session. A failed history commit keeps its operation for an
 unchanged retry; `getProviderIngestionFaults()` reports at most one fault per session — an
 unknown commit outcome (never resubmitted), a permanent overflow, or a retryable failure —
-named by `error.details.fault`. Close and shutdown fence the session instead of waiting on
-an unresolved provider start or response, release the workspace only after confirmed
-provider disposal, and on retry repeat only cleanup phases that failed. A second close
-command ID is refused while one close is unresolved. Filtered subscriptions stay bounded,
+named by `error.details.fault`. Close and shutdown never wait on an unresolved provider
+start or response: they fence the session, return a retryable error at once, and finish
+cleanup when it settles. They release the workspace only after confirmed provider disposal,
+and on retry repeat only cleanup phases that failed. A second close command ID is refused
+while one close is unresolved, and a close receipt commits only after the accepted history
+and the run terminal. Filtered subscriptions stay bounded,
 close retries preserve the original interruption fact, and history reads use at most three
 session-scoped page reads before a retryable contention error.
 
@@ -114,8 +116,9 @@ release. During preparation, a registry observation found only `0.2.0` with
 2026-09-27 found both `0.2.0` and `0.3.0` public for all eight, with `latest=0.3.0`.
 Each version entry carries registry integrity metadata; this readback did not compare
 tarball bytes or integrity against reviewed artifacts. Neither published version may be
-republished or named in another dispatch. Provider `0.4.0` was absent in that readback
-and is not published. See the [release runbook](release.md).
+republished or named in another dispatch. Provider `0.4.0` was absent in that readback;
+both adapter `0.4.0` versions were published later (see the 0.4.0 section above). See the
+[release runbook](release.md).
 
 The eight exact 0.3.0 package versions are:
 
