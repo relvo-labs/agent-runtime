@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runPreflight, type PreflightInput } from './lib/preflight.ts';
+import { refusalsBeforePack, runPreflight, type PreflightInput } from './lib/preflight.ts';
 import type { RegistryScript } from './testing/fixtures.ts';
 import { fakeRegistry, buildPackageTarball, published } from './testing/fixtures.ts';
 import { inspectTarball, tarballFileName, type PackedArtifact } from './lib/tarball.ts';
@@ -334,5 +334,92 @@ describe('release preflight', () => {
   it('produces no plan at all when anything is refused', async () => {
     const outcome = await runPreflight(baseline({ pendingChangesetFiles: ['pending.md'] }), registry());
     expect(outcome.plan).toBeUndefined();
+  });
+});
+
+// Issue #26: a dispatch naming a version the commit does not carry used to fail
+// reading a tarball that `pnpm pack` never produced (ENOENT) before any finding
+// was reported. The CLI now asks this question before packing.
+describe('refusals before packing', () => {
+  function prePack(overrides: Partial<PreflightInput> = {}) {
+    const { artifacts: _artifacts, registryUrl: _registryUrl, ...facts } = baseline(overrides);
+    return facts;
+  }
+
+  it('refuses a version the commit does not carry, with the manifest version in the reason', () => {
+    const request = { sourceSha: SHA, distTag: 'latest', targets: [{ name: PROTOCOL, version: '0.3.0' }] };
+    const findings = refusalsBeforePack(prePack({ request }));
+    expect(findings.map((finding) => finding.code)).toEqual(['scope_version_mismatch']);
+    expect(findings[0]?.message).toContain('is 0.2.0');
+    expect(findings[0]?.message).toContain('names 0.3.0');
+  });
+
+  it('reports pending intent and context together with the scope refusal (the run 34742438216 shape)', () => {
+    const request = { sourceSha: SHA, distTag: 'latest', targets: [{ name: PROTOCOL, version: '0.2.0' }] };
+    const findings = refusalsBeforePack(
+      prePack({
+        request,
+        context: { eventName: 'local_nonpublishing_verification', ref: 'refs/heads/topic', runnerSha: SHA },
+        workspace: [{ directory: 'packages/protocol', name: PROTOCOL, version: '0.1.0', private: false }],
+        pendingChangesetFiles: ['a.md', 'b.md', 'c.md'],
+      }),
+    );
+    const codes = findings.map((finding) => finding.code);
+    expect(codes).toContain('scope_version_mismatch');
+    expect(codes.filter((code) => code === 'pending_version_intent')).toHaveLength(3);
+    expect(codes).toContain('context_event');
+    expect(codes).toContain('context_ref');
+  });
+
+  it('refuses unknown and private packages before packing', () => {
+    const unknown = {
+      sourceSha: SHA,
+      distTag: 'latest',
+      targets: [{ name: '@relvo-labs/agent-ghost', version: '0.2.0' }],
+    };
+    expect(refusalsBeforePack(prePack({ request: unknown })).map((finding) => finding.code)).toEqual([
+      'scope_unknown_package',
+    ]);
+    const privateScope = {
+      sourceSha: SHA,
+      distTag: 'latest',
+      targets: [{ name: '@relvo-labs/reference-app', version: '0.0.0' }],
+    };
+    expect(refusalsBeforePack(prePack({ request: privateScope })).map((finding) => finding.code)).toEqual([
+      'scope_private_package',
+    ]);
+  });
+
+  it('lets a packable scope through so artifact and registry checks still run', async () => {
+    expect(refusalsBeforePack(prePack())).toEqual([]);
+    // Context and intent alone do not stop packing: a local rehearsal still
+    // exercises artifact and registry checks, and runPreflight reports them all.
+    const rehearsal = prePack({
+      context: { eventName: 'local_nonpublishing_verification', ref: 'refs/heads/topic', runnerSha: SHA },
+      pendingChangesetFiles: ['pending.md'],
+    });
+    expect(refusalsBeforePack(rehearsal)).toEqual([]);
+    const full = await codes(
+      baseline({
+        context: rehearsal.context,
+        pendingChangesetFiles: rehearsal.pendingChangesetFiles,
+      }),
+    );
+    expect(full).toEqual(expect.arrayContaining(['context_event', 'context_ref', 'pending_version_intent']));
+  });
+
+  it('is a subset of runPreflight: every pre-pack refusal is still a full-preflight refusal', async () => {
+    const request = { sourceSha: SHA, distTag: 'latest', targets: [{ name: PROTOCOL, version: '0.3.0' }] };
+    const input = baseline({
+      request,
+      pendingChangesetFiles: ['pending.md'],
+      artifacts: [artifact({ name: PROTOCOL, version: '0.3.0', dependencies: { zod: '4.5.4' } })],
+    });
+    const early = refusalsBeforePack(prePack({ request, pendingChangesetFiles: ['pending.md'] })).map(
+      (finding) => finding.code,
+    );
+    const outcome = await runPreflight(input, registry());
+    expect(outcome.plan).toBeUndefined();
+    expect(outcome.findings.map((finding) => finding.code)).toEqual(expect.arrayContaining(early));
   });
 });

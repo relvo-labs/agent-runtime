@@ -308,8 +308,8 @@ completed preparation and release, not a current approval or a dispatch plan.
    The gate step that once refused this shape of PR is issue #27, fixed in PR #29 and
    present in this candidate's baseline: `pnpm changeset:status` now proves a dedicated
    version transition instead of reading a bare CLI coverage answer. Issue #26 — preflight
-   gathering artifacts before it evaluates diagnostics — is a separate, still-open
-   limitation and is not addressed here.
+   gathering artifacts before it evaluates diagnostics — is fixed separately: a scope the
+   commit cannot pack is now refused before any pack work.
 
 ## Outstanding human approvals
 
@@ -442,9 +442,10 @@ Preflight is credential-free and can be run locally against built, packed artifa
 Use the actual branch and an explicitly local event; never impersonate `workflow_dispatch`
 on `refs/heads/main`. That would spoof the two facts preflight exists to check, and a
 rehearsal that lies about its own context cannot tell you anything about a real one. A
-local run must refuse release eligibility. Packing still precedes diagnostic evaluation,
-so a rehearsal can fail while gathering artifacts before it reports any finding; issue #26
-tracks that ordering separately.
+local run must refuse release eligibility. A scope the commit cannot pack (unknown or
+private package, or a version the commit does not carry) is refused before any pack work,
+with context, pending-intent and scope findings reported together (issue #26); a packable
+scope is still packed so the rehearsal exercises artifact and registry checks too.
 
 ```bash
 export RELEASE_EVENT_NAME=local_nonpublishing_verification
