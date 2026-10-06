@@ -106,8 +106,9 @@ reader's own directory, because a `main` or `exports` pointing out of the packag
 contained `package.json` say nothing about the code that runs.
 
 Current status: all eight public packages have immutable `0.2.0` and `0.3.0` releases.
-A 2026-09-27 registry observation found `latest=0.3.0` for each; provider `0.4.0` is not
-published. None of those published exact versions may be republished or named in another
+Both provider adapters also have an immutable `0.4.0`. A 2026-10-04 registry observation
+found `latest=0.4.0` for the adapters and `latest=0.3.0` for the other six; `0.5.0` of
+all eight is prepared, not published. None of those published exact versions may be republished or named in another
 dispatch. Linked Changesets align only packages entering a plan, so a leaf-adapter release
 can contain two packages. The human approvals and
 evidence required before publishing a future version are recorded in `docs/release.md`.

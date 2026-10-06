@@ -9,13 +9,81 @@ Notes are written when a version is **prepared**. A version appearing here has n
 itself, been published: publication is a separate manual dispatch described in the
 [release runbook](release.md).
 
-## 0.4.0 — prepared, not published
+## 0.5.0 — prepared, not published
+
+All eight public packages enter this plan and move to `0.5.0`.
+`@relvo-labs/agent-provider-claude` and `@relvo-labs/agent-provider-codex` move from
+`0.4.0`; `agent-protocol`, `agent-executor`, `agent-provider`, `agent-runtime`,
+`agent-workspace` and `agent-workspace-git` move from `0.3.0`. The `linked` configuration
+aligns packages entering a plan to the highest resulting version, so the six skip `0.4.0`;
+no `0.4.0` of any of them was ever prepared or published.
+This preparation consumed three pending changesets: `runtime-ingestion-recovery` and
+`runtime-provider-ingestion-cutover` (issues #3 and #43), and `package-readmes` (PR #48),
+which patches all eight packages. For `agent-protocol`, `agent-executor`, `agent-workspace`
+and `agent-workspace-git` the only change since `0.3.0` is the expanded package README;
+they have no behaviour or API change. It does not authorize a merge, release dispatch or
+publication.
+
+**Documentation (all eight):** package READMEs now cover installation, TypeScript
+examples, a public API overview and documented limits. Documentation only.
+
+**BREAKING:**
+
+- `AgentRuntime` has a new required method, `retryProviderIngestion(sessionId?)`. Code that
+  implements `AgentRuntime` structurally must add it, or obtain the runtime from
+  `createAgentRuntime`.
+- `interrupt_run` rejects unknown or cross-session run IDs with `unknown_run`. History reads,
+  replaying subscriptions and `quiesce()` reject while a session has a provider ingestion
+  fault; inspect `getProviderIngestionFaults()` to identify it.
+- Provider adapters: only a thrown `ProviderRejection` is a definite rejection. Any other
+  failure of `startRun`, `respondToInteraction` or `ProviderRun.interrupt` is an unknown
+  outcome that only an exact command retry delivers again, so those calls must be
+  idempotent for the same `runRef`, interaction reference and run.
+- An `interrupt_run` with a new command ID chooses its outcome when it is admitted, not when
+  it is invoked. While the run can still be interrupted it mirrors the run's in-flight,
+  unknown or successful interrupt; after a definite rejection it interrupts again; on a
+  terminal run it is the `delivered: false` no-op, persisted in queue order after the
+  terminal. While the terminal is unpersisted, a close is in progress or the session has a
+  fault, it returns the retryable or fault error and records nothing. Retry the exact
+  command ID to observe one interrupt's outcome.
+- Close and `shutdown()` never wait on an unacknowledged store commit. After cleanup, if
+  `session.closed` or earlier history is still being persisted, they return a retryable
+  `store_unavailable` with `details.pending: 'persistence'`; call the same close (or
+  `shutdown()`) again to confirm. No cleanup effect is repeated.
+- Crossing the 256-event pre-activation bound or the 1,023-operation session bound marks
+  history permanently incomplete instead of appending a warning diagnostic.
+
+Provider events, command effects, run terminals, close and shutdown now go through one
+ordered ingestion queue per session. A failed history commit keeps its operation for an
+unchanged retry; `getProviderIngestionFaults()` reports at most one fault per session — an
+unknown commit outcome (never resubmitted), a permanent overflow, or a retryable failure —
+named by `error.details.fault`. Close and shutdown never wait on an unresolved provider
+start or response: they fence the session, return a retryable error at once, and finish
+cleanup when it settles. They release the workspace only after confirmed provider disposal,
+and on retry repeat only cleanup phases that failed. A second close command ID is refused
+while one close is unresolved, and a close receipt commits only after the accepted history
+and the run terminal. Filtered subscriptions stay bounded,
+close retries preserve the original interruption fact, and history reads use at most three
+session-scoped page reads before a retryable contention error.
+
+**Additive:** `RuntimeStore` has an optional `contract?: RuntimeStoreContract`
+(`{ version: 1, level: 'baseline' | 'strong' }`). Only a declared `strong` contract lets a
+custom store's rejected commit be reconciled and retried; an undeclared custom store leaves
+that session's history permanently uncertified after any commit rejection.
+
+Everything remains process-local: no crash durability, durable effect intents or
+multi-process admission (#6), no byte budget (#44). Neutral wire contracts are unchanged and
+the wire version remains `0.5`.
+
+## 0.4.0 — prepared and published (adapters only)
 
 Only `@relvo-labs/agent-provider-claude` and `@relvo-labs/agent-provider-codex`
 move from `0.3.0` to `0.4.0`; the other six public packages remain at their
 published `0.3.0` versions. This preparation consumed the sole pending changeset,
-`provider-upstream-compat`. It does not authorize a merge, release dispatch or
-publication.
+`provider-upstream-compat`. A no-cache registry readback on 2026-10-04 found both
+adapter `0.4.0` versions public with `latest=0.4.0`; they are immutable and may not be
+republished or named in another dispatch. That readback did not compare tarball bytes
+against reviewed artifacts.
 
 **BREAKING:** Consumers typed against `CLAUDE_AGENT_SDK_VERSION` or
 `CODEX_APP_SERVER_VERSION` as the previous string literals must accept `0.3.260` or
@@ -48,8 +116,9 @@ release. During preparation, a registry observation found only `0.2.0` with
 2026-09-27 found both `0.2.0` and `0.3.0` public for all eight, with `latest=0.3.0`.
 Each version entry carries registry integrity metadata; this readback did not compare
 tarball bytes or integrity against reviewed artifacts. Neither published version may be
-republished or named in another dispatch. Provider `0.4.0` was absent in that readback
-and is not published. See the [release runbook](release.md).
+republished or named in another dispatch. Provider `0.4.0` was absent in that readback;
+both adapter `0.4.0` versions were published later (see the 0.4.0 section above). See the
+[release runbook](release.md).
 
 The eight exact 0.3.0 package versions are:
 

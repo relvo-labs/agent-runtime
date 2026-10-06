@@ -12,20 +12,22 @@ intentionally parsed as a bounded string, then compared explicitly before regist
 Foundation v0.4 was the initial pre-1.0 wire line, published in
 `@relvo-labs/agent-protocol@0.2.0`. Wire 0.5 was published in
 `@relvo-labs/agent-protocol@0.3.0`. Both published compatibility fixtures are immutable.
-All eight public packages have immutable `0.2.0` and `0.3.0` releases; a 2026-09-27
-registry observation found `latest=0.3.0` for each. Provider `0.4.0` is not published.
+All eight public packages have immutable `0.2.0` and `0.3.0` releases, and both provider
+adapters have an immutable `0.4.0`; a 2026-10-04 registry observation found `latest=0.4.0`
+for the adapters and `latest=0.3.0` for the other six. `0.5.0` of all eight packages is
+prepared, not published.
 
 A version file records intent, not a release: a version bump is made by a separate reviewed
 release PR running `changeset version`, and publication is a manual, explicitly scoped
 dispatch of [`.github/workflows/release.yml`](../.github/workflows/release.yml) that refuses
 to run while any changeset is still pending. The eight public package manifests on `main`
-are at `0.3.0`, and provider compatibility intent is pending. A separate version-only
-branch is not a release or dispatch approval.
+are at `0.5.0` once the version-only change preparing it is merged, with no intent pending.
+A version-only change is not a release or dispatch approval.
 
 A release runs only against a commit that is the exact current tip of `main`, with the
 canonical gate green on that commit and the `npm-release` environment approval given for
 that run. Carrying a version number is one of those conditions and the weakest of them — it
-makes a line reviewable, not releasable. No published `0.2.0` or `0.3.0` package may be
+makes a line reviewable, not releasable. No published `0.2.0`, `0.3.0` or `0.4.0` package may be
 named in a dispatch again; every future version and scope needs fresh human authority.
 Linked Changesets align only packages entering a plan, so a leaf-adapter release can
 contain just the Claude and Codex adapters. See the

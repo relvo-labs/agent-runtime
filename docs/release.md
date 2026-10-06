@@ -9,7 +9,9 @@ the version entries carry registry integrity metadata. That readback did not com
 artifacts with reviewed tarballs. The first protocol 0.2.0 upload has separate historical
 integrity, shasum and tarball-digest evidence from run 34753860073 attempt 3. Never name
 either published version in another dispatch, republish it, or treat unpublishing as a
-recovery plan. Provider `0.4.0` is not published. Every future version needs a fresh plan
+recovery plan. Both provider adapters also have an immutable `0.4.0`, observed public with
+`latest=0.4.0` on 2026-10-04. `0.5.0` of all eight packages is prepared, not
+published. Every future version needs a fresh plan
 from the current tip of `main`, fresh registry reconciliation, explicit human authority for
 that exact scope and a new environment approval. Preparing a version authorizes nothing by
 itself. Exact package links and historical preparation evidence are in the
@@ -283,8 +285,8 @@ completed preparation and release, not a current approval or a dispatch plan.
 
    Consumed changesets: `foundation-runtime-v0-4` (all eight, minor),
    `codex-provider-text-run` (codex, minor), `claude-provider-text-run` (claude, minor).
-   `.changeset/` held no pending intent after that preparation. It does now contain new
-   provider compatibility intent, which must be consumed before any future dispatch.
+   `.changeset/` held no pending intent after that preparation. Later intents were consumed
+   by the 0.4.0 and 0.5.0 version-only preparations.
    `@relvo-labs/reference-app` is private, was
    deliberately left at `0.0.0`, and is never published. No other manifest field moved:
    the version-only proof compares every workspace manifest against the baseline and
@@ -312,10 +314,10 @@ completed preparation and release, not a current approval or a dispatch plan.
 ## Outstanding human approvals
 
 Every future publication still requires the following human-controlled prerequisites.
-The current `main` has pending provider compatibility version intent and is not dispatchable
-until a separate reviewed version-only change consumes that intent, with the gate and
-preflight rerun on the then-current tip. Provider `0.4.0` is not published; this runbook
-does not choose that version or approve any scope.
+Once the reviewed version-only change preparing `0.5.0` is merged, no version intent is
+pending; the gate and preflight must still be rerun on the then-current tip. Adapter `0.4.0`
+is published and immutable and may not be named again. This runbook does not choose a
+version or approve any scope.
 
 1. **Registry ownership and the `npm-release` environment.** The `@relvo-labs` scope,
    the `NPM_TOKEN` secret (granular, write-limited to this scope, short-lived) and the
@@ -353,12 +355,13 @@ release.
    `source_sha`. If a version-preparation change was required, it must already be merged.
 2. Confirm no version intent is pending, the canonical gate is green on that commit, and
    reconcile every package in the proposed scope against the registry. Exclude every
-   version already published, including all eight `0.2.0` and `0.3.0` versions.
+   version already published, including all eight `0.2.0` and `0.3.0` versions and the
+   two adapter `0.4.0` versions.
 3. Actions → **release** → _Run workflow_ on `main`, with, for example:
    - `source_sha`: `<the 40-character merge commit>`
    - `packages`: `@relvo-labs/<package>@<reviewed-version> ...` (list the exact,
-     dependency-closed scope; never substitute an already-published `0.2.0` or `0.3.0`
-     version). Linked Changesets align only packages entering the plan; a leaf-adapter
+     dependency-closed scope; never substitute an already-published `0.2.0`, `0.3.0` or
+     `0.4.0` version). Linked Changesets align only packages entering the plan; a leaf-adapter
      plan can contain the two adapters without the other six.
    - `dist_tag`: `latest` (a prerelease version may never be published under `latest`)
    - `confirm`: `publish <count> package(s) from <source_sha> to latest`
